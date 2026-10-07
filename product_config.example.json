@@ -1,0 +1,21 @@
+{
+  "product_name": "SubFlow",
+  "edition": "development",
+  "version": "2.0.68 Beta",
+  "license": {
+    "enabled": false,
+    "api_base_url": "",
+    "activation_policy": "permanent_device",
+    "dev_license_keys": []
+  },
+  "tools": {
+    "mkvmerge": "tools\\mkvtoolnix\\mkvmerge.exe",
+    "mkvextract": "tools\\mkvtoolnix\\mkvextract.exe",
+    "ffmpeg": "tools\\ffmpeg\\bin\\ffmpeg.exe",
+    "tesseract": "tools\\tesseract\\tesseract.exe",
+    "seconv": "tools\\seconv\\seconv.exe",
+    "ollama": "tools\\ollama\\ollama.exe",
+    "ollama_host": "http://127.0.0.1:11434",
+    "ollama_model": "qwen3:8b"
+  }
+}

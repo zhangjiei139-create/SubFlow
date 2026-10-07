@@ -1,0 +1,13 @@
+# Baseline versions from the development environment; not a full lock file.
+PySide6==6.11.1
+numpy==2.5.2
+av==18.0.0
+Pillow==12.3.0
+pysrt==1.1.2
+pytesseract==0.3.13
+rapidocr==3.9.2
+onnxruntime==1.28.0
+pgsrip==0.1.12
+opencc-python-reimplemented==0.1.7
+opencv-python
+ffsubsync
