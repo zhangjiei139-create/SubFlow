@@ -131,8 +131,8 @@ class SampledIntegrationTests(unittest.TestCase):
                 'coordinate_error': False, 'tool_coordinate_invalid': False,
                 'expandable': not sufficient}
 
-    def prepare(self, budget=180):
-        return continuous.shared_audio(str(self.movie), 7, self.logs.append, budget=budget)
+    def prepare(self, budget=180, audio_id=7):
+        return continuous.shared_audio(str(self.movie), audio_id, self.logs.append, budget=budget)
 
     def preflight(self, shared, *, work='candidate', budget=20):
         return continuous.preflight(str(self.movie), self.subtitle, self.root / work, 7,
@@ -216,11 +216,47 @@ class SampledIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.decode_commands()), 1)
         self.assertEqual(len(self.match_commands()), 2)
 
+    def test_previous_rule_verdict_is_rechecked_with_unchanged_fingerprint(self):
+        old_rule = 'continuous-vad-v7-regional-offset-conflict-20261008'
+        self.assertNotEqual(continuous.RULE_VERSION, old_rule)
+        self.assertEqual(continuous.FINGERPRINT_RULE_VERSION,
+                         'continuous-vad-v4-sampled-stereo-preserve-20261002')
+        shared = self.prepare()
+        fingerprint = Path(shared.vad_reference).read_bytes()
+        with patch.object(continuous, 'RULE_VERSION', old_rule):
+            self.preflight(shared)
+        self.preflight(self.prepare())
+        self.assertEqual(len(self.decode_commands()), 1)
+        self.assertEqual(len(self.match_commands()), 2)
+        self.assertEqual(Path(shared.vad_reference).read_bytes(), fingerprint)
+
     def test_acoustic_rule_change_rebuilds_the_fingerprint(self):
         self.prepare()
         with patch.object(continuous, 'FINGERPRINT_RULE_VERSION', continuous.FINGERPRINT_RULE_VERSION + '-next'):
             self.prepare()
         self.assertEqual(len(self.decode_commands()), 2)
+
+    def test_explicit_track_switch_keeps_audio_fingerprints_and_verdicts_separate(self):
+        english = self.prepare()
+        self.preflight(english)
+        original = Path(english.vad_reference).read_bytes()
+        self.tracks.append(SimpleNamespace(id=8, type='audio', codec='AC-3',
+                                           language='zh-CN', default=False, name=''))
+        chinese = self.prepare(audio_id=8)
+        self.preflight(chinese)
+        self.assertEqual((english.validation_audio_id, chinese.validation_audio_id), (7, 8))
+        self.assertNotEqual(english.vad_reference, chinese.vad_reference)
+        self.assertEqual(Path(english.vad_reference).read_bytes(), original)
+        for shared in (english, chinese):
+            metadata = json.loads(Path(shared.vad_reference).with_suffix('.json').read_text(encoding='utf-8'))
+            self.assertEqual(metadata['signature']['audio_id'], shared.validation_audio_id)
+        self.assertEqual(len(self.decode_commands()), 2)
+        self.assertEqual(len(self.match_commands()), 2)
+        decode = self.decode_commands()[-1]
+        self.assertEqual(decode[decode.index('-map') + 1], '0:a:1')
+        self.preflight(self.prepare(audio_id=8))
+        self.assertEqual(len(self.decode_commands()), 2)
+        self.assertEqual(len(self.match_commands()), 2)
 
     def test_50_and_60_shortage_extend_to_75_but_not_full(self):
         self.minimum_fraction = .75
@@ -418,6 +454,26 @@ class SampledIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.decode_commands()), 5)
         self.assertEqual(len(self.match_commands()), 0)
         self.assertEqual(set(shared.vad_preparation_state['references']), {.5, .6, .75})
+
+    def test_independent_support_shortage_after_each_match_reaches_manual_at_75(self):
+        # Inject only the acoustic verdict; exercise the real preparation,
+        # incremental extensions and candidate route with tiny PCM/NPZ files.
+        def evidence(reference, events, *, raw_offset=None):
+            sufficient = raw_offset is None
+            return dict(sufficient=sufficient, expandable=not sufficient,
+                        reasons=[] if sufficient else ['insufficient_independent_regional_support'])
+        shared = self.prepare()
+        with patch.object(vad_evidence, 'evaluate_reference', side_effect=evidence):
+            with self.assertRaisesRegex(product.SubtitleContentMismatchError,
+                                        '75%.*手动.*独立取样区域对同一固定偏移的支持不足'):
+                self.preflight(shared)
+        self.assertEqual(len(self.decode_commands()), 5)
+        self.assertEqual(len(self.match_commands()), 3)
+        self.assertEqual(set(shared.vad_preparation_state['references']), {.5, .6, .75})
+        self.assertFalse((self.root / 'candidate' / 'vad-verdict.json').exists())
+        self.assertFalse((self.root / 'candidate' / 'online-verified.srt').exists())
+        self.assertTrue(any('50%证据不足' in line and '60%' in line for line in self.logs))
+        self.assertTrue(any('60%证据不足' in line and '75%' in line for line in self.logs))
 
     def test_cumulative_prep_budget_excludes_candidate_matches(self):
         self.clock = FakeClock()

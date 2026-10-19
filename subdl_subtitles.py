@@ -13,10 +13,14 @@ import zipfile
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from subtitle_candidate_priority import author_name
+import work_identity_resolver as work_identity
 
 from media_title_resolver import (
     TITLE_SETTINGS_LOCK,
     canonical_title_source,
+    connector_query_proposals,
+    controlled_connector_alias,
     needs_canonical_title,
     reject_canonical_title,
     remember_canonical_title,
@@ -25,11 +29,15 @@ from media_title_resolver import (
     sequel_title_conflict,
 )
 from subtitle_identity_guard import (
+    clean_video_title,
+    catalogue_title_aliases,
+    controlled_film_title_alias,
     container_title,
     container_title_can_replace_filename,
     edition_label,
     filename_container_identity_conflict,
     media_specification,
+    parse_filename_and_container,
 )
 
 
@@ -70,6 +78,9 @@ class SubtitleCandidate:
     feature_year: str = ""
     identity_verified: bool = False
     identity_key: str = ""
+    author: str = ""
+    author_role: str = ""
+    priority_reason: str = ""
 
 
 @dataclass
@@ -83,6 +94,12 @@ class SearchMeta:
     feature_lookup_reason: str = ""
     feature_lookup_attempts: tuple[str, ...] = ()
     fallback_reason: str = ""
+    identity_resolution_status: str = ""
+    identity_resolution_reason: str = ""
+    identity_resolution_requests: int = 0
+    identity_resolution_seconds: float = 0.0
+    identity_resolution_cache_hit: bool = False
+    identity_resolution_evidence: tuple[dict, ...] = ()
 
 
 @dataclass
@@ -160,25 +177,6 @@ def save_settings(api_key: str) -> None:
         settings_path().write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def clean_video_title(path: str) -> tuple[str, str]:
-    stem = Path(path).stem
-    year_matches = list(re.finditer(r"\b(19\d{2}|20\d{2})\b", stem))
-    year_match = year_matches[-1] if year_matches else None
-    year = year_match.group(1) if year_match else ""
-    title = re.sub(r"[._]+", " ", stem)
-    if year_match:
-        title = title[: title.find(year)].strip()
-    title = re.sub(r"\[[^\]]*\]|【[^】]*】|\([^)]*(?:www\.|@)[^)]*\)", " ", title, flags=re.I)
-    title = re.sub(
-        r"\b(?:2160p|1080p|720p|BluRay|WEB[- .]?DL|WEBRip|BDRip|HDR|DV|x26[45]|H\.?26[45]|REMUX|AAC|DDP?\d?(?:\.\d)?|Atmos)\b.*$",
-        "",
-        title,
-        flags=re.I,
-    )
-    title = re.sub(r"\s+", " ", title).strip(" -._([{<")
-    return title or Path(path).stem, year
-
-
 def identify_media(video_path: str) -> MediaIdentity:
     title, year = clean_video_title(video_path)
     embedded_title = container_title(video_path)
@@ -189,7 +187,9 @@ def identify_media(video_path: str) -> MediaIdentity:
             embedded_title,
             flags=re.I,
         ).strip()
-        resolved_title, embedded_year = clean_video_title(embedded_title)
+        filename, internal = parse_filename_and_container(video_path, embedded_title)
+        title, year = filename.title, filename.year
+        resolved_title, embedded_year = internal.title, internal.year
         if container_title_can_replace_filename(title, resolved_title):
             title = resolved_title
             year = year or embedded_year
@@ -354,7 +354,7 @@ def _language_matches(item: dict, requested: str) -> bool:
 
 def _candidate_from_item(item: dict, index: int) -> SubtitleCandidate | None:
     url = str(item.get("url") or item.get("download_url") or "")
-    file_id = str(item.get("n_id") or item.get("id") or item.get("file_n_id") or url or index)
+    file_id = str(item.get("file_n_id") or item.get("n_id") or item.get("id") or url or index)
     if not file_id:
         return None
     releases = item.get("releases") or []
@@ -379,6 +379,8 @@ def _candidate_from_item(item: dict, index: int) -> SubtitleCandidate | None:
         trusted=trusted,
         hearing_impaired=hearing_impaired,
         download_url=url,
+        author=author_name(item.get("author")),
+        author_role="作者（站点标注）",
     )
 
 
@@ -399,6 +401,8 @@ def _candidates_from_response(response: dict, language: str) -> list[SubtitleCan
                 continue
             merged = dict(item)
             merged.update(child)
+            if not author_name(merged.get("author")):
+                merged["author"] = item.get("author")
             candidate = _candidate_from_item(merged, index * 100 + child_index)
             if candidate:
                 results.append(candidate)
@@ -443,6 +447,9 @@ def _movie_title_kind(identity: MediaIdentity, item: dict) -> str:
     ]
     if expected in names:
         return "exact"
+    if (str(item.get('year') or '') == identity.year
+            and any(controlled_film_title_alias(expected, name, identity.year) for name in names)):
+        return 'exact'
     expected_words = expected.split()
     for name in names:
         words = name.split()
@@ -453,7 +460,8 @@ def _movie_title_kind(identity: MediaIdentity, item: dict) -> str:
             for left, right in zip(expected_words, words)
             if left != right
         ]
-        if len(differences) == 1 and _one_edit_apart(*differences[0]):
+        if (len(differences) == 1 and not any(word.isdigit() for word in differences[0])
+                and _one_edit_apart(*differences[0])):
             return "typo"
     return ""
 
@@ -483,6 +491,9 @@ def _resolved_movie_name(identity: MediaIdentity, movie: dict) -> str:
             for name in names:
                 if name and _movie_title_kind(identity, {"name": name}) == kind:
                     return name
+        for name in names:
+            if controlled_connector_alias(identity.original_title or identity.title, name):
+                return name
     return next((name for name in names if name and not needs_canonical_title(name)),
                 next((name for name in names if name), identity.original_title or identity.title))
 
@@ -508,6 +519,23 @@ def _choose_movie_without_score(identity: MediaIdentity, items: list[dict]) -> d
                               for name in ("name", "original_name")})]
         ids = {str(item["sd_id"]) for item in native_matches}
         return native_matches[0] if len(ids) == 1 else None
+    if not identity.year and not localized:
+        # Without a local year, shortened/fuzzy names cannot select a film.
+        # A complete title may still resolve when the catalogue is unambiguous.
+        exact = [item for item in eligible if item.get("sd_id")
+                 and _movie_title_kind(identity, item) == "exact"
+                 and str(item.get("type") or "movie").casefold() == "movie"]
+        ids = {str(item["sd_id"]) for item in exact}
+        if len(ids) != 1:
+            return None
+        related = [item for item in items if str(item.get("sd_id") or "") in ids]
+        years = {str(item["year"]) for item in related if item.get("year")}
+        mappings = [{str(item.get(name) or "").removeprefix("tt").lstrip("0")
+                     for item in related if item.get(name)} for name in ("imdb_id", "tmdb_id")]
+        if (len(years) > 1 or any(len(values) > 1 for values in mappings)
+                or any(str(item.get("type") or "movie").casefold() != "movie" for item in related)):
+            return None
+        return exact[0]
     groups = (
         ("exact", {"exact"}),
         ("exact", {"adjacent"}),
@@ -525,12 +553,34 @@ def _choose_movie_without_score(identity: MediaIdentity, items: list[dict]) -> d
                 and _movie_year_kind(identity, item) in year_kinds
             ):
                 return item
+    connector_matches = [item for item in eligible
+                         if identity.year and _movie_year_kind(identity, item) == "exact"
+                         and re.fullmatch(r"[1-9][0-9]*", str(item.get("sd_id") or ""))
+                         and str(item.get("type") or "movie").casefold() == "movie"
+                         and any(controlled_connector_alias(
+                             identity.original_title or identity.title, str(item.get(name) or ""))
+                             for name in ("name", "original_name"))]
+    ids = {str(item["sd_id"]) for item in connector_matches}
+    if len(ids) == 1:
+        # Do not hide an inconsistent duplicate behind the passing row.
+        related = [item for item in items if str(item.get("sd_id") or "") in ids]
+        id_mappings = [{re.sub(r"^tt", "", str(item.get(name) or "").strip(), flags=re.I).lstrip("0")
+                        for item in related if item.get(name)} for name in ("imdb_id", "tmdb_id")]
+        if (all(_movie_year_kind(identity, item) == "exact"
+                and str(item.get("type") or "movie").casefold() == "movie" for item in related)
+                and all(len(values) <= 1 for values in id_mappings)):
+            return connector_matches[0]
     return None
 
 
 def _movie_queries(identity: MediaIdentity) -> list[str]:
     exact = _safe_search_text(identity.original_title or identity.title)
     queries = [exact] if exact else []
+    queries.extend(_safe_search_text(value) for value in catalogue_title_aliases(exact, identity.year))
+    if not identity.year:
+        return list(dict.fromkeys(queries))
+    if identity.year:
+        queries.extend(_safe_search_text(value) for value in connector_query_proposals(exact))
     ordered = [
         token for token in _title_sequence(exact)
         if token not in TITLE_STOPWORDS and not token.isdigit()
@@ -574,7 +624,9 @@ def _resolve_movie(api_key: str, identity: MediaIdentity) -> dict | None:
                 continue
             key = str(item.get("sd_id") or item.get("imdb_id") or item.get("tmdb_id") or "")
             if key:
-                candidates[key] = item
+                profile = tuple(str(item.get(name) or "") for name in (
+                    "year", "name", "original_name", "imdb_id", "tmdb_id", "type"))
+                candidates[str((key, profile))] = item
         if candidates:
             selected = _choose_movie_without_score(identity, list(candidates.values()))
             if diagnostics is not None:
@@ -602,10 +654,121 @@ def _resolve_movie(api_key: str, identity: MediaIdentity) -> dict | None:
     return _choose_movie_without_score(identity, list(candidates.values()))
 
 
-def search(api_key: str, video_path: str, language: str) -> tuple[MediaIdentity, list[SubtitleCandidate], SearchMeta]:
+def _subdl_id_key(value) -> str:
+    match = re.fullmatch(r"(?:sd)?([1-9][0-9]*)", str(value or ""))
+    return match.group(1) if match else ""
+
+
+def _confirmed_work_movie(response: dict, confirmed) -> tuple[dict | None, str]:
+    """Bind an ID lookup to every relevant returned row, before taking sd_id."""
+    if not isinstance(response, dict) or not isinstance(response.get("results"), list):
+        return None, "SubDL作品ID查询响应格式无效，未回退宽搜"
+    entries = response["results"]
+    if len(entries) >= 30 or any(response.get(name) for name in ("next", "next_page", "has_more", "truncated")):
+        return None, "SubDL作品ID查询结果可能未完整加载，未回退宽搜"
+    if any(not isinstance(row, dict) for row in entries):
+        return None, "SubDL作品ID查询含无效条目，未回退宽搜"
+    expected_imdb = work_identity.id_key(confirmed.imdb_id, imdb=True)
+    expected_tmdb = work_identity.id_key(confirmed.tmdb_id)
+    expected_title = work_identity.title_key(confirmed.title)
+    expected_year = str(confirmed.year)
+    matches = []
+    for row in entries:
+        imdb = work_identity.id_key(row.get("imdb_id"), imdb=True)
+        tmdb = work_identity.id_key(row.get("tmdb_id"))
+        year = str(row.get("year") or "")
+        names = {work_identity.title_key(row.get(name)) for name in ("name", "original_name") if row.get(name)}
+        related_id = imdb == expected_imdb or tmdb == expected_tmdb
+        same_title_year = expected_title in names and year == expected_year
+        if not related_id and not same_title_year:
+            continue
+        if imdb != expected_imdb or tmdb != expected_tmdb:
+            return None, "SubDL同片条目的IMDb/TMDB映射存在冲突或缺失，未回退宽搜"
+        if str(row.get("type") or "").casefold() != "movie":
+            return None, "SubDL已确认作品ID返回非电影条目，未回退宽搜"
+        if year != expected_year or expected_title not in names:
+            return None, "SubDL已确认作品ID的完整片名或年份冲突，未回退宽搜"
+        sd_id = str(row.get("sd_id") or "")
+        if not _subdl_id_key(sd_id):
+            return None, "SubDL已确认作品缺少有效站内ID，未回退宽搜"
+        matches.append(row)
+    matched_sd_ids = {_subdl_id_key(row["sd_id"]) for row in matches}
+    if len(matched_sd_ids) != 1:
+        return None, "SubDL未确认与作品证据一致的唯一站内ID，未回退宽搜"
+    if any(_subdl_id_key(row.get("sd_id")) in matched_sd_ids and row not in matches for row in entries):
+        return None, "SubDL同一站内ID关联了其他作品条目，未回退宽搜"
+    return matches[0], ""
+
+
+def _search_confirmed_work(api_key: str, base: MediaIdentity, language: str, confirmed):
+    """Reuse an acquired proof; do not acquire another alias or accept a guess."""
+    def rejected(reason):
+        return base, [], SearchMeta(
+            query_mode="identity-conflict", feature_lookup_status="identity-conflict",
+            feature_lookup_reason=reason, fallback_reason=reason,
+            identity_resolution_status="identity-conflict", identity_resolution_reason=reason,
+        )
+
+    if not work_identity.validate_resolution(base, confirmed):
+        return rejected("跨字幕站作品证据与完整本地片名、年份或双ID不符，未回退宽搜")
+    response = _request_v2(api_key, "/movies/search", params={
+        "q": "tt" + work_identity.id_key(confirmed.imdb_id, imdb=True).zfill(7),
+        "type": "movie", "limit": 30,
+    })
+    movie, conflict = _confirmed_work_movie(response, confirmed)
+    if conflict:
+        return rejected(conflict)
+    resolved = MediaIdentity(
+        title=base.title, original_title=confirmed.title, year=confirmed.year,
+        imdb_id=work_identity.id_key(confirmed.imdb_id, imdb=True),
+        tmdb_id=work_identity.id_key(confirmed.tmdb_id), provider_id=str(movie["sd_id"]),
+        edition=base.edition, specification=base.specification,
+    )
+    response = _request_v2(api_key, "/subtitles/search", params={
+        "sd_id": movie["sd_id"], "languages": LANGUAGE_CODES.get(language, "ZH"),
+        "subs_per_page": 30, "unpack": 1,
+    })
+    # The list endpoint can echo its own work metadata. Validate it before
+    # attaching the requested identity to subtitles; do not overwrite a
+    # different response work with our trusted request's identity.
+    if not isinstance(response, dict):
+        return rejected("SubDL字幕列表响应格式无效，未回退宽搜")
+    for field_name in ("results", "movie", "movies", "feature"):
+        if field_name not in response or response[field_name] is None:
+            continue
+        metadata = response[field_name]
+        entries = [metadata] if isinstance(metadata, dict) else metadata
+        echoed_movie, conflict = _confirmed_work_movie({"results": entries}, confirmed)
+        if conflict:
+            return rejected("SubDL字幕列表返回的作品元数据不符：" + conflict)
+        if _subdl_id_key(echoed_movie["sd_id"]) != _subdl_id_key(movie["sd_id"]):
+            return rejected("SubDL字幕列表返回了另一站内作品ID，未回退宽搜")
+    results = _candidates_from_response(response, language)
+    for item in results:
+        item.feature_title = resolved.original_title
+        item.feature_year = resolved.year
+        item.identity_verified = True
+        item.identity_key = "imdb:" + resolved.imdb_id
+        item.recommendation = "待内容验证"
+        item.match_reason = "复用完整同片证据，本站已复核作品ID；仍需用途、正文和时间轴核验"
+    total = len(response.get("subtitles") or [])
+    reason = "复用已确认的完整片名/别名、年份及双ID，本站已复核唯一站内ID"
+    return resolved, results, SearchMeta(
+        total_count=total, loaded_count=len(results), query_mode="confirmed-work-id",
+        truncated=total >= 30, feature_lookup_status="resolved", feature_lookup_reason=reason,
+        feature_lookup_attempts=("复用前站同片证据；SubDL按IMDb复核站内ID，未重新猜测片名",),
+        identity_resolution_status="confirmed", identity_resolution_reason=reason,
+        identity_resolution_cache_hit=bool(confirmed.cache_hit),
+        identity_resolution_evidence=tuple(confirmed.evidence),
+    )
+
+
+def search(api_key: str, video_path: str, language: str, *, confirmed_work_identity=None) -> tuple[MediaIdentity, list[SubtitleCandidate], SearchMeta]:
     if conflict := filename_container_identity_conflict(video_path):
         raise RuntimeError(conflict)
     base_identity = identify_media(video_path)
+    if confirmed_work_identity is not None:
+        return _search_confirmed_work(api_key, base_identity, language, confirmed_work_identity)
     identity = base_identity
     localized = needs_canonical_title(identity.title)
     config = settings_path() if localized else None
@@ -661,8 +824,11 @@ def search(api_key: str, video_path: str, language: str) -> tuple[MediaIdentity,
             recover_after(index)
     language_code = LANGUAGE_CODES.get(language, "ZH")
     if not movie:
+        if not base_identity.year and not localized:
+            fallback_reason = ("完整片名未确认唯一影片身份，文件名也没有年份；停止缩短片名或按缩写宽搜。"
+                               "请补全正确片名和年份，或使用字幕选择。")
         return base_identity, [], SearchMeta(
-            query_mode="unresolved-title" if localized else "title-year",
+            query_mode="unresolved-title" if localized or not base_identity.year else "title-year",
             feature_lookup_status=lookup.status, feature_lookup_reason=lookup.reason,
             feature_lookup_attempts=tuple(attempts), fallback_reason=fallback_reason,
         )

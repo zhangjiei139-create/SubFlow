@@ -3,15 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import threading
 import time
+import subtitle_audit
+import audio_roles
 from contextlib import contextmanager
 
 # Acceptance rules and acoustic preparation have independent cache versions.
 # A peak-acceptance correction must recheck the verdict without decoding again.
 FINGERPRINT_RULE_VERSION = 'continuous-vad-v4-sampled-stereo-preserve-20261002'
-RULE_VERSION = 'continuous-vad-v6-outside-range-peak-20261003'
+RULE_VERSION = 'continuous-vad-v8-independent-regional-support-20261010'
 PROPOSAL_REPORT_PREFIX = '连续VAD时间轴核验通过：提议固定偏移'
 LEGACY_VERIFIED_REPORT_PREFIX = '连续VAD确认固定偏移'
 _PENDING_ACCEPTANCE_NOTE = '；待候选其余验收'
@@ -30,6 +33,8 @@ _EVIDENCE_REASONS = {
     'tool_coordinate_invalid': '引擎偏移与取样坐标不一致',
     'range_limited': '偏移触及搜索边界',
     'outside_range_peak': '自动范围外存在明显更强的时间匹配',
+    'regional_offset_conflict': '独立取样区域支持的固定偏移相互冲突',
+    'insufficient_independent_regional_support': '独立取样区域对同一固定偏移的支持不足',
 }
 
 
@@ -65,22 +70,41 @@ def _decode_cost(track):
     return 2
 
 
-def audio_track(tracks, selected_id=None):
-    import pro_core as p
-    audio = [t for t in tracks if t.type == 'audio' and not any(
-        word in (t.name or '').lower() for word in
-        ('commentary', 'director', 'comment', '解说', '解說', '评论', '評論',
-         'audio description', 'descriptive', '口述影像', 'isolated score', 'music only',
-         'partial', 'sample only', '片段音轨', '片段音軌'))]
+def _dialogue_audio_tracks(tracks):
+    audio = audio_roles.dialogue_tracks(tracks)
     if not audio:
         raise RuntimeError('未找到正常对白音轨，不能使用评论或片段音轨纠偏。')
-    english = [t for t in audio if p.normalize_language_code(t.language) == 'en']
-    base = next((t for t in audio if t.id == selected_id), None) or next((t for t in audio if t.default), audio[0])
-    language = p.normalize_language_code(base.language)
-    # Unknown labels are not evidence that two tracks have the same language.
-    pool = english or ([t for t in audio if p.normalize_language_code(t.language) == language]
-                       if language != 'und' else [base])
-    return min(pool, key=lambda t: (_decode_cost(t), t.id != base.id, not t.default, t.id))
+    return audio
+
+
+def _preferred_audio(audio, selected_id):
+    return (next((t for t in audio if t.id == selected_id), None)
+            or next((t for t in audio if t.default), audio[0]))
+
+
+def main_audio_track(tracks, selected_id=None):
+    """Resolve the normal main track without applying decoder-cost ranking."""
+    return _preferred_audio(_dialogue_audio_tracks(tracks), selected_id)
+
+
+def audio_track(tracks, selected_id=None):
+    """Choose a cheap reference within the main track's language and purpose."""
+    import pro_core as p
+    audio = _dialogue_audio_tracks(tracks)
+    main = _preferred_audio(audio, selected_id)
+    language = p.normalize_language_code(main.language)
+    compatible = [t for t in audio if p.normalize_language_code(t.language) == language]
+    return min(compatible, key=lambda t: (_decode_cost(t), t.id != main.id, not t.default, t.id))
+
+
+def subtitle_anchor_language(tracks, selected_id=None):
+    """Preserve subtitle language priority independently of the VAD decoder choice."""
+    import pro_core as p
+    from profile_model import normalize_language
+    audio = _dialogue_audio_tracks(tracks)
+    if any(p.normalize_language_code(t.language) == 'en' for t in audio):
+        return 'en'
+    return normalize_language(_preferred_audio(audio, selected_id).language)
 
 
 def cache_directory(movie):
@@ -102,10 +126,60 @@ def image_preparation_budget_seconds(duration_seconds):
     return float(min(300, max(60, math.ceil(duration_seconds / 60.0 + 30.0))))
 
 
-def shared_audio(movie, selected_id, log, cancel=None, budget=None):
+def _audio_priority_flags(state=None):
+    state = state if isinstance(state, dict) else {}
+    flags = {key: state.get(key) is True
+             for key in ('priority_promoted', 'priority_attempted')}
+    flags['priority_attempted'] = flags['priority_attempted'] or flags['priority_promoted']
+    return flags
+
+
+def _merge_audio_priority_flags(state, policy=None, *, inherited=None):
+    """Only two Boolean scheduling flags cross preparation stage boundaries."""
+    old = _audio_priority_flags(state)
+    inherited = _audio_priority_flags(inherited)
+    for key, attribute in (('priority_promoted', 'promoted'), ('priority_attempted', 'attempted')):
+        state[key] = bool(old[key] or inherited[key]
+                          or (policy is not None and getattr(policy, attribute, False) is True))
+
+
+def _attach_audio_priority(deadline, log, *, initial_promoted=False, initial_attempted=False):
+    """Only actual film preparation opts into bounded decoder scheduling.
+
+    A candidate's 20-second matching clock never supplies this policy's budget.
+    Lock waiting and previous preparation have already spent their time before
+    this helper runs; the original absolute deadline is never extended.
+    """
+    if os.name != 'nt':
+        return None
+    preparation_deadline = getattr(deadline, 'deadline', None)
+    if (not isinstance(preparation_deadline, (int, float))
+            or isinstance(preparation_deadline, bool) or not math.isfinite(preparation_deadline)):
+        return None
+    remaining = preparation_deadline - time.monotonic()
+    if remaining <= 0 or (remaining < 60 and not initial_promoted):
+        return None
+    from audio_priority import AudioPriorityPolicy
+    policy = AudioPriorityPolicy(preparation_deadline, remaining, log,
+                                 initial_promoted=initial_promoted,
+                                 initial_attempted=initial_attempted)
+    deadline._audio_priority_policy = policy
+    return policy
+
+
+def shared_audio(movie, selected_id, log, cancel=None, budget=None, *, reference_audio_id=None,
+                 _session=True, _priority_state=None):
     import pro_core as p
     import subtitle_tool_core as core
-    audio = audio_track(core.inspect_tracks(movie), selected_id)
+    tracks = core.inspect_tracks(movie)
+    audio = audio_track(tracks, selected_id)
+    if reference_audio_id is not None:
+        audio = next((t for t in _dialogue_audio_tracks(tracks) if t.id == reference_audio_id), None)
+        if audio is None:
+            raise RuntimeError('所选参照音轨不存在或用途不适合正片对白。')
+    selection = ('使用明确指定的参照音轨，不再按成本改选。' if reference_audio_id is not None
+                 else '用途过滤后，同参照语言按解码成本优先；多份字幕时间核验失败再复核主轨。')
+    log('时间轴参照选择：' + audio_roles.describe(audio) + '；' + selection)
     media = core.inspect_media(movie)
     ns = core.video_track_duration_ns(media) or core.media_duration_ns(media)
     duration = ns / 1e9 if ns > 0 else 0.0
@@ -121,6 +195,8 @@ def shared_audio(movie, selected_id, log, cancel=None, budget=None):
     with _locks_guard:
         lock = _locks.setdefault(key, threading.Lock())
     acquired = False
+    priority_policy = None
+    priority_flags = _audio_priority_flags(_priority_state)
     try:
         while not acquired:
             core.check_cancel(deadline)
@@ -128,6 +204,9 @@ def shared_audio(movie, selected_id, log, cancel=None, budget=None):
         core.check_cancel(deadline)
         log(f'影片音频准备：片长{duration / 60:.1f}分钟，参照音轨{audio.id}（{audio.codec}）；'
             f'本次最多{limit:g}秒，完成后立即继续，后续候选共用。')
+        priority_policy = _attach_audio_priority(deadline, log,
+            initial_promoted=priority_flags['priority_promoted'],
+            initial_attempted=priority_flags['priority_attempted'])
         reference = p._build_continuous_alignment_audio(movie, audio.id, root / f'audio-{audio.id}', log, deadline)
     except core.CancelledError as exc:
         core.check_cancel(cancel)
@@ -136,9 +215,13 @@ def shared_audio(movie, selected_id, log, cancel=None, budget=None):
                 f'影片连续VAD准备达到{limit:g}秒上限；音频准备未完成，候选尚未核验。') from exc
         raise
     finally:
+        _merge_audio_priority_flags(priority_flags, priority_policy)
+        if isinstance(_priority_state, dict):
+            # Preserve a failed native attempt even when this preparation raises.
+            _merge_audio_priority_flags(_priority_state, inherited=priority_flags)
         if acquired:
             lock.release()
-    return p.SharedSubtitleContentAudio(
+    prepared = p.SharedSubtitleContentAudio(
         duration_seconds=ns / 1e9 if ns > 0 else 0,
         validation_audio_id=audio.id,
         audio_stream_index=p._audio_stream_index(movie, audio.id) or 0,
@@ -146,8 +229,10 @@ def shared_audio(movie, selected_id, log, cancel=None, budget=None):
         fingerprint=None,
         vad_reference=reference,
         vad_preparation_state=dict(limit=limit, spent=time.monotonic() - started,
-                                   references={.5: reference}),
+                                   references={.5: reference},
+                                   **priority_flags),
     )
+    return ReferenceAudioSession(prepared, selected_id, tracks, movie=movie) if _session else prepared
 
 
 @contextmanager
@@ -197,6 +282,9 @@ def _extend_reference(movie, shared, reference, fraction, log, cancel):
         if remaining <= 0:
             raise p.SubtitlePreflightTimeoutError(f'影片取样准备已用完累计{limit:g}秒上限。')
         preparation_cancel = p._DeadlineCancel(cancel, time.monotonic() + remaining)
+        priority_policy = _attach_audio_priority(preparation_cancel, log,
+            initial_promoted=state.get('priority_promoted') is True,
+            initial_attempted=state.get('priority_attempted') is True)
         started = time.monotonic()
         try:
             result = p._build_continuous_alignment_audio(
@@ -210,6 +298,7 @@ def _extend_reference(movie, shared, reference, fraction, log, cancel):
             raise
         finally:
             state['spent'] = state.get('spent', 0) + time.monotonic() - started
+            _merge_audio_priority_flags(state, priority_policy)
             log(f'影片取样准备累计耗时 {state["spent"]:.2f}秒 / {limit:g}秒。')
         references[fraction] = result
         return result
@@ -218,7 +307,144 @@ def _extend_reference(movie, shared, reference, fraction, log, cancel):
             lock.release()
 
 
+
+class ReferenceAudioSession:
+    """One film's bounded reference decision; immutable audio snapshots stay intact."""
+    def __init__(self, current, selected_id, tracks, *, movie=None):
+        self.current=current
+        self.selected_id=selected_id
+        self.tracks=tuple(tracks)
+        self.lock=threading.RLock()
+        self.failures={}
+        self.failure_reasons={}
+        self.fallback_used=False
+        self.revision=0
+        self.confirmed=False
+        self.unconfirmed=False
+        self.checked_references=[current.vad_reference]
+        self.movie_signature=None
+        if movie is not None:
+            source=Path(movie).resolve();stat=source.stat()
+            self.movie_signature=(str(source),stat.st_size,stat.st_mtime_ns)
+
+    def __getattr__(self, name):
+        return getattr(self.current, name)
+
+
+def _timing_failure(exc):
+    import pro_core as p
+    return isinstance(exc,p.SubtitleContentMismatchError) and any(
+        text in str(exc) for text in ('连续VAD','中间75%','独立取样区域'))
+
+
+def _subtitle_clock(source):
+    import subtitle_tool_core as core
+    events=core.parse_subtitle(Path(source))
+    return hashlib.sha256(json.dumps([(e.start,e.end) for e in events]).encode()).hexdigest()
+
+
 def preflight(movie, subtitle, work_dir, selected_id, log, cancel=None, *, shared=None,
+              source_language='', candidate_label='字幕', budget=20.0, output_name='online-verified.srt'):
+    import pro_core as p
+    import subtitle_tool_core as core
+    kwargs=dict(source_language=source_language,candidate_label=candidate_label,budget=budget,output_name=output_name)
+    if shared is None:
+        return _preflight_reference(movie,subtitle,work_dir,selected_id,log,cancel,shared=None,**kwargs)
+    if not isinstance(shared,ReferenceAudioSession):
+        return _preflight_reference(movie,subtitle,work_dir,selected_id,log,cancel,shared=shared,**kwargs)
+    session=shared
+    acquired=False
+    try:
+        with _pause_candidate_clocks(cancel):
+            while not acquired:
+                core.check_cancel(cancel)
+                acquired=session.lock.acquire(timeout=.1)
+        core.check_cancel(cancel)
+        if session.movie_signature is not None:
+            source=Path(movie).resolve();stat=source.stat()
+            if session.movie_signature!=(str(source),stat.st_size,stat.st_mtime_ns):
+                raise p.SubtitleVerificationToolError('影片已变化，不能沿用旧参照音轨或核验结果。')
+        try:
+            result=_preflight_reference(movie,subtitle,work_dir,selected_id,log,cancel,shared=session.current,**kwargs)
+            session.confirmed=True
+            return result
+        except p.SubtitleContentMismatchError as original:
+            if not _timing_failure(original) or session.confirmed:
+                raise
+            try:
+                clock=_subtitle_clock(subtitle)
+            except core.CancelledError:
+                raise
+            except Exception as exc:
+                raise p.SubtitleVerificationToolError(
+                    f'记录字幕时间轴证据失败（{type(exc).__name__}: {exc}）；'
+                    '主轨复核尚未执行，不能据此判定字幕不匹配。') from exc
+            session.failure_reasons[str(subtitle)]=str(original)
+            session.failures.setdefault(clock,(str(subtitle),str(work_dir),dict(kwargs)))
+            if len(session.failures)<2 or session.fallback_used:
+                if session.fallback_used:
+                    original.args=('参照音轨或字幕版本待确认：'+str(original),)
+                raise
+            alternative=main_audio_track(session.tracks,session.selected_id)
+            if alternative.id==session.current.validation_audio_id:
+                log('当前参照已是正片主音轨；多份字幕未通过，不重复准备主轨或自动轮换其他音轨。')
+                raise
+            session.fallback_used=True
+            previous=session.current
+            spent=previous.vad_preparation_state.get('spent',0)
+            limit=previous.vad_preparation_state.get('limit',preparation_budget_seconds(previous.duration_seconds))
+            remaining=limit-spent
+            if remaining<=0:
+                raise p.SubtitlePreflightTimeoutError('备用音轨复核未启动：影片共用音频准备预算已用完。')
+            log(f'参照音轨复核：两份不同时间轴字幕均未通过轨{previous.validation_audio_id}；'
+                f'暂停继续换字幕，仅复核一次正片主轨：{audio_roles.describe(alternative)}；不改变核验门槛。')
+            preparation_started=time.monotonic()
+            priority_state = _audio_priority_flags(previous.vad_preparation_state)
+            try:
+                with _pause_candidate_clocks(cancel):
+                    alternate=shared_audio(movie,selected_id,log,cancel,remaining,
+                        reference_audio_id=alternative.id,_session=False,
+                        _priority_state=priority_state)
+            finally:
+                previous.vad_preparation_state['spent']=spent+time.monotonic()-preparation_started
+                _merge_audio_priority_flags(previous.vad_preparation_state, inherited=priority_state)
+            if session.movie_signature is not None:
+                source=Path(movie).resolve();stat=source.stat()
+                if session.movie_signature!=(str(source),stat.st_size,stat.st_mtime_ns):
+                    raise p.SubtitleVerificationToolError('影片在备用音轨准备前后发生变化，未采用核验结果。')
+            alternate.vad_preparation_state['spent']+=spent
+            alternate.vad_preparation_state['limit']=limit
+            _merge_audio_priority_flags(alternate.vad_preparation_state, inherited=priority_state)
+            first_error=None
+            attempts=[(str(subtitle),str(work_dir),kwargs)]
+            attempts.extend(value for value in session.failures.values() if value[0]!=str(subtitle))
+            for source,folder,options in attempts:
+                core.check_cancel(cancel)
+                try:
+                    result=_preflight_reference(movie,source,folder,selected_id,log,cancel,shared=alternate,**options)
+                except p.SubtitleContentMismatchError as exc:
+                    if first_error is None: first_error=exc
+                    continue
+                session.current=alternate
+                session.revision+=1
+                session.confirmed=True
+                log(f'参照音轨已改为轨{alternate.validation_audio_id}：同一原字幕通过原时间轴门槛；'
+                    '原参照用途仍未确认，不自动标为评论轨或删除。')
+                if source==str(subtitle): return result
+                log('较早候选在备用音轨上通过；将回到该原候选完成其余验收，不重新下载。')
+                raise first_error or original
+            # Failed alternate preparation still spends the same film budget.
+            previous.vad_preparation_state['spent']=alternate.vad_preparation_state['spent']
+            session.unconfirmed=True
+            session.checked_references.append(alternate.vad_reference)
+            log('备用音轨复核仍未建立可靠时间轴；参照音轨或字幕版本需人工确认，不继续自动换轨。')
+            original.args=('参照音轨或字幕版本待确认：'+str(original),)
+            raise original
+    finally:
+        if acquired: session.lock.release()
+
+
+def _preflight_reference(movie, subtitle, work_dir, selected_id, log, cancel=None, *, shared=None,
               source_language='', candidate_label='字幕', budget=20.0, output_name='online-verified.srt'):
     import pro_core as p
     import subtitle_tool_core as core
@@ -286,6 +512,11 @@ def preflight(movie, subtitle, work_dir, selected_id, log, cancel=None, *, share
                     and math.isfinite(cached_offset)
                     and abs(cached_offset)<=p.MAX_AUTOMATIC_OFFSET_SECONDS):
                 report=_proposal_report(cached_offset,shared)
+                audit = subtitle_audit.current()
+                if audit is not None:
+                    cached_evidence = dict(saved.get('evidence') or {})
+                    cached_evidence.setdefault('offset_seconds', cached_offset)
+                    audit.evidence(source, matched_reference or '', cached_evidence, cache_reused=True)
                 log('复用相同字幕、音轨和规则的连续VAD时间轴预检结果；候选仍需完成其余验收。')
                 log(candidate_label+'：'+report)
                 return output,report
@@ -332,8 +563,25 @@ def preflight(movie, subtitle, work_dir, selected_id, log, cancel=None, *, share
                     raise p.SubtitleContentMismatchError('连续VAD结果触及自动±10秒范围，请使用手动核听。')
                 if info:
                     evidence=vad_evidence.evaluate_reference(reference,local_events,raw_offset=raw)
+                    # Keep every window's local estimate and quality, including
+                    # unsupported observations. They never grant acceptance.
+                    info_origin = info['range']['start_frame'] / sample.FRAME_RATE
+                    window_record = dict(evidence)
+                    window_record['movie_origin_seconds'] = info_origin
+                    window_record['sample_fraction'] = matched_fraction
+                    (work / f'vad-evidence-{round(matched_fraction*100)}.json').write_text(
+                        json.dumps(window_record, ensure_ascii=False, indent=2), encoding='utf-8')
+                    audit = subtitle_audit.current()
+                    if audit is not None:
+                        audit.evidence(source, reference, window_record)
                     if evidence.get('coordinate_error') or evidence.get('tool_coordinate_invalid'):
                         raise p.SubtitleVerificationToolError('取样字幕与声音坐标不一致，未应用偏移。')
+                    if evidence.get('regional_offset_conflict'):
+                        offsets = '、'.join(f"{item['offset_seconds']:+.2f}秒"
+                                          for item in evidence['regional_offsets'])
+                        raise p.SubtitleContentMismatchError(
+                            f'连续VAD独立区域的可信偏移冲突（{offsets}），不能统一平移；'
+                            '疑似漂移、跳变或混轴，未应用偏移；请核听前中后或更换字幕。')
                     if evidence.get('outside_range_peak'):
                         outside=evidence['diagnostic_offset_seconds']
                         message=(f'连续VAD：±10秒内提议 {raw:+.2f} 秒，'
@@ -359,7 +607,21 @@ def preflight(movie, subtitle, work_dir, selected_id, log, cancel=None, *, share
             if not evidence.get('expandable',False):
                 raise p.SubtitleVerificationToolError(f'取样时间轴资料无效，不能通过扩展修复：{reason}')
             if matched_fraction is None or matched_fraction>=.75:
-                raise p.SubtitleContentMismatchError(f'中间75%仍缺少可用时间轴证据，请手动核听或换字幕：{reason}')
+                message=f'中间75%仍缺少可用时间轴证据，请手动核听或换字幕：{reason}'
+                if (matched_fraction == .75
+                        and evidence.get('reasons') == ['insufficient_independent_regional_support']
+                        and evidence.get('fft_evaluated')
+                        and not any(evidence.get(key) for key in (
+                            'range_limited', 'outside_range_peak', 'coordinate_error',
+                            'tool_coordinate_invalid', 'regional_offset_conflict'))):
+                    # A completed evidence audit may itself consume the last
+                    # match-clock time. Cancellation/timeout must win over
+                    # retaining a candidate for manual listening.
+                    core.check_cancel(deadline)
+                    raise p.SubtitleInsufficientRegionalSupportError(
+                        evidence, reference, getattr(shared,'vad_preparation_state',{}),
+                        message=message)
+                raise p.SubtitleContentMismatchError(message)
             next_fraction=.6 if matched_fraction<.6 else .75
             log(f'{candidate_label}：中间{matched_fraction:.0%}证据不足（{reason}），才向两侧扩至{next_fraction:.0%}。')
             with _pause_candidate_clocks(deadline):

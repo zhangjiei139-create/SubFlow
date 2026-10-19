@@ -421,16 +421,20 @@ class BatchSubtitleVerificationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             subtitle = Path(folder) / "downloaded.srt"
             write_movie_srt(subtitle)
+            movie = Path(folder) / "movie.mkv"
+            movie.write_bytes(b"movie")
             with patch.object(batch_core, "_inspect_media_cached", return_value=({}, False)), patch.object(
                 batch_core.core, "tracks_from_media", return_value=self.tracks
             ):
                 plan = batch_core.analyze_video(
-                    "movie.mkv",
+                    str(movie),
                     self.profile,
                     str(subtitle),
                     "en",
                     True,
                     "verified",
+                    external_subtitle_media_signature=batch_core.media_signature(movie),
+                    external_subtitle_content_hash=batch_core.hashlib.sha256(subtitle.read_bytes()).hexdigest(),
                 )
 
         self.assertEqual(plan.status, "ready")

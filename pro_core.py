@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import copy
 import hashlib
 import shutil
 import subprocess
@@ -35,6 +36,9 @@ import audio_fine_aligner
 import audio_precision_gate
 import subtitle_offset_guard
 import pgs_local_alignment
+import subtitle_roles
+import subtitle_audit
+from subtitle_languages import subtitle_language
 
 
 class SubtitlePreflightError(RuntimeError):
@@ -43,6 +47,37 @@ class SubtitlePreflightError(RuntimeError):
 
 class SubtitleContentMismatchError(SubtitlePreflightError):
     """The check completed normally and proved that the content does not match."""
+
+
+class SubtitleInsufficientRegionalSupportError(SubtitleContentMismatchError):
+    """Completed preflight lacks only independent regional timing support.
+
+    This is a structured rejection, never an automatic acceptance. Controllers
+    may retain its original candidate for explicit human listening after other
+    candidates have been tried. The snapshots do not share mutable state with
+    the film preparation clock or subsequent candidates.
+    """
+    reason_code = "insufficient_independent_regional_support"
+
+    def __init__(self, evidence, reference, preparation_state, message=None):
+        if (not isinstance(evidence, dict)
+                or evidence.get("reasons") != [self.reason_code]
+                or any(evidence.get(key) for key in (
+                    "range_limited", "outside_range_peak", "coordinate_error",
+                    "tool_coordinate_invalid", "regional_offset_conflict"))):
+            raise ValueError("只有独立区域支持不足可保留为人工核听候选。")
+        super().__init__(message or "中间75%仅独立取样区域支持不足，需要手动核听；未采用偏移。")
+        self.evidence = copy.deepcopy(evidence)
+        self.reference = Path(reference)
+        self.preparation_state = copy.deepcopy(preparation_state or {})
+
+
+class RetainedSubtitleVerificationError(SubtitleContentMismatchError):
+    """The text passed audio timing; a separate retained track did not pass."""
+    def __init__(self, message, results, aligned=""):
+        super().__init__(message)
+        self.results = copy.deepcopy(results)
+        self.aligned_subtitle = str(aligned)
 
 
 class SubtitleVerificationToolError(SubtitlePreflightError):
@@ -222,8 +257,29 @@ def _run(
     log: Callable[[str], None],
     cancel: threading.Event | None,
     cwd: str | None = None,
+    *,
+    process_monitor=None,
 ) -> subprocess.CompletedProcess:
+    if process_monitor is not None:
+        return legacy.run_command(args, log=log, cancel_event=cancel, cwd=cwd,
+                                  process_monitor=process_monitor)
     return legacy.run_command(args, log=log, cancel_event=cancel, cwd=cwd)
+
+
+def _audio_preparation_priority(cancel):
+    """Only film preparation explicitly attaches a scheduling policy.
+
+    Candidate matching has its own nested 20-second clocks; neither those nor
+    arbitrary caller deadlines opt a tool into audio preparation scheduling.
+    """
+    seen = set()
+    while cancel is not None and id(cancel) not in seen:
+        seen.add(id(cancel))
+        policy = getattr(cancel, '_audio_priority_policy', None)
+        if policy is not None:
+            return policy
+        cancel = getattr(cancel, 'cancel_event', None)
+    return None
 
 
 def subtitle_events_to_srt(source: Path, destination: Path) -> Path:
@@ -553,6 +609,7 @@ def complete_shared_image_timing(request: SharedImageTimingPreparationRequired, 
 def _pgs_sample_windows(
     reference_intervals: list[tuple[float, float]],
     duration: float,
+    *, require_dense: bool = True,
 ) -> list[tuple[int, int]]:
     """Choose one dense, non-overlapping 120-second window in each third."""
     if duration < 360.0:
@@ -570,9 +627,10 @@ def _pgs_sample_windows(
             candidate = (count, -abs(window_start + 60 - midpoint), window_start)
             if best is None or candidate > best:
                 best = candidate
-        if best is None or best[0] < 20:
+        if require_dense and (best is None or best[0] < 20):
             return []
-        windows.append((best[2], best[2] + 120))
+        start = best[2] if best is not None else int(midpoint - 60)
+        windows.append((start, start + 120))
     return windows
 
 
@@ -682,6 +740,7 @@ def _pgs_local_reason(reason: str) -> str:
         "mutual_anchors_insufficient": "相互对应的字幕起点不足或分布不够分散",
         "too_few_distinct_starts": "可比较的独立字幕起点不足",
         "empty_candidate_region": "某一区没有有效图片字幕时间点",
+        "regional_offset_conflict": "独立区域各自通过检查，但支持的固定偏移相互冲突",
     }.get(reason, "局部时间点数据不足或无效")
 
 
@@ -756,7 +815,8 @@ def _pgs_local_corrections(
                         f"{'保持原时间轴' if offset == 0 else '可按此偏移纠正'}，局部{minutes}分钟检查通过。")
                 else:
                     log(f"图片字幕序号 {ordinal}：局部{minutes}分钟证据不足：{_pgs_local_reason(result.reason)}")
-            pending = {ordinal for ordinal in pending if not results[ordinal].accepted}
+            pending = {ordinal for ordinal in pending
+                       if not results[ordinal].accepted and not results[ordinal].timing_conflict}
             completed_expansion = minutes == 8
             if not pending:
                 break
@@ -806,6 +866,29 @@ def _pgs_local_corrections(
                 raise
     log(f"图片字幕局部检查耗时 {time.monotonic() - started:.2f} 秒；已通过 {sum(result.accepted for result in results.values())}/{len(subtitle_stream_indices)} 轨。")
     return results
+
+
+def _full_image_region_consistency(reference_intervals, intervals, duration, offset, cancel):
+    """Full packets may fill gaps, but a global majority cannot erase a conflict."""
+    initial = _pgs_sample_windows(reference_intervals, duration, require_dense=False)
+    result = pgs_local_alignment.RegionConsistencyResult(False)
+    if len(initial) != 3:
+        return result
+    previous = None
+    for minutes in (2, 4, 8):
+        legacy.check_cancel(cancel)
+        windows = _pgs_expanded_windows(initial, duration, minutes * 60)
+        if windows == previous:
+            break
+        previous = windows
+        regions = [[(a, b) for a, b in intervals if b > low - 15 and a < high + 15]
+                   for low, high in windows]
+        result = pgs_local_alignment.evaluate_region_consistency(
+            reference_intervals, windows, regions, proposed_offset=offset)
+        legacy.check_cancel(cancel)
+        if result.conflict or all(value is not None for value in result.offsets):
+            return result
+    return result
 
 
 def _pgs_sampled_noop(input_path, subtitle_stream_index, reference_intervals,
@@ -1203,7 +1286,9 @@ def _build_sampled_alignment_audio(movie, audio_id, cache_dir, log, cancel,
     started = time.monotonic()
     decode_elapsed = vad_elapsed = 0.0
 
-    def make_segment(span, name):
+    priority_policy = _audio_preparation_priority(cancel)
+
+    def make_segment(span, name, future_media_seconds=0.0):
         nonlocal actual_mode, decode_elapsed, vad_elapsed
         wav = cache / f'pcm-{token}-{name}.wav'
         npz = wav.with_suffix('.npz')
@@ -1212,15 +1297,30 @@ def _build_sampled_alignment_audio(movie, audio_id, cache_dir, log, cancel,
         def decode():
             nonlocal decode_elapsed
             before = time.monotonic()
+            monitor = None
+            progress_options = []
+            if priority_policy is not None:
+                # Each attempt, including a DTS fallback, owns a fresh file.
+                # communicate() remains the sole owner of both output pipes.
+                progress = cache / f'progress-{uuid.uuid4().hex}.txt'
+                temporaries.append(progress)
+                progress_options = ['-progress', str(progress), '-stats_period', '2', '-nostats']
+                monitor = priority_policy.monitor(progress, span.duration_seconds,
+                                                  future_media_seconds=future_media_seconds)
             try:
-                _run([
+                command = [
                     legacy.FFMPEG, '-hide_banner', '-nostdin', '-y', '-loglevel', 'error',
-                    '-xerror', *vad_window_input_options(movie, span.start_seconds), *options,
+                    '-xerror', *progress_options,
+                    *vad_window_input_options(movie, span.start_seconds), *options,
                     '-i', str(source), '-map', f'0:a:{index}', '-vn', '-sn', '-dn',
                     '-t', f'{span.duration_seconds:.2f}', '-ac', '1', '-c:a', 'pcm_s16le',
                     '-af', f'aresample=48000:async=1:first_pts=0,atrim=end_sample={span.pcm_sample_count}',
                     '-ar', '48000', '-f', 'wav', str(wav),
-                ], log, cancel)
+                ]
+                if monitor is None:
+                    _run(command, log, cancel)
+                else:
+                    _run(command, log, cancel, process_monitor=monitor)
                 legacy.check_cancel(cancel)
                 with wave.open(str(wav), 'rb') as pcm:
                     sample.validate_pcm(span, pcm.getnframes(), pcm.getframerate(),
@@ -1242,9 +1342,14 @@ def _build_sampled_alignment_audio(movie, audio_id, cache_dir, log, cancel,
             options = []
             decode()
         before = time.monotonic()
-        _run([engine, str(wav), '--serialize-speech', '--frame-rate', '48000',
+        command = [engine, str(wav), '--serialize-speech', '--frame-rate', '48000',
               '--vad', 'webrtc', '--reference-stream', 'a:0',
-              '--ffmpeg-path', str(Path(legacy.FFMPEG).parent)], log, cancel)
+              '--ffmpeg-path', str(Path(legacy.FFMPEG).parent)]
+        if priority_policy is None:
+            _run(command, log, cancel)
+        else:
+            # No VAD progress signal: only inherit an earlier decoder boost.
+            _run(command, log, cancel, process_monitor=priority_policy.monitor(None, 0))
         vad_elapsed += time.monotonic() - before
         legacy.check_cancel(cancel)
         return sample.read_npz(npz, span)
@@ -1256,10 +1361,12 @@ def _build_sampled_alignment_audio(movie, audio_id, cache_dir, log, cancel,
             base = sample.read_npz(previous_reference, base_span)
             plan = sample.extension_plan(base_span, target, duration)
             additions = {}
-            for part in plan.segments:
+            for part_index, part in enumerate(plan.segments):
                 log(f'仅补取{part.name}侧新增区间 {part.owned_range.start_seconds:.2f}～'
                     f'{part.owned_range.end_seconds:.2f}秒，接缝另带2秒上下文；中间指纹复用。')
-                additions[part.name] = make_segment(part.decode_range, part.name)
+                future_seconds = sum(later.decode_range.duration_seconds
+                                     for later in plan.segments[part_index + 1:])
+                additions[part.name] = make_segment(part.decode_range, part.name, future_seconds)
             payload = sample.stitch_reference(base, plan, additions)
         else:
             payload = make_segment(target, 'middle')
@@ -1530,6 +1637,7 @@ def choose_complete_subtitle_source(
     candidates = [
         track for track in tracks
         if normalize_language_code(track.language) == requested_language and track.id in normalized
+        and subtitle_roles.track_role(track).main_dialogue
     ]
     profiles: dict[int, SubtitleCompleteness] = {}
     for track in candidates:
@@ -4317,6 +4425,16 @@ def _legacy_whisper_align_embedded_text_track(
 
 
 @dataclass(frozen=True)
+class PreparedEmbeddedTextExtraction:
+    """Same-run normalized text files, without any timeline approval."""
+    movie_path: str
+    movie_size: int
+    movie_mtime_ns: int
+    subtitle_signature: tuple[tuple[int, int, str, str, bool, bool, bool], ...]
+    sources: tuple[tuple[int, Path, str], ...]
+
+
+@dataclass(frozen=True)
 class PreparedEmbeddedAnchor:
     """An in-memory handoff from an actual, completed embedded VAD check."""
     movie_path: str
@@ -4332,6 +4450,7 @@ class PreparedEmbeddedAnchor:
     corrected_sha256: str
     offset_ms: int
     report: str
+    subtitle_signature: tuple[tuple[int, int, str, str, bool, bool, bool], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4349,7 +4468,7 @@ class PreparedImageTiming:
     nonce: str = field(repr=False, compare=False)
 
 
-_IMAGE_TIMING_HANDOFF_RULE_VERSION = "image-fixed-local-2-4-8-bounded10-full-v2"
+_IMAGE_TIMING_HANDOFF_RULE_VERSION = "image-fixed-local-2-4-8-bounded10-full-v3-region-conflict"
 _prepared_image_timings = weakref.WeakValueDictionary()
 _prepared_image_timings_lock = threading.Lock()
 
@@ -4458,6 +4577,11 @@ def _prepared_anchor_audio_id(tracks, selected_audio_id, shared_content_audio) -
 
     actual = continuous_vad.audio_track(tracks, selected_audio_id).id
     if shared_content_audio is not None and shared_content_audio.validation_audio_id != actual:
+        if (isinstance(shared_content_audio, continuous_vad.ReferenceAudioSession)
+                and shared_content_audio.confirmed
+                and any(t.id == shared_content_audio.validation_audio_id
+                        for t in continuous_vad._dialogue_audio_tracks(tracks))):
+            return shared_content_audio.validation_audio_id
         raise ValueError("共用音频与当前取证音轨不一致")
     return actual
 
@@ -4503,6 +4627,7 @@ def _make_prepared_embedded_anchor(input_path, track, selected_audio_id,
             normalize_language_code(track.language), source,
             hashlib.sha256(source.read_bytes()).hexdigest(), corrected,
             hashlib.sha256(corrected.read_bytes()).hexdigest(), int(offset_ms), adopted,
+            _prepared_image_subtitle_signature(tracks),
         )
     except (OSError, ValueError, RuntimeError):
         # Failure to create an optimization must not override a real verifier
@@ -4525,7 +4650,8 @@ def _validated_prepared_embedded_anchor(prepared, input_path, tracks,
     track = next((track for track in tracks if track.id == prepared.track_id
                   and track.type == "subtitles" and track.text_subtitle), None)
     if (track is None or track.id != embedded_source_id
-            or normalize_language_code(track.language) != prepared.track_language):
+            or normalize_language_code(track.language) != prepared.track_language
+            or prepared.subtitle_signature != _prepared_image_subtitle_signature(tracks)):
         raise ValueError("当前文本来源与预检标杆不一致")
     if _prepared_anchor_audio_id(tracks, selected_audio_id, shared_content_audio) != prepared.validation_audio_id:
         raise ValueError("当前取证音轨与预检标杆不一致")
@@ -4537,6 +4663,35 @@ def _validated_prepared_embedded_anchor(prepared, input_path, tracks,
     _prepared_anchor_events(prepared.source_subtitle_path, prepared.corrected_subtitle_path,
                             duration, prepared.offset_ms)
     return prepared
+
+
+def _prepared_text_extraction_context(input_path, tracks):
+    movie = Path(input_path).resolve()
+    stat = movie.stat()
+    return (str(movie).casefold(), stat.st_size, stat.st_mtime_ns,
+            _prepared_image_subtitle_signature(tracks))
+
+
+def _validated_prepared_text_sources(prepared, input_path, tracks, log):
+    if not isinstance(prepared, PreparedEmbeddedTextExtraction):
+        return {}
+    try:
+        context = _prepared_text_extraction_context(input_path, tracks)
+        if context != (prepared.movie_path, prepared.movie_size, prepared.movie_mtime_ns,
+                       prepared.subtitle_signature):
+            raise ValueError("影片或字幕轨映射在预检后已变化")
+    except (OSError, ValueError) as exc:
+        log(f"内嵌文本提取结果不能复用，重新提取：{exc}。")
+        return {}
+    sources = {}
+    for track_id, path, digest in prepared.sources:
+        try:
+            if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise ValueError("文本内容已变化")
+            sources[track_id] = path
+        except (OSError, ValueError) as exc:
+            log(f"内嵌文本轨 {track_id} 的提取结果不能复用，重新提取：{exc}。")
+    return sources
 
 
 def prepare_embedded_text_corrections(
@@ -4554,9 +4709,14 @@ def prepare_embedded_text_corrections(
     verification_status: dict[str, object] | None = None,
     prepared_embedded_anchor: PreparedEmbeddedAnchor | None = None,
     prepared_image_timing: PreparedImageTiming | None = None,
+    prepared_text_extraction: PreparedEmbeddedTextExtraction | None = None,
+    prefetch_text_subtitle_ids: list[int] | None = None,
 ) -> tuple[dict[int, int], dict[int, Path], int | None]:
     legacy.check_cancel(cancel)
     tracks = legacy.inspect_tracks(input_path)
+    if verification_status is not None:
+        verification_status.clear()
+        verification_status["verified_anchor"] = False
     media = None
     duration = 0.0
     prepared = None
@@ -4576,6 +4736,11 @@ def prepare_embedded_text_corrections(
     if embedded_source_id is not None:
         wanted_ids.add(embedded_source_id)
     source_track = next((track for track in tracks if track.id == embedded_source_id), None)
+    inappropriate = [track for track in tracks if track.type == 'subtitles'
+                     and track.id in wanted_ids and not subtitle_roles.track_role(track).main_dialogue]
+    if inappropriate:
+        raise SubtitleContentMismatchError('所选字幕用途不适合正片核验：' + '；'.join(
+            f'轨{track.id}：{subtitle_roles.track_role(track).reason}' for track in inappropriate))
     source_language = (
         normalize_language_code(source_track.language)
         if source_track is not None
@@ -4588,6 +4753,7 @@ def prepare_embedded_text_corrections(
                 track.type == "subtitles"
                 and track.text_subtitle
                 and normalize_language_code(track.language) == source_language
+                and subtitle_roles.track_role(track).main_dialogue
                 and not track.forced
                 and not any(
                     marker in (track.name or "").lower()
@@ -4620,26 +4786,39 @@ def prepare_embedded_text_corrections(
     )
     work = Path(work_dir) / "embedded-subtitle-correction"
     work.mkdir(parents=True, exist_ok=True)
-    extraction_input = legacy.prepare_work_input(
-        input_path,
-        work / "normalized-input",
-        log,
-        cancel_event=cancel,
-    )
-    if str(Path(extraction_input).resolve()) == str(Path(input_path).resolve()):
-        extraction_track_ids = {track.id: track.id for track in tracks}
-        extraction_tracks = {track.id: track for track in tracks}
-    else:
-        normalized_tracks = legacy.inspect_tracks(extraction_input)
-        extraction_track_ids = legacy.map_normalized_track_ids(tracks, normalized_tracks)
-        extraction_tracks = {track.id: track for track in normalized_tracks}
+    # Prefetch only explicitly retained text. These extra tracks are not aligned
+    # until the formal stage has adopted an actual timeline anchor.
+    text_ids = {track.id for track in text_tracks}
+    extraction_ids = text_ids | set(prefetch_text_subtitle_ids or ())
+    extraction_text_tracks = text_tracks + [track for track in tracks
+        if track.type == "subtitles" and track.text_subtitle
+        and track.id in extraction_ids and track.id not in text_ids]
+    normalized = _validated_prepared_text_sources(prepared_text_extraction, input_path, tracks, log)
+    normalized = {track_id: path for track_id, path in normalized.items() if track_id in extraction_ids}
+    if prepared is not None:
+        normalized[prepared.track_id] = prepared.source_subtitle_path
+    missing_tracks = [track for track in extraction_text_tracks if track.id not in normalized]
+    initial_extraction_context = None
+    if verification_status is not None:
+        try:
+            initial_extraction_context = _prepared_text_extraction_context(input_path, tracks)
+        except (OSError, ValueError):
+            pass
+    extraction_input = input_path
+    if missing_tracks:
+        extraction_input = legacy.prepare_work_input(
+            input_path, work / "normalized-input", log, cancel_event=cancel,
+        )
+        if str(Path(extraction_input).resolve()) == str(Path(input_path).resolve()):
+            extraction_track_ids = {track.id: track.id for track in tracks}
+            extraction_tracks = {track.id: track for track in tracks}
+        else:
+            normalized_tracks = legacy.inspect_tracks(extraction_input)
+            extraction_track_ids = legacy.map_normalized_track_ids(tracks, normalized_tracks)
+            extraction_tracks = {track.id: track for track in normalized_tracks}
     extracted: dict[int, Path] = {}
-    normalized: dict[int, Path] = {}
-    extraction_specs: list[str] = []
-    for track in text_tracks:
-        if prepared is not None and track.id == prepared.track_id:
-            normalized[track.id] = prepared.source_subtitle_path
-            continue
+    extraction_requests: list[tuple[legacy.Track, Path]] = []
+    for track in missing_tracks:
         track_work = work / f"track-{track.id}"
         track_work.mkdir(parents=True, exist_ok=True)
         extraction_track_id = extraction_track_ids.get(track.id)
@@ -4652,25 +4831,42 @@ def prepare_embedded_text_corrections(
             f"{legacy.subtitle_extension(extraction_track)}"
         )
         extracted[track.id] = extracted_path
-        if not extracted_path.exists() or extracted_path.stat().st_size <= 0:
-            extraction_specs.append(f"{extraction_track.id}:{extracted_path}")
+        extraction_requests.append((extraction_track, extracted_path))
 
-    if extraction_specs:
-        log(f"一次读取 {len(extraction_specs)} 条候选文本字幕轨，避免重复扫描影片。")
-        legacy.run_command(
-            [legacy.MKVEXTRACT, "tracks", extraction_input, *extraction_specs],
-            log=log,
-            cancel_event=cancel,
-        )
+    if extraction_requests:
+        legacy.extract_subtitles(extraction_input, extraction_requests, log, cancel)
 
-    for track in text_tracks:
-        if prepared is not None and track.id == prepared.track_id:
-            continue
+    for track in missing_tracks:
         track_work = work / f"track-{track.id}"
-        normalized[track.id] = subtitle_events_to_srt(
-            extracted[track.id],
-            track_work / "original-normalized.srt",
-        )
+        try:
+            normalized[track.id] = subtitle_events_to_srt(
+                extracted[track.id],
+                track_work / "original-normalized.srt",
+            )
+        except legacy.CancelledError:
+            raise
+        except (OSError, ValueError, RuntimeError) as exc:
+            if track.id in text_ids:
+                raise
+            # Optional prefetch cannot reject a good candidate. The formal
+            # stage will still require and validate this retained track.
+            log(f"预取文本轨 {track.id} 暂未能解析，留待正式阶段检查：{exc}")
+    if normalized and verification_status is not None and initial_extraction_context is not None:
+        try:
+            if _prepared_text_extraction_context(input_path, tracks) == initial_extraction_context:
+                sources = tuple((track_id, path.resolve(), hashlib.sha256(path.read_bytes()).hexdigest())
+                                for track_id, path in sorted(normalized.items()))
+                verification_status["prepared_text_extraction"] = PreparedEmbeddedTextExtraction(
+                    *initial_extraction_context, sources,
+                )
+        except (OSError, ValueError):
+            # Extraction remains usable in this call if the optimization cannot
+            # be issued; subsequent calls use the ordinary extraction route.
+            pass
+    missing_ids = {track.id for track in missing_tracks}
+    reused_ids = sorted(track.id for track in extraction_text_tracks if track.id not in missing_ids)
+    if reused_ids:
+        log(f"复用已核对影片及内容签名的文本提取结果：轨 {', '.join(map(str, reused_ids))}；各轨仍独立核验时间轴。")
 
     if media is None:
         media = legacy.inspect_media(input_path)
@@ -4682,11 +4878,12 @@ def prepare_embedded_text_corrections(
     anchor_events: list[legacy.SubtitleEvent] = []
     anchor_offset: int | None = None
     verified_reference_events: list[legacy.SubtitleEvent] = []
+    text_results = {}
     if external_reference.is_file():
         verified_reference_events = legacy.parse_subtitle(external_reference)
     if verification_status is not None:
-        verification_status.clear()
         verification_status["verified_anchor"] = bool(verified_reference_events)
+        verification_status['text_results'] = text_results
 
     if text_tracks and verified_reference_events:
         # A selected and confirmed download is the absolute timeline anchor.
@@ -4705,6 +4902,16 @@ def prepare_embedded_text_corrections(
             score, offset_seconds = _interval_alignment(
                 reference_intervals, candidate_intervals
             )
+            text_results[track.id] = dict(accepted=score >= .85 and abs(offset_seconds) <= MAX_AUTOMATIC_OFFSET_SECONDS,
+                kind='retained_text', score=score, proposed_offset_seconds=offset_seconds,
+                reason=f'与已确认文本比较：相关度{score:.1%}，相对偏移{offset_seconds:+.2f}秒',
+                failure_kind=('outside_automatic_offset_range' if score >= .85
+                              and abs(offset_seconds) > MAX_AUTOMATIC_OFFSET_SECONDS else 'insufficient_evidence'))
+            if subtitle_audit.current() is not None:
+                subtitle_audit.current().track_result(track.id, 'retained_text',
+                    score >= 0.85 and abs(offset_seconds) <= MAX_AUTOMATIC_OFFSET_SECONDS,
+                    '与已确认文本时间轴比较', score=score, offset_seconds=offset_seconds,
+                    reference_path=str(external_reference))
             if score >= 0.85 and abs(offset_seconds) <= MAX_AUTOMATIC_OFFSET_SECONDS:
                 offset = 0 if abs(offset_seconds) <= 0.25 else int(round(offset_seconds * 1000))
                 offsets[track.id] = offset
@@ -4774,6 +4981,8 @@ def prepare_embedded_text_corrections(
                     shared_content_audio,
                 )
             anchor_is_verified = _timeline_report_verified(anchor_report)
+            if subtitle_audit.current() is not None:
+                subtitle_audit.current().track_result(anchor.id, 'retained_text', anchor_is_verified, anchor_report)
             if anchor_is_verified:
                 import continuous_vad
 
@@ -4821,7 +5030,14 @@ def prepare_embedded_text_corrections(
                     for event in candidate_events
                 ]
                 score, offset_seconds = _interval_alignment(reference_intervals, candidate_intervals)
+                if verified_reference_events and score >= .85 and abs(offset_seconds) > MAX_AUTOMATIC_OFFSET_SECONDS:
+                    text_results[track.id] = dict(accepted=False, kind='retained_text', score=score,
+                        proposed_offset_seconds=offset_seconds, failure_kind='outside_automatic_offset_range',
+                        reason=f'与已确认标杆相对偏移{offset_seconds:+.2f}秒，超过自动纠偏范围')
                 if score >= 0.85 and abs(offset_seconds) <= MAX_AUTOMATIC_OFFSET_SECONDS:
+                    if subtitle_audit.current() is not None:
+                        subtitle_audit.current().track_result(track.id, 'retained_text', True,
+                            '与本片已确认文本标杆单独比较', score=score, offset_seconds=offset_seconds)
                     offset = int(round(offset_seconds * 1000))
                     offsets[track.id] = offset
                     corrected_sources[track.id] = _shifted_srt(
@@ -4847,6 +5063,10 @@ def prepare_embedded_text_corrections(
                     shared_content_audio,
                 )
                 track_is_verified = _timeline_report_verified(report)
+                if track_is_verified:
+                    text_results.pop(track.id, None)
+                if subtitle_audit.current() is not None:
+                    subtitle_audit.current().track_result(track.id, 'retained_text', track_is_verified, report)
                 if track_is_verified:
                     import continuous_vad
 
@@ -4918,7 +5138,8 @@ def prepare_embedded_text_corrections(
                 'reason': '复用本轮针对同一已纠偏文本的候选验收结果',
             }
             continue
-        image_results[track.id] = {'accepted': False, 'reason': '没有可用文本标杆'}
+        image_results[track.id] = {'accepted': False, 'reason': '没有可用文本标杆',
+                                   'failure_kind': 'insufficient_evidence'}
         if len(reference_intervals) < 20:
             log(
                 f"原图片字幕轨 {track.id} 没有可用的已验证文本标杆；"
@@ -4930,6 +5151,13 @@ def prepare_embedded_text_corrections(
         local = local_results.get(stream_index)
         if local is not None:
             image_results[track.id]['local_evidence'] = asdict(local)
+        if local is not None and local.timing_conflict:
+            image_results[track.id]['reason'] = _pgs_local_reason(local.reason)
+            image_results[track.id]['failure_kind'] = 'non_fixed_offset'
+            offsets[track.id] = 0
+            log(f"原图片字幕轨 {track.id} 已发现可信区域偏移冲突，不能统一平移；"
+                "本轨未通过，不以全片总分覆盖冲突。")
+            continue
         if local is not None and local.accepted:
             offset = int(round(local.offset_seconds * 1000))
             offsets[track.id] = offset
@@ -4981,7 +5209,18 @@ def prepare_embedded_text_corrections(
             score, offset_seconds = _interval_alignment(reference_intervals, intervals)
             image_results[track.id].update(score=score, proposed_offset_seconds=offset_seconds,
                 reason=f'相关度{score:.1%}，相对偏移{offset_seconds:+.2f}秒，不满足现有图片字幕核验条件')
+            if score >= 0.55 and abs(offset_seconds) > MAX_AUTOMATIC_OFFSET_SECONDS:
+                image_results[track.id]['failure_kind'] = 'outside_automatic_offset_range'
             if score >= 0.55 and abs(offset_seconds) <= MAX_AUTOMATIC_OFFSET_SECONDS:
+                consistency = _full_image_region_consistency(
+                    reference_intervals, intervals, duration, offset_seconds, cancel)
+                image_results[track.id]['full_region_evidence'] = asdict(consistency)
+                if consistency.conflict:
+                    image_results[track.id]['reason'] = '全片时间点中的可信区域偏移冲突，不能统一平移'
+                    image_results[track.id]['failure_kind'] = 'non_fixed_offset'
+                    offsets[track.id] = 0
+                    log(f"原图片字幕轨 {track.id} 全片总分虽达到条件，但区域偏移冲突；本轨未通过。")
+                    continue
                 # Match the existing 250 ms no-op rule used for verified text:
                 # sub-frame alignment noise should not rewrite a kept track.
                 offset = 0 if abs(offset_seconds) <= 0.25 else int(round(offset_seconds * 1000))
@@ -5005,6 +5244,12 @@ def prepare_embedded_text_corrections(
         else:
             image_results[track.id].update(accepted=True, offset_ms=offset, reason='与已纠偏文本时间轴匹配')
         offsets[track.id] = offset
+    audit = subtitle_audit.current()
+    if audit is not None:
+        for track_id, result in image_results.items():
+            audit.track_result(track_id, 'retained_image', result.get('accepted', False),
+                               result.get('reason', ''), evidence=result,
+                               reference_path=str(external_reference) if external_reference.is_file() else '')
     return offsets, corrected_sources, resolved_source_id
 
 
@@ -5021,8 +5266,76 @@ def prepare_shared_image_timing(input_path, track_ids, work_dir, log, cancel=Non
     log('图片字幕时间点延后至文本纠偏完成再读取；优先局部检查，全部字幕轨共用。')
 
 
+def unalignable_retained_tracks(results):
+    """An unknown/low-score track is not proved wrong by a failed check."""
+    return {track_id: result for track_id, result in results.items()
+            if not result.get('accepted') and result.get('failure_kind') in {
+                'non_fixed_offset', 'outside_automatic_offset_range'}}
+
+
+def _record_retained_replacement(track_ids, results, log, *, tracks=(),
+        reference_path=None, reference_label='', target_codes=()):
+    audit = subtitle_audit.current()
+    track_map = {track.id: track for track in tracks}
+    source = str(reference_path or '')
+    source_label = reference_label or (Path(source).name if source else '')
+    targets = list(dict.fromkeys(target_codes))
+    labels = [legacy.LANGUAGES.get(code, ('', '', code))[2] for code in targets]
+    if source:
+        log(f'内嵌字幕替换来源：{source_label}；文件：{source}；沿用该来源已验证的时间轴。')
+    if labels:
+        log('内嵌字幕替换计划：按所选语言生成' + '、'.join(labels) + '字幕，继承标轴时间。')
+    elif source:
+        log('内嵌字幕替换计划：采用可靠原文或正常保留轨补齐所选语言，无需新增翻译。')
+    for track_id in sorted(track_ids):
+        reason = results[track_id].get('reason', '无法按当前规则纠偏')
+        track = track_map.get(track_id)
+        language = subtitle_language(track.language, track.name) if track is not None else 'und'
+        label = legacy.LANGUAGES.get(language, ('', '', language))[2]
+        codec = ('PGS' if track is not None and track.pgs_subtitle else
+                 'VobSub' if track is not None and track.vobsub_subtitle else
+                 track.codec if track is not None else '')
+        details = ' / '.join(value for value in (label, codec) if value)
+        description = f'原字幕轨 {track_id}' + (f'（{details}）' if track is not None else '')
+        cause = {'non_fixed_offset': '非固定偏移，无法统一纠偏',
+                 'outside_automatic_offset_range': '超出当前自动纠偏范围'}.get(
+                     results[track_id].get('failure_kind'), '无法按当前规则纠偏')
+        log(f'{description} 无法沿用已验证标轴：{cause}；{reason}；'
+            '将从成品中剔除，并按所选语言补齐字幕。')
+        if audit is not None:
+            kind = results[track_id].get('kind', 'retained_image')
+            row = next((r for r in audit.records if r.get('track_id') == track_id
+                        and r.get('kind') == kind), None)
+            if row is None:
+                row = audit.add(f'原字幕轨 {track_id}', track_id=track_id, kind=kind)
+            audit.update(row, 'replacement', 'replacement_planned', reason,
+                         evidence=results[track_id])
+            row['retained'] = False
+            row['label'] = description
+            row['replacement'] = dict(track_language=language, track_format=codec,
+                failure_kind=results[track_id].get('failure_kind', ''),
+                source_path=source, source_label=source_label,
+                target_codes=targets, target_labels=labels)
+
+
+def _replacement_targets(tracks, kept_ids, preferences, source_code, script_equivalent):
+    covered = {subtitle_language(track.language, track.name) for track in tracks
+               if track.type == 'subtitles' and track.id in kept_ids
+               and subtitle_roles.track_role(track).main_dialogue}
+    # The verified source can be written directly, rather than translated
+    # into its own language. Unknown-language text does not cover a request.
+    if source_code != 'und':
+        covered.add(source_code)
+    if 'zh' in covered or (script_equivalent and covered.intersection(
+            chinese_script_converter.CHINESE_SCRIPT_CODES)):
+        covered.update(code for code in preferences
+                       if code in chinese_script_converter.CHINESE_SCRIPT_CODES)
+    return [code for code in preferences if code not in covered]
+
+
 def require_image_timeline_anchor(input_path, track_ids, audio_id, work_dir, aligned, log,
-        cancel=None, prepared_image_status: dict[str, object] | None = None):
+        cancel=None, prepared_image_status: dict[str, object] | None = None,
+        replace_unalignable: bool = False):
     """Check task suitability after audio alignment; PGS never proves absolute sync."""
     if prepared_image_status is not None:
         prepared_image_status.clear()
@@ -5040,20 +5353,42 @@ def require_image_timeline_anchor(input_path, track_ids, audio_id, work_dir, ali
         input_path, track_ids, None, audio_id, str(work_dir), log, cancel,
         verified_external_subtitle=str(aligned), verification_status=status)
     results = status.get('image_results', {})
+    replacements = unalignable_retained_tracks(results) if replace_unalignable else {}
+    if replacements:
+        # Only a same-run decision bound to the unchanged movie, actual audio,
+        # retained tracks and verified text may authorize omitting a track.
+        try:
+            current_context = _prepared_image_context(input_path, track_ids, audio_id, None, aligned)
+        except (OSError, StopIteration, TypeError, ValueError, RuntimeError):
+            current_context = None
+        if initial_context is None or current_context != initial_context:
+            replacements = {}
     unresolved = [f"轨{track_id}：{results.get(track_id, {}).get('reason', '尚未取得核验结果')}"
-        for track_id in track_ids if not results.get(track_id, {}).get('accepted')]
+        for track_id in track_ids if not results.get(track_id, {}).get('accepted')
+        and track_id not in replacements]
     if unresolved:
-        raise SubtitleContentMismatchError(
-            '本候选已完成音频对时，但不能指导需保留的图片字幕；' + '；'.join(unresolved))
+        raise RetainedSubtitleVerificationError(
+            '本候选已完成音频对时，但不能指导需保留的图片字幕；' + '；'.join(unresolved), results, aligned)
     legacy.check_cancel(cancel)
     if prepared_image_status is not None:
+        passed_ids = [track_id for track_id in track_ids if track_id not in replacements]
+        passed_context = initial_context
+        if replacements:
+            prepared_image_status['replacement_tracks'] = replacements
+            prepared_image_status['replacement_context'] = initial_context
+            # A handoff contains successful tracks only. Failed tracks are
+            # never issued as a timing pass or reused to bless another track.
+            passed_context = (*initial_context[:6], tuple(sorted(passed_ids)), initial_context[7])
         prepared = _make_prepared_image_timing(
-            input_path, track_ids, audio_id, None, aligned, results, initial_context,
+            input_path, passed_ids, audio_id, None, aligned, results, passed_context,
         )
         legacy.check_cancel(cancel)
         if prepared is not None:
             prepared_image_status['prepared_image_timing'] = prepared
-    log('本候选已完成音频对时，并可指导需保留的图片字幕。')
+    if replacements:
+        log('本候选已完成音频对时；无法纠偏的原轨转为替换，不再阻止采用可靠文本来源。')
+    else:
+        log('本候选已完成音频对时，并可指导需保留的图片字幕。')
     return results
 
 
@@ -5281,10 +5616,15 @@ def process_pro(
     translation_end: Callable[[], None] | None = None,
     prepared_embedded_anchor: PreparedEmbeddedAnchor | None = None,
     prepared_image_timing: PreparedImageTiming | None = None,
+    prepared_text_extraction: PreparedEmbeddedTextExtraction | None = None,
+    retained_replacement_status: dict | None = None,
 ) -> str:
     """Run the selected subtitle or tracks-only route and safely remux a final file."""
     if (translation_start is None) != (translation_end is None):
         raise ValueError("翻译资源回调必须同时提供开始和结束方法。")
+    correction_status = {}
+    if retained_replacement_status is not None:
+        retained_replacement_status.clear()
     if trust_embedded_original_timeline:
         subtitle_sync_offsets, corrected_sources, resolved_source_id = {}, {}, embedded_source_id
         log("无搜索处理不运行内嵌字幕时间轴核验；所有保留字幕沿用原时间轴。")
@@ -5314,6 +5654,8 @@ def process_pro(
             shared_content_audio=shared_content_audio,
             prepared_embedded_anchor=prepared_embedded_anchor,
             prepared_image_timing=prepared_image_timing,
+            prepared_text_extraction=prepared_text_extraction,
+            verification_status=correction_status,
         )
     if resolved_source_id != embedded_source_id and resolved_source_id is not None:
         if embedded_source_id in keep_subtitle_ids:
@@ -5323,6 +5665,63 @@ def process_pro(
             ]
             keep_subtitle_ids = list(dict.fromkeys(keep_subtitle_ids))
         embedded_source_id = resolved_source_id
+    if not trust_embedded_original_timeline and subtitle_language_preferences is not None:
+        decisions = dict(correction_status.get('image_results', {}))
+        decisions.update(correction_status.get('text_results', {}))
+        rejected = unalignable_retained_tracks(decisions)
+        rejected = {track_id: result for track_id, result in rejected.items()
+                    if track_id in keep_subtitle_ids and track_id != embedded_source_id}
+        trusted_external = (Path(verified_timeline_reference) if verified_timeline_reference
+            and Path(verified_timeline_reference).is_file() else
+            Path(external_subtitle) if trust_external_original_timeline and external_subtitle
+            and Path(external_subtitle).is_file() else None)
+        anchor_id = correction_status.get('track_id', resolved_source_id)
+        trusted_embedded = corrected_sources.get(anchor_id) if anchor_id is not None else None
+        if rejected and correction_status.get('verified_anchor') and (
+                trusted_external is not None or trusted_embedded is not None):
+            tracks = legacy.inspect_tracks(input_path)
+            keep_subtitle_ids = [track_id for track_id in keep_subtitle_ids if track_id not in rejected]
+            local_chinese_conversion_sources = {code: track_id for code, track_id in
+                (local_chinese_conversion_sources or {}).items() if track_id not in rejected}
+            for track_id in rejected:
+                subtitle_sync_offsets.pop(track_id, None)
+                corrected_sources.pop(track_id, None)
+            if source_mode == 'none':
+                if trusted_external is not None:
+                    source_mode = 'external'
+                    external_subtitle = str(trusted_external)
+                    trust_external_original_timeline = True
+                else:
+                    source_mode = 'embedded'
+                    embedded_source_id = anchor_id
+            source_path = trusted_external or trusted_embedded
+            anchor_track = next((track for track in tracks if track.id == anchor_id), None)
+            source_hint = (anchor_track.language if source_mode == 'embedded' and anchor_track is not None
+                           else source_language or speech_language)
+            source_code = detect_subtitle_language(legacy.parse_subtitle(source_path), source_hint)
+            if source_mode != 'embedded':
+                source_language = source_code
+            missing = _replacement_targets(tracks, keep_subtitle_ids,
+                subtitle_language_preferences, source_code, chinese_script_equivalent)
+            target_codes = list(dict.fromkeys([*target_codes, *[
+                code for code in missing if code not in local_chinese_conversion_sources]]))
+            retained_languages = {subtitle_language(track.language, track.name) for track in tracks
+                                  if track.type == 'subtitles' and track.id in keep_subtitle_ids}
+            if (source_mode == 'embedded' and source_code in subtitle_language_preferences
+                    and source_code not in retained_languages and embedded_source_id is not None):
+                keep_subtitle_ids.append(embedded_source_id)
+            if (source_mode in {'external', 'online'} and source_code in subtitle_language_preferences
+                    and source_code not in retained_languages):
+                include_external_source_in_output = True
+            _record_retained_replacement(rejected, decisions, log, tracks=tracks,
+                reference_path=source_path,
+                reference_label=(f'已验证内嵌文本轨 {anchor_id}' if source_mode == 'embedded'
+                                 else '已验证外挂文本'), target_codes=[code for code in target_codes
+                                    if normalize_language_code(code) != source_code])
+            if retained_replacement_status is not None:
+                retained_replacement_status.update(keep_subtitle_ids=keep_subtitle_ids,
+                    target_codes=target_codes, replacement_tracks=rejected,
+                    local_chinese_conversion_sources=local_chinese_conversion_sources)
     local_generated = _prepare_local_chinese_conversions(
         input_path,
         local_chinese_conversion_sources,
@@ -5400,6 +5799,9 @@ def process_pro(
     if not events:
         raise RuntimeError("生成的字幕没有有效文本。")
     source_code, source_track_name = subtitle_track_identity(events, source_language or speech_language)
+    if include_external_source_in_output:
+        import subtitle_fonts
+        subtitle_fonts.preflight_text(source_code, '\n'.join(event.text for event in events), log)
     target_codes = list(dict.fromkeys(target_codes))
     if not allow_reverse_translation and source_code != "en" and any(
         normalize_language_code(code) == "en" for code in target_codes
@@ -5431,6 +5833,7 @@ def process_pro(
             if not chinese_script_converter.is_script_conversion(source_code, target)
             and legacy.needs_model_translation(
                 events, target, work / f"translation-cache-{target}.jsonl", source_code,
+                retry_issues=True, output_srt=work / f"translated-{target}.srt",
             )
         ]
 
@@ -5456,6 +5859,7 @@ def process_pro(
                     source_code,
                     log,
                     cancel_event=cancel_event,
+                    retry_issues=True,
                 )
             except legacy.CancelledError:
                 log(f"{target_label}翻译已停止：用户停止处理；已完成的翻译缓存仍然保留。")
@@ -5584,6 +5988,16 @@ def preflight_external_subtitle(input_path, subtitle_path, work_dir, selected_au
 def align_embedded_text_track(input_path, normalized_subtitle, work_dir, selected_audio_id,
         source_language, track_id, log, cancel=None, shared_audio_reference=None, shared_content_audio=None):
     import continuous_vad
-    return continuous_vad.preflight(input_path, str(normalized_subtitle), str(work_dir), selected_audio_id,
-        log, cancel, shared=shared_content_audio, candidate_label=f"内嵌文本轨 {track_id}",
-        output_name="verified-anchor.srt")
+    audit = subtitle_audit.current()
+    previous = audit.active_record if audit is not None else None
+    if audit is not None and (previous is None or previous.get('track_id') != track_id):
+        audit.track_result(track_id, 'retained_text', False, '正在进行本轨音频核验')
+        audit.active_record = next(row for row in audit.records if row.get('track_id') == track_id
+                                   and row.get('kind') == 'retained_text')
+    try:
+        return continuous_vad.preflight(input_path, str(normalized_subtitle), str(work_dir), selected_audio_id,
+            log, cancel, shared=shared_content_audio, candidate_label=f"内嵌文本轨 {track_id}",
+            output_name="verified-anchor.srt")
+    finally:
+        if audit is not None:
+            audit.active_record = previous

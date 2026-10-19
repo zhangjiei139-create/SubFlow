@@ -10,6 +10,7 @@ from tkinter import messagebox, ttk
 import online_subtitles as opensubtitles
 import subdl_subtitles as subdl
 from subtitle_identity_guard import identity_conflict_notice
+from subtitle_candidate_priority import prioritize_candidates, author_display, candidate_note
 
 
 LANGUAGES = [
@@ -118,7 +119,7 @@ class OnlineSubtitleDialog(tk.Toplevel):
         identity = f"{self.identity.title or '未识别片名'} {self.identity.year}".strip()
         ttk.Label(
             outer,
-            text=f"识别结果：{identity} · 站点结果按返回顺序显示，下载后验证正文",
+            text=f"识别结果：{identity} · 优先显示版本匹配线索较多的候选，下载后核验",
         ).grid(row=0, column=0, columnspan=6, sticky=tk.W, pady=(0, 10))
 
         provider_row = ttk.Frame(outer)
@@ -156,7 +157,7 @@ class OnlineSubtitleDialog(tk.Toplevel):
         self.search_button = ttk.Button(outer, text="搜索字幕", command=self.start_search)
         self.search_button.grid(row=3, column=2, padx=(0, 8), pady=(9, 0))
 
-        columns = ("source", "match", "release", "language", "downloads", "rating", "flags")
+        columns = ("source", "match", "release", "language", "downloads", "rating", "flags", "author")
         self.tree = ttk.Treeview(outer, columns=columns, show="headings", selectmode="browse")
         headings = {
             "source": "来源",
@@ -166,6 +167,7 @@ class OnlineSubtitleDialog(tk.Toplevel):
             "downloads": "下载量",
             "rating": "评分",
             "flags": "标记",
+            "author": "作者 / 上传者",
         }
         for column, label in headings.items():
             self.tree.heading(column, text=label)
@@ -176,6 +178,7 @@ class OnlineSubtitleDialog(tk.Toplevel):
         self.tree.column("downloads", width=75, anchor=tk.E, stretch=False)
         self.tree.column("rating", width=55, anchor=tk.CENTER, stretch=False)
         self.tree.column("flags", width=90, anchor=tk.CENTER, stretch=False)
+        self.tree.column("author", width=130, stretch=False)
         scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.grid(row=4, column=0, columnspan=5, sticky=tk.NSEW, pady=(10, 8))
@@ -276,6 +279,7 @@ class OnlineSubtitleDialog(tk.Toplevel):
         if provider != self.provider.get():
             return
         self.identity = identity
+        results = prioritize_candidates(self.video_path, results, identity)
         self.results = results
         self.result_provider = provider
         self.tree.delete(*self.tree.get_children())
@@ -298,10 +302,11 @@ class OnlineSubtitleDialog(tk.Toplevel):
                     item.downloads,
                     f"{item.rating:.1f}",
                     flags,
+                    author_display(item),
                 ),
             )
         if results:
-            suffix = "，仅显示前 30 条" if meta.truncated else ""
+            suffix = "，站点仍有未加载的结果" if meta.truncated else ""
             self.status.set(
                 f"{provider_name} 获得候选 {meta.total_count} 条，显示 {len(results)} 条{suffix}。"
             )
@@ -321,7 +326,7 @@ class OnlineSubtitleDialog(tk.Toplevel):
         if selection:
             item = self.results[int(selection[0])]
             self.status.set(
-                f"{item.recommendation}：{item.match_reason}。下载后将验证字幕正文。"
+                f"{item.recommendation}：{item.match_reason}。{candidate_note(item)}"
             )
 
     def _show_error(self, message: str, verify: bool = False) -> None:

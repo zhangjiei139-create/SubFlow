@@ -4,6 +4,22 @@ from bisect import bisect_right
 import math
 
 
+def observation_report(points, offsets):
+    """Record human observations without replacing the existing correction guard."""
+    if len(points) != 3 or len(offsets) != 3 or not all(math.isfinite(float(v)) for v in (*points, *offsets)):
+        raise ValueError('三个核听点及偏移必须为有限数值。')
+    spread = max(offsets) - min(offsets)
+    interval = points[2] - points[0]
+    expected = offsets[0] + (offsets[2] - offsets[0]) * (points[1] - points[0]) / interval if interval > 0 else None
+    return dict(windows=[dict(movie_seconds=p, offset_seconds=d, evidence='human-listening')
+                         for p, d in zip(points, offsets)],
+                variation_seconds=spread, endpoint_difference_seconds=offsets[2]-offsets[0],
+                middle_linear_residual_seconds=offsets[1]-expected if expected is not None else None,
+                fixed_offset_warning=spread > .25,
+                note='三点偏移不同；使用人工确认的三点渐变修正，不合并成一个固定偏移。'
+                     if spread > .25 else '三点偏移接近；仍保存并应用各点确认值。')
+
+
 def validate(points, offsets):
     if len(points) != 3 or len(offsets) != 3:
         raise ValueError('需要且只需要前、中、后三个调节值。')

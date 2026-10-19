@@ -4,12 +4,17 @@ from __future__ import annotations
 import json
 import hashlib
 import concurrent.futures
+import errno
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
 
@@ -17,13 +22,16 @@ import pro_core
 import subtitle_tool_core as core
 import burned_subtitle_detector
 import chinese_script_converter
+import subtitle_roles
+import subtitle_audit
 from subtitle_languages import chinese_dialect_rank, subtitle_language
-from subtitle_identity_guard import media_specification
+from subtitle_identity_guard import media_specification, media_signature
 from profile_model import (
     AUDIO_FORMATS,
     BatchPlan,
     PreferenceProfile,
     audio_format,
+    effective_subtitle_styles,
     is_commentary,
     language_label,
     normalize_language,
@@ -32,10 +40,77 @@ from profile_model import (
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".mov", ".avi", ".m4v"}
 OUTPUT_SUFFIX = ".SF.mkv"
+OUTPUT_FORMATS = ("MKV", "MP4")
+
+
+def normalize_output_format(value: str) -> str:
+    selected = str(value).upper()
+    if selected not in OUTPUT_FORMATS:
+        raise ValueError("输出格式只能选择 MKV 或 MP4。")
+    return selected
 
 
 def is_output_path(path: str | Path) -> bool:
-    return Path(path).name.lower().endswith(OUTPUT_SUFFIX.lower())
+    return Path(path).name.lower().endswith((".sf.mkv", ".sf.mp4"))
+
+
+def normalized_output_key(path: str | Path) -> str:
+    return os.path.normcase(str(Path(path).resolve())).casefold()
+
+
+def batch_output_path(input_path: str | Path, other_inputs=(), output_format: str = "MKV") -> str:
+    """Keep the usual name unless another container would share its output."""
+    source = Path(input_path)
+    suffix = ".SF." + normalize_output_format(output_format).lower()
+    source_key = normalized_output_key(source)
+    parent_key = normalized_output_key(source.parent)
+    siblings = [source.with_suffix(extension) for extension in VIDEO_EXTENSIONS]
+    candidates = [path for path in siblings if path.is_file()]
+    candidates.extend(Path(path) for path in other_inputs)
+    collision = any(
+        normalized_output_key(path) != source_key
+        and normalized_output_key(path.parent) == parent_key
+        and path.stem.casefold() == source.stem.casefold()
+        and path.suffix.lower() in VIDEO_EXTENSIONS
+        and not is_output_path(path)
+        for path in candidates
+    )
+    name = source.name if collision else source.stem
+    return str(source.with_name(name + suffix))
+
+
+def mp4_compatibility_reasons(plan, profile, tracks=()) -> list[str]:
+    """Do not silently discard selected picture subtitles or requested styling."""
+    if Path(plan.output_path).suffix.lower() != ".mp4":
+        return []
+    reasons = []
+    if any(track.id in plan.subtitle_ids and _is_image_subtitle(track) for track in tracks):
+        reasons.append("MP4 无法保留已选图片字幕；请改选 MKV。")
+    styles = effective_subtitle_styles(profile.subtitle_styles, profile.subtitle_languages)
+    if any(style.get("font_id") or style.get("size_mode") == "manual"
+           or style.get("color", "keep") != "keep" for style in styles.values()):
+        reasons.append("MP4 无法应用已设置的字幕字体、字号或颜色；请改选 MKV，或先恢复默认字幕样式。")
+    return reasons
+
+
+_OUTPUT_CLAIMS_LOCK = threading.Lock()
+_OUTPUT_CLAIMS: set[str] = set()
+
+
+@contextmanager
+def claim_output_path(path: str | Path):
+    key = normalized_output_key(path)
+    with _OUTPUT_CLAIMS_LOCK:
+        if key in _OUTPUT_CLAIMS:
+            raise RuntimeError(f"另一项任务正在写入同一输出文件，请更换输出路径：{path}")
+        _OUTPUT_CLAIMS.add(key)
+    try:
+        yield
+    finally:
+        with _OUTPUT_CLAIMS_LOCK:
+            _OUTPUT_CLAIMS.discard(key)
+
+
 UNIVERSAL_AUDIO_ORDER = ("AC-3", "AAC", "E-AC-3", "Opus")
 DEFAULT_UNIVERSAL_AUDIO = "AC-3"
 _ANALYSIS_CACHE_LOCK = threading.Lock()
@@ -44,6 +119,162 @@ _ANALYSIS_CACHE_LIMIT = 300
 
 class OfflineSubtitleUnavailableError(RuntimeError):
     """The no-search batch mode cannot safely create the requested subtitles."""
+
+
+class PendingSubtitleReviewError(RuntimeError):
+    """The film has saved usable originals and awaits explicit human review."""
+    def __init__(self, plan, candidates, context, manifest_path=""):
+        self.plan = plan
+        self.candidates = tuple(candidates)
+        self.context = dict(context)
+        self.manifest_path = str(manifest_path)
+        super().__init__(
+            ("参照音轨或字幕版本待确认；" if self.context.get('reason_code')=='reference_audio_unconfirmed'
+             else "自动未确认当前字幕的时间轴；") +
+            "可右键影片→核听当前字幕，或通过字幕选择换一份字幕后再处理。"
+        )
+
+
+def failure_advice(error) -> str:
+    """Suggest a next action without changing state, trust or processing gates."""
+    chain, seen = [], set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = (getattr(current, "__cause__", None)
+                   or (None if getattr(current, "__suppress_context__", False)
+                       else getattr(current, "__context__", None)))
+    text = "\n".join(str(item) for item in chain).casefold()
+    if any(isinstance(item, pro_core.RetainedSubtitleVerificationError) for item in chain):
+        return "建议查看详情中的保留字幕轨核验结果；已通过音频核验的文本已保存，需单独核验保留轨或调整字幕选择。"
+    if '参照音轨或字幕版本待确认' in text:
+        return '建议在核听窗口检查并选择参照音轨，再确认字幕版本；已下载候选无需重新搜索。'
+    if any(isinstance(item, PendingSubtitleReviewError) for item in chain):
+        return "建议右键影片→核听当前字幕，确认前、中、后三段后再继续处理。"
+    if (any(isinstance(item, PermissionError)
+            or getattr(item, "errno", None) in {errno.EACCES, errno.ENOSPC, errno.EBUSY, errno.EROFS}
+            or getattr(item, "winerror", None) in {5, 32, 33, 112}
+            for item in chain)
+            or any(word in text for word in (
+                "磁盘空间", "空间不足", "目标目录", "文件占用", "文件被占用", "另一项任务正在写入",
+                "写入权限", "拒绝访问", "permission denied", "access denied", "disk full",
+                "no space left", "sharing violation", "being used by another process"))):
+        return "建议检查目标目录、磁盘剩余空间、写入权限及文件占用后重新处理。"
+    if (any(isinstance(item, core.InvalidTranslationResponseError) for item in chain)
+            or any(word in text for word in (
+                "ollama", "本地模型", "翻译模型", "模型加载", "模型响应", "翻译引擎",
+                "翻译服务", "翻译失败", "翻译返回", "译文缺失", "模型请求"))):
+        return "建议检查翻译服务和模型状态后重新处理。"
+    if (any(isinstance(item, ConnectionError) or type(item).__name__ in {
+                "SubtitleAuthenticationError", "SubtitleQuotaError", "URLError", "gaierror"}
+            for item in chain)
+            or any(word in text for word in (
+                "api key", "api_key", "opensubtitles api", "subdl api", "网络连接",
+                "无法连接", "连接失败", "网络错误", "请求额度", "下载额度", "频率限制",
+                "connection refused", "connection reset", "getaddrinfo", "name resolution",
+                "network is unreachable", "http error", "http 401", "http 403", "http 429",
+                "quota", "rate limit", "too many requests", "请求失败（406）"))):
+        return "建议检查字幕服务的网络连接、API Key及账户额度后重新处理。"
+    infrastructure = any(isinstance(item, (
+        pro_core.SubtitleVerificationToolError, pro_core.SubtitlePreflightTimeoutError)) for item in chain)
+    if any(isinstance(item, pro_core.SubtitleVerificationToolError) for item in chain):
+        return '建议保留失败报告，检查核验工具或程序错误后重试；无需反复更换字幕。'
+    if not infrastructure and (
+            any(isinstance(item, (pro_core.SubtitleContentMismatchError, OfflineSubtitleUnavailableError))
+                for item in chain)
+            or any(word in text for word in (
+                "影片身份", "另一影片", "字幕不完整", "不完整字幕", "错版", "版本不匹配",
+                "容器身份", "缺少同片证据", "候选标记为第", "剪辑版本冲突", "年份冲突",
+                "候选影片年份", "字幕正文", "不是影片正片字幕", "片段或强制字幕",
+                "分卷字幕", "影院片源字幕", "纯英文翻译源",
+                "没有可核验的英文文本", "没有找到可核验的英文文本", "没有可靠候选",
+                "没有找到可下载的英文字幕", "候选均未通过", "均未通过安全核验",
+                "不是英文", "字幕语言", "英文候选", "字幕时间轴明显长于影片"))):
+        return "建议右键影片→字幕选择，在线选择或本地导入正确、完整的字幕后再处理。"
+    return "建议查看详情，修复具体失败原因后重新处理。"
+
+
+def movie_detail_text(plan, status=None):
+    """Present one current result while retaining the original diagnostic data."""
+    fields = {}
+    extra = []
+    key = None
+    lines = []
+    def flush():
+        value='\n'.join(lines).strip()
+        if value:
+            (fields.setdefault(key,[]) if key is not None else extra).append(value)
+    for line in (plan.detail or '').splitlines():
+        match=re.match(r'^(影片规格|影片|套用|音轨|字幕|提示|输出|字幕失败报告|处理失败|处理建议)[：:]\s*(.*)$',line)
+        if match:
+            flush();key=match[1];lines=[match[2]]
+        else:
+            lines.append(line)
+    flush()
+    def latest(name, default=''):
+        return fields.get(name,[default])[-1]
+    def unique(values):
+        return list(dict.fromkeys(value for value in values if value))
+    def compact_tracks(value):
+        counts={}
+        for item in (value or '').split('、'):
+            item=item.strip()
+            if item:counts[item]=counts.get(item,0)+1
+        return '、'.join(f'{item} ×{count}' if count>1 else item for item,count in counts.items())
+    state=status or getattr(plan,'task_status_label','') or plan.status_label or '待分析'
+    profile=latest('套用',f'偏好 {plan.profile_slot}')
+    specs=latest('影片规格',getattr(plan,'media_specification',''))
+    header=[f'影片：{Path(plan.path).name}',f'路径：{plan.path}',f'状态：{state}',f'套用偏好：{profile}']
+    if specs:header.append('影片规格：'+specs.removeprefix('影片规格：'))
+    tracks=[]
+    if plan.audio_tracks or plan.main_audio:tracks.append('原音轨：'+(plan.audio_tracks or plan.main_audio))
+    if plan.subtitles:tracks.append('现有字幕：'+compact_tracks(plan.subtitles))
+    scheme=[]
+    if latest('音轨'):scheme.append('音轨方案：'+latest('音轨'))
+    if latest('字幕'):scheme.append('字幕方案：'+latest('字幕'))
+    failure=latest('处理失败')
+    if not failure and plan.summary and plan.summary.strip()!=state:
+        scheme.append('处理方案：'+plan.summary.strip())
+    notes=unique(fields.get('提示',[]))
+    if notes:scheme.append('提示：'+'\n'.join(notes))
+    outcome=[]
+    if failure:outcome.append('失败原因：'+failure)
+    advice=latest('处理建议')
+    if advice:outcome.append('处理建议：'+advice)
+    paths=[]
+    output=latest('输出',plan.output_path)
+    if output:paths.append('输出：'+output)
+    report=latest('字幕失败报告',getattr(plan,'subtitle_report_path',''))
+    if report:paths.append('字幕失败报告：'+report)
+    return '\n\n'.join('\n'.join(section) for section in
+        (header,tracks,scheme,unique(extra),outcome,paths) if section)
+
+
+def _retain_pending_subtitle_review(plan, pending, cancel_event=None):
+    import manual_review_state
+    import smart_subtitles
+    core.check_cancel(cancel_event)
+    if not pending.candidates:
+        raise RuntimeError("核听接续结果没有实际保存的字幕候选。")
+    for candidate in pending.candidates:
+        smart_subtitles.validate_pending_candidate(plan.path, candidate)
+    first = pending.candidates[0]
+    baseline = manual_review_state.capture_origin(plan, first.subtitle_path, first.language)
+    core.check_cancel(cancel_event)
+    manual_review_state.clear_trust(plan, required=True)
+    plan.manual_review_resume_processing = True
+    plan.source_mode = "external"
+    plan.source_subtitle_id = None
+    plan.external_subtitle = str(baseline)
+    plan.external_language = first.language or "en"
+    plan.external_subtitle_origin = "download"
+    plan.pending_review_audio_id = pending.context.get("validation_audio_id")
+    plan.status, plan.status_label = "review", "需要确认"
+    plan.summary = ("参照音轨或字幕版本待确认，可右键影片→核听当前字幕并选择参照音轨"
+                    if pending.context.get('reason_code')=='reference_audio_unconfirmed'
+                    else "自动未确认当前字幕的时间轴，可右键影片→核听当前字幕")
+    return PendingSubtitleReviewError(plan, pending.candidates, pending.context, pending.manifest_path)
 
 
 class _TranslationResourceScope:
@@ -96,6 +327,9 @@ class _AnyCancel:
 
 
 def process_log_path(plan: BatchPlan) -> Path:
+    if not plan.output_path:
+        source = Path(plan.path)
+        return source.with_name(source.stem + '_pro_work') / 'process.log'
     output = Path(plan.output_path)
     return Path(str(output.with_suffix("")) + "_work") / "process.log"
 
@@ -191,7 +425,7 @@ def _finish_analysis(plan: BatchPlan, started: float, log: Callable[[str], None]
 
 
 def _main_audio(audio_tracks):
-    candidates = [track for track in audio_tracks if not is_commentary(track)] or list(audio_tracks)
+    candidates = [track for track in audio_tracks if not is_commentary(track)]
     return next((track for track in candidates if track.default), candidates[0] if candidates else None)
 
 
@@ -387,7 +621,8 @@ def _subtitle_coverage(
     script_equivalent: bool,
     additional_languages: tuple[str, ...] = (),
 ) -> set[str]:
-    covered = {_subtitle_language(track) for track in tracks} | set(additional_languages)
+    covered = {_subtitle_language(track) for track in tracks
+               if subtitle_roles.track_role(track).main_dialogue} | set(additional_languages)
     if "zh" in covered or (
         script_equivalent and covered.intersection(chinese_script_converter.CHINESE_SCRIPT_CODES)
     ):
@@ -442,7 +677,7 @@ def _statistical_incomplete_reason(track, movie_duration: float = 0.0) -> str:
 
 
 def _is_incomplete_subtitle(track, movie_duration: float = 0.0) -> bool:
-    return _is_foreign_only_subtitle(track) or bool(
+    return not subtitle_roles.track_role(track).main_dialogue or _is_foreign_only_subtitle(track) or bool(
         _statistical_incomplete_reason(track, movie_duration)
     )
 
@@ -455,18 +690,18 @@ def _foreign_only_note(tracks, movie_duration: float = 0.0) -> str:
     for track in marked:
         language = language_label(track.language)
         name = _subtitle_name(track)
-        reason = _statistical_incomplete_reason(track, movie_duration)
+        reason = subtitle_roles.track_role(track).reason or _statistical_incomplete_reason(track, movie_duration)
         label = f"{language}({name})" if name else language
         if reason:
             label += f"[{reason}]"
         if label not in labels:
             labels.append(label)
-    return "检测到片段/强制字幕：" + "、".join(labels) + "；已按非完整字幕处理，不当作完整字幕或翻译来源。"
+    return "检测到非正片用途或片段/强制字幕：" + "、".join(labels) + "；不当作完整正片字幕或翻译来源。"
 
 
 def _subtitle_rank(track, movie_duration: float = 0.0) -> tuple[int, int, int]:
     name = _subtitle_name(track).lower()
-    accessibility = any(token in name for token in ("sdh", "hearing", "cc", "听障"))
+    accessibility = subtitle_roles.track_role(track).code == 'sdh'
     return (
         1 if _is_incomplete_subtitle(track, movie_duration) else 0,
         1 if accessibility else 0,
@@ -527,8 +762,7 @@ def _offline_source_track(tracks, main_track, movie_duration: float = 0.0):
 
 def ordered_text_anchors(tracks, main_track, duration=0.0):
     import continuous_vad
-    audio = continuous_vad.audio_track(tracks, main_track.id if main_track else None)
-    language = normalize_language(audio.language)
+    language = continuous_vad.subtitle_anchor_language(tracks, main_track.id if main_track else None)
     candidates = [t for t in tracks if t.type == "subtitles" and t.text_subtitle
         and not _is_incomplete_subtitle(t, duration)
         and not any(x in (t.name or "").lower() for x in ("commentary", "评论", "評論", "解说"))]
@@ -543,7 +777,19 @@ def ordered_text_anchors(tracks, main_track, duration=0.0):
             language_tier = 2
         return (language_tier, *_subtitle_rank(track, duration), track.id)
 
-    return sorted(candidates, key=rank)
+    ordered = sorted(candidates, key=rank)
+    useful = [track for track in ordered if _subtitle_language(track) in {language, "en"}]
+    # Foreign copies of the same film clock do not add independent evidence.
+    # If neither dialogue language nor English is available, keep one fallback.
+    pool = useful if useful else ordered[:1]
+    counts = {}
+    selected = []
+    for track in pool:
+        code = _subtitle_language(track)
+        if counts.get(code, 0) < 2:
+            selected.append(track)
+            counts[code] = counts.get(code, 0) + 1
+    return selected
 
 
 def plan_requires_online_subtitle_service(
@@ -624,14 +870,14 @@ def _refresh_incomplete_subtitle_selections(
             )
             refreshed_ids.append(replacement.id)
             log(
-                f"正式处理前复核：字幕轨 {selected.id} 已由容器统计确认不完整，"
+                f"正式处理前复核：字幕轨 {selected.id} 不适合作为完整正片字幕（{subtitle_roles.track_role(selected).reason or '容器统计确认不完整'}），"
                 f"自动改用同语种完整字幕轨 {replacement.id}。"
             )
         else:
             if language in desired and language not in plan.missing_subtitle_languages:
                 plan.missing_subtitle_languages.append(language)
             log(
-                f"正式处理前复核：字幕轨 {selected.id} 已由容器统计确认不完整，"
+                f"正式处理前复核：字幕轨 {selected.id} 不适合作为完整正片字幕（{subtitle_roles.track_role(selected).reason or '容器统计确认不完整'}），"
                 "已从保留列表移除。"
             )
     plan.subtitle_ids = list(dict.fromkeys(refreshed_ids))
@@ -726,8 +972,28 @@ def analyze_video(
     cancel_event: threading.Event | None = None,
     external_subtitle_origin: str = "",
     manual_confirmation_hash: str = "",
+    external_subtitle_media_signature: dict[str, int] | None = None,
+    external_subtitle_content_hash: str = "",
+    output_format: str = "MKV",
 ) -> BatchPlan:
     core.check_cancel(cancel_event)
+    if external_subtitle_verified and Path(external_subtitle).is_file():
+        try:
+            if external_subtitle_provider:
+                import smart_subtitles
+                smart_subtitles.verify_before_processing(
+                    path, external_subtitle, external_subtitle_provider,
+                    external_subtitle_release, external_subtitle_identity_key, external_subtitle_seal,
+                )
+            elif not external_subtitle_media_signature or external_subtitle_media_signature != media_signature(path):
+                raise RuntimeError("影片文件已变化或缺少影片验证记录，请重新核验字幕。")
+            elif ((external_subtitle_content_hash or manual_confirmation_hash)
+                    != hashlib.sha256(Path(external_subtitle).read_bytes()).hexdigest()):
+                raise RuntimeError("字幕文件已变化或缺少字幕验证记录，请重新核验字幕。")
+        except (OSError, RuntimeError, ValueError) as exc:
+            external_subtitle_verified = False
+            external_subtitle_verification = str(exc)
+            log(f"{Path(path).name}：原字幕验证已失效：{exc}")
     analysis_started = time.monotonic()
     metadata_started = time.monotonic()
     media_data, cache_hit = _inspect_media_cached(path, log, cancel_event)
@@ -739,7 +1005,7 @@ def analyze_video(
     audio_tracks = [track for track in tracks if track.type == "audio"]
     subtitle_tracks = [track for track in tracks if track.type == "subtitles"]
     main_audio = _main_audio(audio_tracks)
-    output = str(Path(path).with_suffix("")) + OUTPUT_SUFFIX
+    output = batch_output_path(path, output_format=output_format)
     plan = BatchPlan(path=path, profile_slot=profile.slot, output_path=output)
     duration_ns = core.video_track_duration_ns(media_data) or core.media_duration_ns(media_data)
     duration_seconds = duration_ns / 1_000_000_000 if duration_ns else 0.0
@@ -762,6 +1028,8 @@ def analyze_video(
     plan.external_subtitle_seal = external_subtitle_seal
     plan.external_subtitle_origin = external_subtitle_origin
     plan.manual_confirmation_hash = manual_confirmation_hash
+    plan.external_subtitle_media_signature = dict(external_subtitle_media_signature or {})
+    plan.external_subtitle_content_hash = external_subtitle_content_hash
     plan.main_audio = (
         f"{language_label(main_audio.language)} / {audio_format(main_audio.codec)}" if main_audio else "无音轨"
     )
@@ -782,6 +1050,16 @@ def analyze_video(
         plan.status_label = "无法处理"
         plan.summary = "影片没有可用音轨"
         plan.detail = "未检测到音轨。批量处理不会生成新的配音，需先更换片源。"
+        return _finish_analysis(plan, analysis_started, log)
+
+    if main_audio is None:
+        import audio_roles
+        plan.status = "blocked"
+        plan.status_label = "无法处理"
+        plan.main_audio = "未找到正片对白音轨"
+        plan.summary = "仅发现评论、口述解说、音乐或片段等非正片音轨"
+        plan.detail = "不能用这些音轨核对正片字幕。请检查音轨用途标记或更换包含正片对白的片源。\n" + "\n".join(
+            audio_roles.describe(track) for track in audio_tracks)
         return _finish_analysis(plan, analysis_started, log)
 
     audio_policy = profile.audio_policy if profile.audio_policy in {"native", "universal", "compact"} else "universal"
@@ -1049,6 +1327,14 @@ def analyze_video(
         if plan.burned_subtitle_detail
         else processing_detail
     )
+    format_reasons = mp4_compatibility_reasons(plan, profile, tracks)
+    if format_reasons and plan.status in {"ready", "review"}:
+        plan.status = "blocked"
+        plan.status_label = "格式不兼容"
+        plan.summary = "；".join(format_reasons)
+        plan.detail += "\n输出格式检查：" + plan.summary
+    elif Path(plan.output_path).suffix.lower() == ".mp4":
+        plan.detail += "\nMP4 输出使用普通文本字幕，显示样式由播放器决定。"
     return _finish_analysis(plan, analysis_started, log)
 
 
@@ -1060,6 +1346,46 @@ def _audio_stream_index(path: str, track_id: int) -> int:
     raise RuntimeError("无法定位用于音频兼容转换的主音轨。")
 
 
+@dataclass(frozen=True)
+class ConvertedAudio:
+    path: Path
+    source_relative_start_ns: int
+    media: dict
+
+
+def _track_origin_ns(path: str | Path, media: dict, track: dict, cancel_event) -> int:
+    value = track.get("properties", {}).get("minimum_timestamp")
+    if value is not None and not isinstance(value, bool):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            pass
+    kind = track.get("type")
+    matching = [item for item in media.get("tracks", []) if item.get("type") == kind]
+    ordinal = matching.index(track)
+    selector = "a" if kind == "audio" else "v"
+    ffprobe = Path(core.FFMPEG).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+    timeout = core._VideoDurationProbeCancel(cancel_event, 5.0)
+    try:
+        completed = core.run_command([
+            str(ffprobe), "-v", "error", "-nofind_stream_info", "-select_streams", f"{selector}:{ordinal}",
+            "-show_entries", "stream=start_time", "-of", "json", str(path),
+        ], cancel_event=timeout)
+        core.check_cancel(cancel_event)
+        if completed.stderr and completed.stderr.strip():
+            raise RuntimeError("兼容音轨时间起点补查报告读取错误，未采信其时间戳。")
+        payload = json.loads(completed.stdout.decode("utf-8"))
+        seconds = Decimal(str(payload["streams"][0]["start_time"]))
+        if seconds.is_finite() and not timeout.is_set():
+            return int(seconds * 1_000_000_000)
+    except core.CancelledError:
+        core.check_cancel(cancel_event)
+    except (KeyError, IndexError, ValueError, TypeError, InvalidOperation):
+        pass
+    core.check_cancel(cancel_event)
+    raise RuntimeError("无法确认兼容音轨与主视频的时间起点，已停止生成，避免音画不同步。")
+
+
 def _transcode_audio(
     input_path: str,
     track_id: int,
@@ -1067,28 +1393,38 @@ def _transcode_audio(
     destination: Path,
     log: Callable[[str], None],
     cancel_event: threading.Event | None,
-) -> Path:
+) -> ConvertedAudio:
     settings = {
         # The generated track is a compatibility companion, so AAC uses the
         # fast coder. The original high-quality track remains untouched.
-        "AAC": ("aac", "384k", ".m4a", ["-aac_coder", "fast"]),
-        "AC-3": ("ac3", "640k", ".ac3", []),
-        "E-AC-3": ("eac3", "640k", ".eac3", []),
-        "Opus": ("libopus", "256k", ".opus", []),
+        "AAC": ("aac", "384k", ["-aac_coder", "fast"]),
+        "AC-3": ("ac3", "640k", []),
+        "E-AC-3": ("eac3", "640k", []),
+        "Opus": ("libopus", "256k", []),
     }
     if target_format not in settings:
         raise RuntimeError(f"不支持自动生成音频格式：{target_format}")
-    codec, bitrate, extension, encoder_options = settings[target_format]
-    output = destination.with_suffix(extension)
+    codec, bitrate, encoder_options = settings[target_format]
+    # Matroska retains CodecDelay/DiscardPadding; raw AC-3 and a separately
+    # imported MP4 edit list cannot carry the original film's time origin.
+    output = destination.with_suffix(".mka")
     stream_index = _audio_stream_index(input_path, track_id)
     log(f"正在由主音轨生成兼容音轨：{target_format}（只转换音频，不转换视频）")
     media = core.inspect_media(input_path)
+    source_audio = next((item for item in media.get("tracks", [])
+                         if item.get("type") == "audio" and item.get("id") == track_id), None)
+    source_video = next((item for item in media.get("tracks", []) if item.get("type") == "video"), None)
+    if source_audio is None or source_video is None:
+        raise RuntimeError("无法定位兼容转换的源音轨或主视频。")
+    relative_start = (_track_origin_ns(input_path, media, source_audio, cancel_event)
+                      - _track_origin_ns(input_path, media, source_video, cancel_event))
     duration_ns = core.video_track_duration_ns(media) or core.media_duration_ns(media)
     duration_seconds = duration_ns / 1_000_000_000 if duration_ns else 0.0
     args = [
         core.FFMPEG, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-i", input_path, "-map", f"0:a:{stream_index}", "-vn", "-sn", "-dn",
         "-map_metadata", "-1", "-map_chapters", "-1",
+        "-af", "asetpts=PTS-STARTPTS", "-avoid_negative_ts", "disabled",
         "-c:a", codec, "-b:a", bitrate, *encoder_options,
         "-progress", "pipe:1", "-nostats", str(output),
     ]
@@ -1155,22 +1491,43 @@ def _transcode_audio(
     log("兼容音频进度：100%")
     if not output.exists() or output.stat().st_size < 1024:
         raise RuntimeError(f"未生成有效的 {target_format} 音轨。")
-    return output
+    core.check_cancel(cancel_event)
+    generated_media = core.inspect_media(str(output), cancel_event=cancel_event)
+    audio = [item for item in generated_media.get("tracks", []) if item.get("type") == "audio"]
+    if len(audio) != 1 or audio_format(audio[0].get("codec", "")) != target_format:
+        raise RuntimeError(f"兼容音轨编码验证失败：应生成一条 {target_format} 音轨。")
+    log(f"兼容音轨保留时间原点：相对主视频 {relative_start / 1_000_000:+.3f} 毫秒；"
+        f"编码器延迟 {int(audio[0].get('properties', {}).get('codec_delay', 0)) / 1_000_000:.3f} 毫秒。")
+    return ConvertedAudio(output, relative_start, generated_media)
 
 
 def _finalize_with_audio(
     base_path: Path,
     final_path: Path,
-    generated_audio: list[tuple[Path, str, str]],
+    generated_audio: list[tuple[ConvertedAudio, str, str]],
     keep_base_audio: bool,
     input_path: str,
     log: Callable[[str], None],
     cancel_event: threading.Event | None,
     generated_audio_default: bool = False,
 ) -> None:
+    core.check_cancel(cancel_event)
+    base_media = core.inspect_media(str(base_path), cancel_event=cancel_event)
+    base_video = next((item for item in base_media.get("tracks", []) if item.get("type") == "video"), None)
+    if base_video is None:
+        raise RuntimeError("兼容音轨封装基片缺少主视频。")
+    base_video_start = _track_origin_ns(base_path, base_media, base_video, cancel_event)
+    base_audio = [item for item in base_media.get("tracks", []) if item.get("type") == "audio"] if keep_base_audio else []
+    expected_subs = sum(item.get("type") == "subtitles" for item in base_media.get("tracks", []))
+    expected_audio_specs = list(base_audio)
+    generated_expectations = []
     partial = core.partial_output_path(str(final_path))
     core.remove_incomplete_file(partial, log)
     args = [core.MKVMERGE, "-o", str(partial)]
+    styled_fonts = any(str(a.get('file_name','')).startswith('SubFlow-')
+                       and str(a.get('file_name','')).lower().endswith(('.ttf','.otf'))
+                       for a in base_media.get('attachments',[]))
+    if styled_fonts: args += ['--enable-legacy-font-mime-types']
     if not keep_base_audio:
         args.append("--no-audio")
     elif generated_audio_default:
@@ -1178,36 +1535,118 @@ def _finalize_with_audio(
             if track.type == "audio":
                 args += ["--default-track", f"{track.id}:no"]
     args.append(str(base_path))
-    for index, (audio_path, label, language) in enumerate(generated_audio):
+    for index, (converted, label, language) in enumerate(generated_audio):
+        specs = [item for item in converted.media.get("tracks", []) if item.get("type") == "audio"]
+        if len(specs) != 1 or audio_format(specs[0].get("codec", "")) != label:
+            raise RuntimeError(f"待封装兼容音轨规格无效：{label}")
+        spec = specs[0]
+        generated_start = _track_origin_ns(converted.path, converted.media, spec, cancel_event)
+        sync_ns = base_video_start + converted.source_relative_start_ns - generated_start
         is_default = index == 0 and (generated_audio_default or not keep_base_audio)
         mkv_language = core.LANGUAGES.get(language, ("eng", language, language))[0]
+        expected_audio_specs.append(spec)
+        generated_expectations.append((converted, spec, mkv_language, f"{label} Compatible", is_default))
         args += [
+            "--sync", f"0:{round(sync_ns / 1_000_000)}",
             "--language",
             f"0:{mkv_language}",
             "--track-name",
             f"0:{label} Compatible",
             "--default-track",
             f"0:{'yes' if is_default else 'no'}",
-            str(audio_path),
+            str(converted.path),
         ]
     log(f"正在封装批量输出：{partial}")
     try:
         core.run_command(args, log=log, cancel_event=cancel_event)
-        input_media = core.inspect_media(input_path)
-        output_media = core.inspect_media(str(partial))
-        expected_audio = sum(1 for item in output_media.get("tracks", []) if item.get("type") == "audio")
-        expected_subs = sum(1 for item in output_media.get("tracks", []) if item.get("type") == "subtitles")
+        input_media = core.inspect_media(input_path, cancel_event=cancel_event)
         core.validate_media_output(
-            partial, input_media, expected_audio, expected_subs, None, log,
+            partial, input_media, len(expected_audio_specs), expected_subs, expected_audio_specs, log,
             input_path=input_path, cancel_event=cancel_event,
         )
+        output_media = core.inspect_media(str(partial), cancel_event=cancel_event)
+        output_video = next(item for item in output_media.get("tracks", []) if item.get("type") == "video")
+        video_start = _track_origin_ns(partial, output_media, output_video, cancel_event)
+        output_audio = [item for item in output_media.get("tracks", []) if item.get("type") == "audio"]
+        for (converted, spec, language, name, default), actual in zip(generated_expectations, output_audio[len(base_audio):]):
+            props = actual.get("properties", {})
+            source_props = spec.get("properties", {})
+            if (props.get("language") != language or props.get("track_name") != name
+                    or bool(props.get("default_track")) != default
+                    or bool(props.get("forced_track"))
+                    or int(props.get("codec_delay", 0)) != int(source_props.get("codec_delay", 0))):
+                raise RuntimeError("兼容音轨验证失败：语言、默认标记或编码器延迟与计划不符。")
+            actual_relative = _track_origin_ns(partial, output_media, actual, cancel_event) - video_start
+            if abs(actual_relative - converted.source_relative_start_ns) > 1_000_000:
+                raise RuntimeError("兼容音轨验证失败：相对主视频的时间起点发生变化。")
+        core.check_cancel(cancel_event)
         os.replace(partial, final_path)
     except BaseException:
         core.remove_incomplete_file(partial, log)
         raise
 
 
-def process_plan(
+def process_plan(plan, profile, log, cancel_event, parallel_targets=2,
+                 ai_gate=None, allow_online_search=True):
+    """Publish a complete per-film report even when a later gate rejects it."""
+    directory = (Path(str(Path(plan.output_path).with_suffix("")) + "_work") if plan.output_path
+                 else Path(plan.path).with_name(Path(plan.path).stem + "_pro_work"))
+    audit = subtitle_audit.FilmAudit(plan.path, directory)
+    outcome, reason = "completed", "处理流程完成；各轨验证状态见报告"
+    with subtitle_audit.scope(audit):
+        try:
+            return _process_plan_with_styles(plan, profile, log, cancel_event,
+                                            parallel_targets, ai_gate, allow_online_search)
+        except core.CancelledError:
+            outcome, reason = "stopped", "用户停止处理"
+            raise
+        except Exception as exc:
+            outcome, reason = "failed", str(exc)
+            raise
+        finally:
+            data, report_path = audit.write(outcome, reason, persistent_process_logger(plan, log))
+            plan.subtitle_report_path = report_path
+            plan.subtitle_verification_states = data["records"]
+            if report_path:
+                plan.detail = (plan.detail or "") + f"\n字幕{'失败' if outcome == 'failed' else '处理'}报告：{report_path}"
+
+
+def _process_plan_with_styles(
+    plan: BatchPlan,
+    profile: PreferenceProfile,
+    log: Callable[[str], None],
+    cancel_event: threading.Event | None,
+    parallel_targets: int = 2,
+    ai_gate: threading.Semaphore | None = None,
+    allow_online_search: bool = True,
+) -> str:
+    # Recheck sibling containers immediately before processing: they may have
+    # been added after analysis. Explicit custom output paths remain explicit.
+    output_format = Path(plan.output_path).suffix.lstrip(".").upper() if plan.output_path else "MKV"
+    legacy_output = str(Path(plan.path).with_suffix("")) + ".SF." + output_format.lower()
+    if normalized_output_key(plan.output_path) == normalized_output_key(legacy_output):
+        plan.output_path = batch_output_path(plan.path, output_format=output_format)
+    with claim_output_path(plan.output_path):
+        import subtitle_fonts
+        # Automatic sizing is the default even when the font dialog has never
+        # been opened. Only an explicit saved user size replaces this default.
+        styles = effective_subtitle_styles(profile.subtitle_styles, profile.subtitle_languages)
+        if output_format == "MP4":
+            reasons = mp4_compatibility_reasons(plan, profile)
+            if reasons:
+                raise RuntimeError("；".join(reasons))
+            log("MP4 输出使用普通文本字幕，默认字体和字号由播放器控制。")
+            return _process_plan_impl(plan, profile, log, cancel_event, parallel_targets,
+                                      ai_gate, allow_online_search)
+        if not styles or not plan.output_path:
+            return _process_plan_impl(plan, profile, log, cancel_event, parallel_targets,
+                                      ai_gate, allow_online_search)
+        with subtitle_fonts.processing(styles, Path(str(Path(plan.output_path).with_suffix('')) + '_work'), plan.output_path):
+            return _process_plan_impl(plan, profile, log, cancel_event, parallel_targets,
+                                      ai_gate, allow_online_search)
+
+
+def _process_plan_impl(
     plan: BatchPlan,
     profile: PreferenceProfile,
     log: Callable[[str], None],
@@ -1218,6 +1657,8 @@ def process_plan(
 ) -> str:
     if plan.status not in {"ready", "review", "processing"}:
         raise RuntimeError(f"该影片尚未满足处理条件：{plan.status_label}")
+    if plan.manual_review_required:
+        raise RuntimeError("本片人工对齐尚未完成，请确认前、中、后三段，或重新选择字幕后再处理。")
     if plan.external_subtitle_verified and not Path(plan.external_subtitle).is_file():
         raise RuntimeError("已验证英文字幕文件不存在，已阻止静默回退到图片字幕或其他来源。")
     if plan.manual_confirmation_hash and (
@@ -1228,7 +1669,14 @@ def process_plan(
         raise RuntimeError("人工确认的字幕文件已变化，必须重新核听确认。")
     if plan.source_mode == "online" and not plan.external_subtitle_verified:
         raise RuntimeError("在线字幕尚未通过音轨时间轴预检，已阻止进入正式处理。")
-    if plan.source_mode == "online" and plan.external_subtitle_provider:
+    if plan.external_subtitle_verified and not plan.external_subtitle_provider:
+        if (not plan.external_subtitle_media_signature
+                or plan.external_subtitle_media_signature != media_signature(plan.path)):
+            raise RuntimeError("影片文件已变化或缺少影片验证记录，请重新核验字幕。")
+        if ((plan.external_subtitle_content_hash or plan.manual_confirmation_hash)
+                != hashlib.sha256(Path(plan.external_subtitle).read_bytes()).hexdigest()):
+            raise RuntimeError("字幕文件已变化或缺少字幕验证记录，请重新核验字幕。")
+    if plan.external_subtitle_verified and plan.external_subtitle_provider:
         import smart_subtitles
 
         smart_subtitles.verify_before_processing(
@@ -1245,12 +1693,42 @@ def process_plan(
     work = Path(str(output.with_suffix("")) + "_work")
     work.mkdir(parents=True, exist_ok=True)
     log = persistent_process_logger(plan, log)
+    if plan.manual_confirmation_hash:
+        try:
+            record_path = Path(plan.external_subtitle).parent / 'manual-confirmation.json'
+            record = json.loads(record_path.read_text(encoding='utf-8'))
+            if record.get('output_sha256') == plan.manual_confirmation_hash:
+                import manual_timeline
+                observation = manual_timeline.observation_report(record['points'], record['offsets'])
+                audit = subtitle_audit.current()
+                if audit is not None:
+                    audit.evidence(plan.external_subtitle, 'human-listening', dict(
+                        region_observations=[dict(region=i, offset_seconds=item['offset_seconds'],
+                                                  start_seconds=item['movie_seconds'], trusted=True,
+                                                  reason='用户逐窗核听确认')
+                                             for i, item in enumerate(observation['windows'])],
+                        human_observations=observation, fixed_offset_warning=observation['fixed_offset_warning']))
+        except (OSError, ValueError, TypeError, KeyError):
+            # The existing source hash/film trust checks remain authoritative;
+            # missing optional display evidence cannot invent a new approval.
+            log('未读取到可绑定的人工三点显示记录；字幕及影片信任仍按已有记录复查。')
     log("处理阶段开始；后续搜索、身份、时间轴与翻译信息将保存到本片日志。")
     base_output = work / "base-processed.mkv"
+    mux_output = work / "processed-before-mp4.mkv" if output.suffix.lower() == ".mp4" else output
+    if output.suffix.lower() == ".mp4":
+        core.ensure_output_disk_space(plan.path, str(output), log)
     if output.exists() and output.resolve() == source.resolve():
         raise RuntimeError("输出文件不能覆盖原影片。")
 
     all_tracks = core.inspect_tracks(plan.path)
+    audit = subtitle_audit.current() or subtitle_audit.FilmAudit(plan.path, work)
+    for track in all_tracks:
+        if track.type == "subtitles":
+            role = subtitle_roles.track_role(track)
+            row = audit.add(f"内嵌轨 {track.id} {track.name or track.language}",
+                            track_id=track.id, kind="selection", language=track.language,
+                            role=role.code, retained=track.id in plan.subtitle_ids)
+            audit.update(row, "purpose", "eligible" if role.main_dialogue else "filtered", role.reason)
     main_track = _main_audio([track for track in all_tracks if track.type == "audio"])
     if not main_track:
         raise RuntimeError("影片没有可用音轨。")
@@ -1262,6 +1740,12 @@ def process_plan(
         runtime_duration,
         log,
     )
+    for row in audit.records:
+        if row.get('kind') == 'selection':
+            row['retained'] = row.get('track_id') in plan.subtitle_ids
+    format_reasons = mp4_compatibility_reasons(plan, profile, all_tracks)
+    if format_reasons:
+        raise RuntimeError("；".join(format_reasons))
     targets = list(plan.missing_subtitle_languages)
     local_conversion_targets = [
         code for code in targets if code in plan.local_chinese_conversion_sources
@@ -1281,8 +1765,15 @@ def process_plan(
         if track.id in plan.subtitle_ids and _is_image_subtitle(track)
     ]
     anchor_candidates = ordered_text_anchors(all_tracks, main_track, runtime_duration)
+    chosen_anchor_ids = {track.id for track in anchor_candidates}
+    for track in all_tracks:
+        if track.type == "subtitles" and track.text_subtitle and not _is_incomplete_subtitle(track, runtime_duration):
+            row = audit.add(f"内嵌文本标杆 {track.id}", track_id=track.id, kind="source")
+            if track.id not in chosen_anchor_ids:
+                audit.update(row, "selection", "not_examined", "优先对白语言/英文；同语言最多两条，其他轨不重复核验")
     embedded_timeline_anchor = None
     prepared_embedded_anchor = None
+    prepared_text_extraction = None
     prepared_image_timing = None
     shared_audio_reference = None
     shared_content_audio = None
@@ -1290,9 +1781,19 @@ def process_plan(
     if not allow_online_search:
         log("无搜索处理：沿用现有字幕时间轴，不启动在线搜索或自动纠偏。")
     elif not (plan.external_subtitle_verified and Path(plan.external_subtitle).is_file()):
-        for candidate in anchor_candidates:
+        candidate_queue = list(anchor_candidates)
+        attempted_anchor_ids = set()
+        reference_revision = 0
+        while candidate_queue:
+            candidate = candidate_queue.pop(0)
+            attempted_anchor_ids.add(candidate.id)
             core.check_cancel(cancel_event)
             status = {}
+            row = next((r for r in audit.records if r.get("track_id") == candidate.id and r.get("kind") == "source"), None)
+            if row is None:
+                row = audit.add(f"内嵌文本标杆 {candidate.id}", track_id=candidate.id, kind="source")
+            row["attempted"] = True
+            audit.active_record = row
             try:
                 if shared_content_audio is None:
                     shared_content_audio = pro_core.prepare_shared_subtitle_content_audio(
@@ -1300,17 +1801,30 @@ def process_plan(
                     shared_audio_reference = shared_content_audio.vad_reference
                 pro_core.prepare_embedded_text_corrections(
                     plan.path, [candidate.id], candidate.id, shared_content_audio.validation_audio_id,
-                    str(work), log, cancel_event, shared_audio_reference=shared_audio_reference,
-                    shared_content_audio=shared_content_audio, verification_status=status)
+                    str(work), log, cancel_event, shared_audio_reference=shared_content_audio.vad_reference,
+                    shared_content_audio=shared_content_audio, verification_status=status,
+                    prepared_text_extraction=prepared_text_extraction,
+                    prefetch_text_subtitle_ids=plan.subtitle_ids)
             except core.CancelledError:
                 raise
             except (pro_core.SubtitleVerificationToolError, pro_core.SubtitlePreflightTimeoutError):
                 raise
             except Exception as exc:
+                audit.update(row, "audio_timing", subtitle_audit.failure_kind(exc), str(exc))
                 log(f"内嵌文本轨 {candidate.id} 未能建立标杆：{exc}")
+                revision = getattr(shared_content_audio, 'revision', 0)
+                if revision != reference_revision:
+                    reference_revision = revision
+                    candidate_queue = [t for t in anchor_candidates if t.id in attempted_anchor_ids and t.id != candidate.id] + candidate_queue
+                    log('参照已切换，先复用原内嵌文本重验；不重新提取或下载。')
                 continue
+            finally:
+                if status.get("prepared_text_extraction") is not None:
+                    prepared_text_extraction = status["prepared_text_extraction"]
             if status.get("verified_anchor"):
+                audit.update(row, "audio_timing", "verified", status.get("report", "已通过音频时间轴预检"))
                 embedded_timeline_anchor = candidate
+                shared_audio_reference = shared_content_audio.vad_reference
                 prepared_embedded_anchor = status.get("prepared_anchor")
                 source_track = candidate
                 plan.source_subtitle_id = candidate.id
@@ -1318,6 +1832,7 @@ def process_plan(
                     plan.source_mode = "embedded"
                 log(f"选用内嵌{language_label(candidate.language)}文本轨 {candidate.id}作为时间标杆，不下载替代文本。")
                 break
+            audit.update(row, "audio_timing", "insufficient_evidence", status.get("report", "未能建立可信标杆"))
         if anchor_candidates and embedded_timeline_anchor is None:
             plan.source_subtitle_id = None
             log("内嵌文本均未建立可用标杆，随后尝试下载英文文本。")
@@ -1424,8 +1939,8 @@ def process_plan(
                 )
             else:
                 log(
-                    "需要校正原图片字幕时间轴，正在搜索可靠英文文本字幕作为临时时间标杆；"
-                    "核验后不自动写入成品。"
+                    "需要核验原图片字幕，正在搜索可靠英文文本标轴；"
+                    "核验后按所选语言决定保留、替换和补译。"
                 )
         elif needs_text_timeline_anchor and not needs_translation_english_source:
             log("内嵌文本未能完成纠偏，正在搜索英文文本作为时间标杆。")
@@ -1436,23 +1951,41 @@ def process_plan(
         required_image_ids = [track.id for track in retained_image_tracks
             if not (profile.replace_downloaded_subtitle and normalize_language(track.language) == 'en')]
         candidate_image_timing = None
+        candidate_image_replacements = {}
+        candidate_image_context = None
+        image_failures_by_clock = {}
 
         def prepare_candidate_images(preparation_cancel):
             pro_core.prepare_shared_image_timing(
                 plan.path, required_image_ids, str(work), log, preparation_cancel)
 
         def check_candidate_images(aligned, candidate_cancel):
-            nonlocal candidate_image_timing
+            nonlocal candidate_image_timing, candidate_image_replacements, candidate_image_context
             # Any retry, candidate change or failure discards the previous
             # candidate's handoff before running the actual acceptance checks.
             candidate_image_timing = None
+            candidate_image_replacements = {}
+            candidate_image_context = None
             if not required_image_ids:
                 return
             image_status = {}
-            pro_core.require_image_timeline_anchor(
-                plan.path, required_image_ids, main_track.id, str(work), aligned,
-                log, candidate_cancel, prepared_image_status=image_status)
+            import smart_subtitles
+            clock = smart_subtitles.subtitle_timeline_fingerprint(aligned)
+            if clock in image_failures_by_clock:
+                log("保留图片字幕：本候选与已检查文本的时间点完全相同，复用逐轨失败证据，不重复扫描。")
+                raise image_failures_by_clock[clock]
+            try:
+                pro_core.require_image_timeline_anchor(
+                    plan.path, required_image_ids,
+                    getattr(candidate_cancel, 'validation_audio_id', main_track.id), str(work), aligned,
+                    log, candidate_cancel, prepared_image_status=image_status,
+                    replace_unalignable=True)
+            except pro_core.RetainedSubtitleVerificationError as error:
+                image_failures_by_clock[clock] = error
+                raise
             candidate_image_timing = image_status.get("prepared_image_timing")
+            candidate_image_replacements = image_status.get('replacement_tracks', {})
+            candidate_image_context = image_status.get('replacement_context')
 
         try:
             core.check_cancel(cancel_event)
@@ -1465,12 +1998,23 @@ def process_plan(
                 cancel_event,
                 candidate_acceptance=check_candidate_images if required_image_ids else None,
                 candidate_preparation=prepare_candidate_images if required_image_ids else None,
+                **({'audio_checkpoint': plan.audio_verified_source} if plan.audio_verified_source else {}),
             )
         except core.CancelledError:
             raise
-        except (pro_core.SubtitlePreflightTimeoutError, pro_core.SharedImageTimingPreparationError):
+        except smart_subtitles.PendingSubtitleReviewError as exc:
+            pending = _retain_pending_subtitle_review(plan, exc, cancel_event)
+            log(str(pending))
+            raise pending from exc
+        except (pro_core.SubtitlePreflightTimeoutError, pro_core.SharedImageTimingPreparationError,
+                pro_core.SubtitleVerificationToolError):
             # The film's audio preparation failed, not its downloaded subtitles.
             # Do not retry every subtitle or misreport this as a missing source.
+            raise
+        except pro_core.RetainedSubtitleVerificationError as error:
+            # The passed text and per-track evidence remain in the report/work.
+            # Do not call this a missing English source or grant it final trust.
+            plan.audio_verified_source = dict(getattr(error, 'audio_checkpoint', {}) or {})
             raise
         except Exception as exc:
             if needs_translation_english_source:
@@ -1484,6 +2028,10 @@ def process_plan(
             ) from exc
         else:
             core.check_cancel(cancel_event)
+            plan.audio_verified_source = {}
+            if getattr(smart_result, 'shared_audio', None) is not None:
+                shared_content_audio = smart_result.shared_audio
+                shared_audio_reference = shared_content_audio.vad_reference
             if pro_core.prepared_image_timing_matches_subtitle(
                     candidate_image_timing, smart_result.subtitle_path):
                 prepared_image_timing = candidate_image_timing
@@ -1500,7 +2048,40 @@ def process_plan(
             plan.external_subtitle_seal = smart_result.verification_seal
             plan.external_subtitle_origin = "download"
             plan.manual_confirmation_hash = ""
-            if profile.replace_downloaded_subtitle:
+            if candidate_image_replacements:
+                current_context = pro_core._prepared_image_context(
+                    plan.path, required_image_ids,
+                    (smart_result.validation_audio_id if getattr(smart_result, 'validation_audio_id', None) is not None
+                     else main_track.id), None, smart_result.subtitle_path)
+                if current_context != candidate_image_context:
+                    raise pro_core.SubtitleVerificationToolError(
+                        '影片、音轨或已验证字幕在原轨替换决定后发生变化，请重新处理。')
+                replaced = set(candidate_image_replacements)
+                plan.subtitle_ids = [track_id for track_id in plan.subtitle_ids if track_id not in replaced]
+                plan.local_chinese_conversion_sources = {code: track_id for code, track_id in
+                    plan.local_chinese_conversion_sources.items() if track_id not in replaced}
+                local_conversion_targets[:] = [code for code in local_conversion_targets
+                                              if code in plan.local_chinese_conversion_sources]
+                retained = [track for track in all_tracks if track.id in plan.subtitle_ids]
+                coverage = _subtitle_coverage(retained, profile.subtitle_languages,
+                    profile.chinese_script_equivalent, (normalize_language(plan.external_language),))
+                for code in profile.subtitle_languages:
+                    if code not in coverage:
+                        if code not in translation_candidates:
+                            translation_candidates.append(code)
+                        if code not in plan.missing_subtitle_languages:
+                            plan.missing_subtitle_languages.append(code)
+                plan.source_mode = 'online'
+                plan.source_subtitle_id = None
+                pro_core._record_retained_replacement(replaced, candidate_image_replacements, log,
+                    tracks=all_tracks, reference_path=plan.external_subtitle,
+                    reference_label=' · '.join(value for value in (
+                        plan.external_subtitle_provider, plan.external_subtitle_release) if value),
+                    target_codes=[code for code in translation_candidates if code not in coverage])
+                plan.has_retained_image_subtitles = any(_is_image_subtitle(track) for track in retained)
+            if candidate_image_replacements:
+                log('可靠英文文本已通过核验，将沿用为原轨替换和所需字幕的来源；原轨失败不触发重新搜索英文。')
+            elif profile.replace_downloaded_subtitle:
                 log(
                     "可靠英文文本字幕已通过核验；按偏好写入成品并替换"
                     "同语言内嵌字幕，其余选中字幕参照此时间轴。"
@@ -1580,7 +2161,7 @@ def process_plan(
         )
         log(f"成品保留的原图片字幕：{image_labels}。")
     elif plan.has_image_subtitles:
-        log("影片含有图片字幕，但当前偏好未保留这些轨道，不写入成品。")
+        log("本次输出不包含原图片字幕；选择或替换原因见前述日志。")
     translation_targets = _effective_translation_targets(
         plan,
         translation_candidates,
@@ -1618,6 +2199,7 @@ def process_plan(
         _subtitle_language(track)
         for track in all_tracks
         if track.type == "subtitles" and track.id in plan.subtitle_ids
+        and subtitle_roles.track_role(track).main_dialogue
     }
     external_source_language = normalize_language(plan.external_language)
     requested_subtitle_languages = {
@@ -1631,10 +2213,11 @@ def process_plan(
         ))
     )
     translation_scope = _TranslationResourceScope(ai_gate, log, cancel_event)
+    retained_replacement_status = {}
     try:
         pro_core.process_pro(
             input_path=plan.path,
-            output_path=str(base_output if plan.missing_audio_formats else output),
+            output_path=str(base_output if plan.missing_audio_formats else mux_output),
             keep_audio_ids=plan.audio_ids,
             keep_subtitle_ids=plan.subtitle_ids,
             source_mode=plan.source_mode,
@@ -1670,13 +2253,32 @@ def process_plan(
             translation_end=translation_scope.finish,
             prepared_embedded_anchor=prepared_embedded_anchor,
             prepared_image_timing=prepared_image_timing,
+            prepared_text_extraction=prepared_text_extraction,
+            retained_replacement_status=retained_replacement_status,
         )
     finally:
         translation_scope.finish()
+    if retained_replacement_status:
+        plan.subtitle_ids = retained_replacement_status['keep_subtitle_ids']
+        plan.local_chinese_conversion_sources = retained_replacement_status['local_chinese_conversion_sources']
+        translation_targets = retained_replacement_status['target_codes']
+        for code in translation_targets:
+            if code not in plan.missing_subtitle_languages:
+                plan.missing_subtitle_languages.append(code)
+        plan.has_retained_image_subtitles = any(_is_image_subtitle(track) for track in all_tracks
+                                               if track.id in plan.subtitle_ids)
     if not plan.missing_audio_formats:
+        if output.suffix.lower() == ".mp4":
+            _publish_mp4(mux_output, output, log, cancel_event)
+            return str(output)
+        plan.translation_review_pending = _register_translation_output(output, work, translation_targets, log)
         return str(output)
 
-    generated_source_id = plan.generated_audio_source_id or main_track.id
+    generated_source_id = plan.generated_audio_source_id if plan.generated_audio_source_id is not None else main_track.id
+    generated_source_track = next((track for track in all_tracks
+                                   if track.type == "audio" and track.id == generated_source_id), None)
+    if generated_source_track is None:
+        raise RuntimeError("计划中的兼容转换源音轨已不存在，请重新分析影片。")
     generated = [
         (
             _transcode_audio(
@@ -1688,13 +2290,13 @@ def process_plan(
                 cancel_event,
             ),
             fmt,
-            "en",
+            normalize_language(generated_source_track.language),
         )
         for fmt in plan.missing_audio_formats
     ]
     _finalize_with_audio(
         base_output,
-        output,
+        mux_output,
         generated,
         bool(plan.audio_ids),
         plan.path,
@@ -1704,8 +2306,54 @@ def process_plan(
     )
     if base_output.exists():
         base_output.unlink()
+    if output.suffix.lower() == ".mp4":
+        _publish_mp4(mux_output, output, log, cancel_event)
+        return str(output)
     log(f"批量项完成：{output}")
+    plan.translation_review_pending = _register_translation_output(output, work, translation_targets, log)
     return str(output)
+
+
+def _publish_mp4(intermediate, output, log, cancel_event):
+    """Convert the verified final MKV, then verify and atomically publish MP4."""
+    core.check_cancel(cancel_event)
+    media = core.inspect_media(str(intermediate), cancel_event=cancel_event)
+    audio = [track for track in media.get("tracks", []) if track.get("type") == "audio"]
+    subs = sum(track.get("type") == "subtitles" for track in media.get("tracks", []))
+    partial = core.partial_output_path(str(output))
+    core.remove_incomplete_file(partial, log)
+    try:
+        core.remux_mkv_to_mp4(str(intermediate), str(partial), log, cancel_event)
+        log("MP4 封装完成，正在验证成品。")
+        core.validate_media_output(partial, media, len(audio), subs, audio, log,
+                                   input_path=intermediate, cancel_event=cancel_event)
+        actual = core.inspect_media(str(partial), cancel_event=cancel_event)
+        container = str(actual.get("container", {}).get("type", "")).lower()
+        if "mp4" not in container and "quicktime" not in container:
+            raise RuntimeError("MP4 输出容器验证失败，未发布成品。")
+        core.check_cancel(cancel_event)
+        log("全部检查通过，正在替换成品。")
+        os.replace(partial, output)
+        log(f"正式输出已就绪：{output}")
+    except BaseException:
+        core.remove_incomplete_file(partial, log)
+        raise
+    log("MP4 的译文问题报告保存在处理目录；直接修改并重封装目前支持 MKV。")
+    try:
+        intermediate.unlink(missing_ok=True)
+    except OSError as exc:
+        log(f"MP4 成品已发布；临时 MKV 未能删除，可稍后清理：{exc}")
+
+
+def _register_translation_output(output, work, targets, log):
+    try:
+        import translation_remux
+        return translation_remux.register_output(output, work, targets, log) or 0
+    except Exception as exc:
+        # The completed movie remains valid even if the optional edit receipt
+        # cannot be saved. Never advertise a safe edit without that receipt.
+        log(f"成品已完成；翻译修改记录未建立，问题报告仍保留：{exc}")
+        return 0
 
 
 def videos_in_folder(folder: str) -> list[str]:

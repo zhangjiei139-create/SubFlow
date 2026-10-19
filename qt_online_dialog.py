@@ -27,6 +27,7 @@ import online_subtitles as opensubtitles
 import subdl_subtitles as subdl
 from subtitle_identity_guard import edition_label, identity_conflict_notice
 from qt_workers import FunctionWorker
+from subtitle_candidate_priority import prioritize_candidates, author_display, candidate_note
 
 
 LANGUAGES = [
@@ -92,9 +93,10 @@ class OnlineSubtitleDialog(QDialog):
         layout.setSpacing(10)
         identity = f"{self.identity.title or '未识别片名'} {self.identity.year}".strip()
         self.identity_label = QLabel(
-            f"识别结果：{identity} · 影片规格：{self.identity.specification} · 站点结果按返回顺序显示，下载后验证正文"
+            f"识别结果：{identity} · 影片规格：{self.identity.specification} · 优先显示版本匹配线索较多的候选"
         )
         self.identity_label.setObjectName("dialogTitle")
+        self.identity_label.setWordWrap(True)
         layout.addWidget(self.identity_label)
 
         providers = QHBoxLayout()
@@ -135,8 +137,8 @@ class OnlineSubtitleDialog(QDialog):
         controls.setColumnStretch(1, 1)
         layout.addLayout(controls)
 
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["来源", "筛选状态", "字幕版本 / 片源", "语言", "下载量", "评分", "标记"])
+        self.table = QTableWidget(0, 8)
+        self.table.setHorizontalHeaderLabels(["来源", "筛选状态", "字幕版本 / 片源", "语言", "下载量", "评分", "标记", "作者 / 上传者"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -149,6 +151,7 @@ class OnlineSubtitleDialog(QDialog):
 
         footer = QHBoxLayout()
         self.status = QLabel("选择字幕站和语言后开始搜索。")
+        self.status.setWordWrap(True)
         self.status.setObjectName("muted")
         footer.addWidget(self.status, 1)
         close_button = QPushButton("关闭")
@@ -247,11 +250,12 @@ class OnlineSubtitleDialog(QDialog):
         if provider != self.provider:
             return
         self.identity, self.results, meta = payload
+        self.results = prioritize_candidates(self.video_path, self.results, self.identity)
         recognized = f"{self.identity.title or '未识别片名'} {self.identity.year}".strip()
         if self.identity.original_title and self.identity.original_title != self.identity.title:
             recognized = f"{recognized} → {self.identity.original_title}"
         self.identity_label.setText(
-            f"识别结果：{recognized} · 影片规格：{self.identity.specification} · 站点结果按返回顺序显示，下载后验证正文"
+            f"识别结果：{recognized} · 影片规格：{self.identity.specification} · 优先显示版本匹配线索较多的候选"
         )
         self.result_provider = provider
         self.table.setRowCount(len(self.results))
@@ -272,11 +276,13 @@ class OnlineSubtitleDialog(QDialog):
             release_text = f"[{candidate_edition}] {item.release}"
             release = f"{identity} · {release_text}" if identity else release_text
             values = [name, item.recommendation, release, item.language,
-                      str(item.downloads), f"{item.rating:.1f}", flags]
+                      str(item.downloads), f"{item.rating:.1f}", flags, author_display(item)]
             for column, value in enumerate(values):
-                self.table.setItem(row, column, QTableWidgetItem(value))
+                cell = QTableWidgetItem(value)
+                cell.setToolTip(candidate_note(item))
+                self.table.setItem(row, column, cell)
         if self.results:
-            suffix = "，仅显示前 30 条" if meta.truncated else ""
+            suffix = "，站点仍有未加载的结果" if meta.truncated else ""
             self.status.setText(f"{name} 获得候选 {meta.total_count} 条，显示 {len(self.results)} 条{suffix}。")
             self.table.selectRow(0)
         else:
@@ -295,7 +301,7 @@ class OnlineSubtitleDialog(QDialog):
         if valid:
             item = self.results[row]
             self.status.setText(
-                f"{item.recommendation}：{item.match_reason}。下载后将验证字幕正文。"
+                f"{item.recommendation}：{item.match_reason}。{candidate_note(item)}"
             )
 
     def _download(self) -> None:

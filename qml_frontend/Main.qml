@@ -66,6 +66,121 @@ ApplicationWindow {
         renderType: Text.NativeRendering
     }
 
+    component PairedMenuButton: AbstractButton {
+        id: menuHalf
+        signal triggered()
+        property string accessibleLabel: text
+        property color labelColor: enabled ? window.textPrimary : "#a3aaae"
+        implicitHeight: 26
+        implicitWidth: contentItem.implicitWidth + 8
+        leftPadding: 0
+        rightPadding: 0
+        hoverEnabled: true
+        activeFocusOnTab: enabled
+        Accessible.role: Accessible.MenuItem
+        Accessible.name: accessibleLabel
+        Accessible.onPressAction: {
+            if (enabled)
+                triggered()
+        }
+        contentItem: AppText {
+            text: menuHalf.text
+            color: menuHalf.labelColor
+            font.pixelSize: 13
+            horizontalAlignment: Text.AlignLeft
+            verticalAlignment: Text.AlignVCenter
+        }
+        background: Rectangle {
+            radius: 5
+            color: menuHalf.enabled && (menuHalf.hovered || menuHalf.activeFocus) ? "#edf5f4" : "transparent"
+            border.width: menuHalf.activeFocus ? 1 : 0
+            border.color: window.accent
+        }
+        onClicked: {
+            if (enabled)
+                triggered()
+        }
+        Keys.onReturnPressed: {
+            if (enabled)
+                triggered()
+        }
+        Keys.onEnterPressed: {
+            if (enabled)
+                triggered()
+        }
+    }
+
+    component PairedMenuItem: MenuItem {
+        id: pairedItem
+        property string firstText
+        property string secondText
+        property string firstObjectName
+        property string secondObjectName
+        property string firstAccessibleLabel: firstText
+        property string secondAccessibleLabel: secondText
+        property bool firstEnabled: false
+        property bool secondEnabled: false
+        signal firstTriggered()
+        signal secondTriggered()
+        enabled: firstEnabled || secondEnabled
+        implicitHeight: 30
+        implicitWidth: 220
+        topPadding: 2
+        bottomPadding: 2
+        Accessible.name: firstText + "／" + secondText
+        background: Rectangle { color: "transparent" }
+        contentItem: RowLayout {
+            spacing: 0
+            PairedMenuButton {
+                id: firstHalf
+                objectName: pairedItem.firstObjectName
+                text: pairedItem.firstText
+                accessibleLabel: pairedItem.firstAccessibleLabel
+                enabled: pairedItem.firstEnabled
+                Layout.preferredWidth: implicitWidth
+                KeyNavigation.right: secondHalf.enabled ? secondHalf : null
+                onTriggered: {
+                    if (enabled)
+                        pairedItem.firstTriggered()
+                }
+            }
+            AppText {
+                text: "／"
+                color: "#a3aaae"
+                font.pixelSize: 13
+                Layout.preferredWidth: 20
+                horizontalAlignment: Text.AlignHCenter
+            }
+            PairedMenuButton {
+                id: secondHalf
+                objectName: pairedItem.secondObjectName
+                text: pairedItem.secondText
+                accessibleLabel: pairedItem.secondAccessibleLabel
+                enabled: pairedItem.secondEnabled
+                Layout.fillWidth: true
+                KeyNavigation.left: firstHalf.enabled ? firstHalf : null
+                onTriggered: {
+                    if (enabled)
+                        pairedItem.secondTriggered()
+                }
+            }
+        }
+        Keys.onRightPressed: {
+            if (secondHalf.enabled)
+                secondHalf.forceActiveFocus()
+        }
+        Keys.onLeftPressed: {
+            if (firstHalf.enabled)
+                firstHalf.forceActiveFocus()
+        }
+        Keys.onReturnPressed: {
+            if (firstHalf.enabled)
+                firstHalf.triggered()
+            else if (secondHalf.enabled)
+                secondHalf.triggered()
+        }
+    }
+
     component SoftCard: Rectangle {
         color: "#ffffff"
         radius: 12
@@ -95,6 +210,7 @@ ApplicationWindow {
         border.width: 1
         border.color: selected ? window.accent : "#d9dfe1"
         scale: pillTap.pressed ? 0.96 : 1
+        opacity: enabled ? 1 : 0.45
         Behavior on scale { NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
         AppText {
             id: pillText
@@ -105,7 +221,8 @@ ApplicationWindow {
         }
         TapHandler {
             id: pillTap
-            onTapped: pill.clicked()
+            enabled: pill.enabled
+            onTapped: { if (pill.enabled) pill.clicked() }
         }
     }
 
@@ -208,6 +325,15 @@ ApplicationWindow {
         property int importRow: -1
         property var detailItem: null
 
+        NativeDialogs.FileDialog {
+            id: reviewCompletedMovieDialog
+            objectName: "reviewCompletedMovieDialog"
+            title: "选择需要检查译文的成品"
+            fileMode: NativeDialogs.FileDialog.OpenFile
+            nameFilters: ["MKV 影片 (*.mkv)"]
+            onAccepted: backend.reviewCompletedMovie(selectedFile)
+        }
+
         function selectMovieRow(row, modifiers) {
             let next = selectedRows.slice()
             if ((modifiers & Qt.ShiftModifier) && selectionAnchor >= 0) {
@@ -243,7 +369,10 @@ ApplicationWindow {
         function canProcessSelectedMovies() {
             if (backend.batchRunning)
                 return false
-            return selectedMovieItems().some(item => !item.burned && !item.processing &&
+            const items = selectedMovieItems()
+            if (items.some(item => item.manualReviewRequired))
+                return false
+            return items.some(item => !item.burned && !item.processing &&
                                                   item.taskState !== "completed" &&
                                                   (item.state === "ready" || item.state === "review"))
         }
@@ -298,6 +427,7 @@ ApplicationWindow {
 
         Dialog {
             id: batchDetailDialog
+            objectName: "batchDetailDialog"
             parent: Overlay.overlay
             anchors.centerIn: parent
             width: Math.min(parent.width - 80, 760)
@@ -344,14 +474,8 @@ ApplicationWindow {
                         font.family: window.fontFamily
                         font.pixelSize: 12
                         font.weight: Font.Medium
-                        text: detailItem ? "影片：" + detailItem.name +
-                                           "\n\n路径：" + detailItem.path +
-                                           "\n\n音轨：" + detailItem.audioDetail +
-                                           "\n现有字幕：" + detailItem.subtitles +
-                                           "\n套用偏好：" + detailItem.profile +
-                                           "\n\n处理方案：" + detailItem.summary +
-                                           (detailItem.detail ? "\n\n详细说明：" + detailItem.detail : "") +
-                                           "\n\n状态：" + detailItem.status : ""
+                        objectName: "movieDetailText"
+                        text: detailItem ? (detailItem.detailText || "影片：" + detailItem.name) : ""
                         background: Rectangle {
                             radius: 10
                             color: "#f7f9f9"
@@ -370,14 +494,35 @@ ApplicationWindow {
             RowLayout {
                 Layout.fillWidth: true
                 AppText { text: "影片处理"; font.pixelSize: 21; font.weight: Font.DemiBold }
+                AppText { text: "输出格式"; font.pixelSize: 12 }
+                ComboBox {
+                    objectName: "batchOutputFormat"
+                    Layout.preferredWidth: 76
+                    model: ["MKV", "MP4"]
+                    currentIndex: backend.batchOutputFormat === "MP4" ? 1 : 0
+                    enabled: !backend.batchOutputFormatLocked
+                    font.family: window.fontFamily
+                    font.pixelSize: 12
+                    onActivated: selectedIndex => backend.batchSetOutputFormat(model[selectedIndex])
+                    ToolTip.visible: hovered
+                    ToolTip.text: "对本批影片生效；分析后锁定。MP4 使用普通文本字幕，图片字幕和自定义字幕样式需要 MKV。"
+                }
                 Item { Layout.fillWidth: true }
                 PillButton { objectName: "addMovieButton"; text: "添加影片"; onClicked: addMovieDialog.open() }
                 PillButton { objectName: "addFolderButton"; text: "添加文件夹"; onClicked: addFolderDialog.open() }
                 PillButton { objectName: "removeSelectedButton"; text: "移除所选"; onClicked: removeSelectedMovies() }
                 PillButton { text: "清空"; onClicked: { backend.batchClear(); selectedRows = []; selectedRow = -1; selectionAnchor = -1 } }
-                PillButton { text: "分析全部"; selected: true; onClicked: backend.batchAnalyze() }
-                PillButton { text: "开始处理"; selected: true; onClicked: backend.batchStart() }
-                PillButton { text: "停止"; onClicked: backend.batchStop() }
+                PillButton { objectName: "batchAnalyzeButton"; text: "分析全部"; selected: true; enabled: !backend.batchRunning; onClicked: backend.batchAnalyze() }
+                PillButton { objectName: "batchStartButton"; text: "开始处理"; selected: true; enabled: !backend.batchRunning; onClicked: backend.batchStart() }
+                PillButton { objectName: "batchStopButton"; text: "停止"; enabled: backend.batchRunning; onClicked: backend.batchStop() }
+            }
+            AppText {
+                visible: backend.batchOutputFormat === "MP4"
+                Layout.fillWidth: true
+                text: "MP4 使用普通文本字幕；保留图片字幕或自定义字幕样式，请选择 MKV。"
+                color: window.textSecondary
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
             }
             Rectangle {
                 Layout.fillWidth: true
@@ -431,16 +576,11 @@ ApplicationWindow {
                             required property var modelData
                             width: batchList.width
                             height: 48
-                            color: modelData.burned ? "#173f7a" :
-                                   modelData.audioWarning ? "#fff3da" :
-                                   modelData.state === "ready" ? "#e8f5f1" :
-                                   modelData.state === "review" ? "#fff3da" :
-                                   modelData.state === "blocked" || modelData.state === "failed" ? "#fde9e7" :
-                                   index % 2 ? "#f8faf9" : "#ffffff"
+                            color: modelData.rowColor
                             Rectangle {
                                 anchors.fill: parent
                                 visible: selectedRows.indexOf(index) >= 0
-                                color: "#2607998d"
+                                color: modelData.taskState === "failed" ? "transparent" : "#2607998d"
                                 border.width: 2
                                 border.color: window.accent
                                 z: 1
@@ -486,51 +626,111 @@ ApplicationWindow {
                             Menu {
                                 id: batchContextMenu
                                 objectName: "movieContextMenu"
+                                width: 168
+                                leftPadding: 4
+                                rightPadding: 4
+                                topPadding: 4
+                                bottomPadding: 4
+                                // The custom background has no shadow, so remove
+                                // the Windows style's space reserved for it.
+                                leftInset: 0
+                                rightInset: 0
+                                topInset: 0
+                                bottomInset: 0
+                                font.family: window.fontFamily
+                                font.pixelSize: 13
+                                background: Rectangle {
+                                    color: "#ffffff"
+                                    border.color: "#dfe4e6"
+                                    radius: 8
+                                }
                                 MenuItem {
+                                    id: contextPlayItem
                                     objectName: "contextPlayVideo"
                                     text: "播放视频"
                                     onTriggered: backend.batchPlayVideo(index)
                                 }
+                                PairedMenuItem {
+                                    objectName: "contextProcessStopRow"
+                                    leftPadding: contextPlayItem.leftPadding
+                                    firstObjectName: "contextProcessSelected"
+                                    secondObjectName: "contextStopSelected"
+                                    firstText: "处理"
+                                    secondText: "停止"
+                                    firstAccessibleLabel: "处理选中"
+                                    secondAccessibleLabel: "停止选中"
+                                    firstEnabled: canProcessSelectedMovies()
+                                    secondEnabled: canStopSelectedMovies()
+                                    onFirstTriggered: {
+                                        batchContextMenu.close()
+                                        backend.batchStartRows(selectedRows)
+                                    }
+                                    onSecondTriggered: {
+                                        batchContextMenu.close()
+                                        backend.batchStopRows(selectedRows)
+                                    }
+                                }
                                 MenuItem {
                                     objectName: "contextRemoveSelected"
-                                    text: "移除选中"
+                                    text: "移除"
                                     enabled: canRemoveSelectedMovies()
                                     onTriggered: removeSelectedMovies()
                                 }
-                                MenuSeparator {}
                                 MenuItem {
-                                    objectName: "contextProcessSelected"
-                                    text: "处理选中"
-                                    enabled: canProcessSelectedMovies()
-                                    onTriggered: backend.batchStartRows(selectedRows)
+                                    objectName: "contextAlignSubtitle"
+                                    text: "核听当前字幕"
+                                    enabled: modelData.canListenSubtitle
+                                    Accessible.role: Accessible.MenuItem
+                                    Accessible.name: text
+                                    Accessible.onPressAction: {
+                                        if (enabled) {
+                                            batchContextMenu.close()
+                                            backend.batchListenCurrentSubtitle(index)
+                                        }
+                                    }
+                                    onTriggered: backend.batchListenCurrentSubtitle(index)
                                 }
-                                MenuItem {
-                                    objectName: "contextStopSelected"
-                                    text: "停止选中"
-                                    enabled: canStopSelectedMovies()
-                                    onTriggered: backend.batchStopRows(selectedRows)
-                                }
-                                MenuSeparator {}
-                                MenuItem {
-                                    text: "智能字幕"
-                                    enabled: !modelData.burned && !modelData.processing
-                                    onTriggered: backend.batchSmartSubtitles(index)
-                                }
-                                MenuItem {
-                                    text: "在线手动字幕"
-                                    enabled: !modelData.burned && !modelData.processing
-                                    onTriggered: backend.batchManualSubtitles(index)
-                                }
-                                MenuItem {
-                                    text: "导入本地字幕"
-                                    enabled: !modelData.burned && !modelData.processing
-                                    onTriggered: {
-                                        importRow = index
-                                        importSubtitleDialog.currentFolder = backend.batchMovieFolderUrl(index)
-                                        importSubtitleDialog.open()
+                                Menu {
+                                    objectName: "contextChooseSubtitle"
+                                    title: "字幕选择"
+                                    width: 136
+                                    leftPadding: 4
+                                    rightPadding: 4
+                                    topPadding: 4
+                                    bottomPadding: 4
+                                    leftInset: 0
+                                    rightInset: 0
+                                    topInset: 0
+                                    bottomInset: 0
+                                    enabled: modelData.subtitleEditable
+                                    font.family: window.fontFamily
+                                    font.pixelSize: 13
+                                    background: Rectangle {
+                                        color: "#ffffff"
+                                        border.color: "#dfe4e6"
+                                        radius: 8
+                                    }
+                                    MenuItem {
+                                        objectName: "contextChooseOnlineSubtitle"
+                                        text: "在线选择"
+                                        onTriggered: backend.batchManualSubtitles(index)
+                                    }
+                                    MenuItem {
+                                        objectName: "contextImportSubtitle"
+                                        text: "本地导入"
+                                        onTriggered: {
+                                            importRow = index
+                                            importSubtitleDialog.currentFolder = backend.batchMovieFolderUrl(index)
+                                            importSubtitleDialog.open()
+                                        }
                                     }
                                 }
-                                MenuSeparator {}
+                                MenuItem {
+                                    objectName: "contextReviewTranslation"
+                                    text: "译文修改"
+                                    enabled: modelData.canReviewTranslation
+                                    onTriggered: backend.batchReviewTranslation(index)
+                                }
                                 MenuItem {
                                     objectName: "contextShowDetails"
                                     text: "查看详情"
@@ -554,6 +754,10 @@ ApplicationWindow {
                     }
                 }
             }
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 30
+                id: batchProgressRow
             Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 30
@@ -566,6 +770,57 @@ ApplicationWindow {
                     color: window.accent
                 }
                 AppText { anchors.centerIn: parent; text: backend.batchStatus; font.pixelSize: 12 }
+            }
+            PillButton {
+                id: reviewExistingBtn
+                objectName: "reviewCompletedMovieButton"
+                text: "检查已有译文"
+                enabled: !backend.batchRunning
+                onClicked: reviewCompletedMovieDialog.open()
+            }
+            }
+            ColumnLayout {
+                objectName: "muxProgressArea"
+                Layout.fillWidth: true
+                Layout.rightMargin: reviewExistingBtn.width + batchProgressRow.spacing
+                Layout.preferredHeight: 28
+                spacing: 3
+                opacity: backend.muxVisible ? 1 : 0
+                AppText {
+                    Layout.fillWidth: true
+                    text: backend.muxStatus
+                    color: "#9a570c"
+                    font.pixelSize: 11
+                    elide: Text.ElideMiddle
+                }
+                ProgressBar {
+                    id: muxBar
+                    objectName: "muxProgressBar"
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 7
+                    from: 0
+                    to: 100
+                    value: backend.muxProgress
+                    indeterminate: backend.muxBusy
+                    background: Rectangle { radius: 3; color: "#f6e8d5" }
+                    contentItem: Item {
+                        Rectangle {
+                            id: muxFill
+                            width: parent.width * (backend.muxBusy ? 0.22 : backend.muxProgress / 100)
+                            height: parent.height
+                            radius: 3
+                            color: "#ee982d"
+                            NumberAnimation on x {
+                                running: backend.muxBusy && backend.muxVisible
+                                loops: Animation.Infinite
+                                from: 0
+                                to: Math.max(0, muxBar.width * 0.78)
+                                duration: 1100
+                                onRunningChanged: if (!running) muxFill.x = 0
+                            }
+                        }
+                    }
+                }
             }
             ScrollView {
                 id: batchLogScroll
@@ -586,12 +841,15 @@ ApplicationWindow {
                 }
 
                 function replaceLogText() {
+                    const nextText = backend.batchLogText
+                    if (initializedScroll && batchLogArea.text === nextText)
+                        return
                     let position = initializedScroll ? contentItem.contentY : window.batchLogSavedY
                     let followLatest = initializedScroll
                             ? maximumScrollPosition - position <= 8
                             : window.batchLogFollowLatest
                     restoringScroll = true
-                    batchLogArea.text = backend.batchLogText
+                    batchLogArea.text = nextText
                     Qt.callLater(function() {
                         let maximum = Math.max(0, batchLogScroll.contentItem.contentHeight - batchLogScroll.contentItem.height)
                         batchLogScroll.contentItem.contentY = followLatest ? maximum : Math.max(0, Math.min(position, maximum))
@@ -804,7 +1062,12 @@ ApplicationWindow {
                     ColumnLayout {
                         anchors.fill: parent
                         anchors.margins: 18
-                        AppText { text: "最终需要的字幕"; font.pixelSize: 18; font.weight: Font.DemiBold }
+                        RowLayout {
+                            Layout.fillWidth: true
+                            AppText { text: "最终需要的字幕"; font.pixelSize: 18; font.weight: Font.DemiBold }
+                            Item { Layout.fillWidth: true }
+                            PillButton { text: "修改字体"; selected: true; onClicked: backend.profileEditFonts() }
+                        }
                         AppText { text: "按语言选择成品字幕；下载字幕可按下方选项替换同语言原轨。"; color: window.textSecondary; font.pixelSize: 12 }
                         GridLayout {
                             Layout.fillWidth: true
@@ -1094,17 +1357,24 @@ ApplicationWindow {
                     }
                 }
                 MouseArea {
+                    objectName: "windowTitleDrag"
                     property point pressPosition
+                    property bool nativeMove: false
                     anchors.fill: parent
                     anchors.rightMargin: 126
                     acceptedButtons: Qt.LeftButton
-                    onPressed: mouse => pressPosition = Qt.point(mouse.x, mouse.y)
+                    onPressed: mouse => {
+                        pressPosition = Qt.point(mouse.x, mouse.y)
+                        nativeMove = window.startSystemMove()
+                    }
                     onPositionChanged: mouse => {
-                        if (!pressed || window.visibility === Window.Maximized)
+                        if (nativeMove || !pressed || window.visibility === Window.Maximized)
                             return
                         window.x += mouse.x - pressPosition.x
                         window.y += mouse.y - pressPosition.y
                     }
+                    onReleased: nativeMove = false
+                    onCanceled: nativeMove = false
                 }
             }
 

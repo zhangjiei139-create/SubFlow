@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import concurrent.futures
@@ -605,7 +605,7 @@ class BatchMixin:
                     try:
                         future.result()
                         plan.status = "completed"
-                        plan.status_label = "已完成"
+                        plan.status_label = "已完成·译文待检查" if getattr(plan, "translation_review_pending", 0) else "已完成"
                         completed += 1
                     except Exception as exc:
                         batch_core.append_process_log(plan, f"处理失败：{exc}")

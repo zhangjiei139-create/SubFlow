@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -40,6 +41,7 @@ class PreferenceProfile:
     replace_downloaded_subtitle: bool = False
     audio_policy: str = "universal"
     chinese_script_equivalent: bool = False
+    subtitle_styles: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -63,6 +65,19 @@ class BatchPlan:
     external_subtitle_seal: str = ""
     external_subtitle_origin: str = ""
     manual_confirmation_hash: str = ""
+    # Keep the untouched candidate as the baseline when a user reopens review.
+    manual_review_origin: dict[str, object] = field(default_factory=dict)
+    manual_review_required: bool = False
+    # Actual dialogue audio used for saved evidence, not the first output track.
+    pending_review_audio_id: int | None = None
+    # Only a saved-candidate failure from processing resumes after listening.
+    manual_review_resume_processing: bool = False
+    external_subtitle_media_signature: dict[str, int] = field(default_factory=dict)
+    external_subtitle_content_hash: str = ""
+    subtitle_report_path: str = ""
+    subtitle_verification_states: list[dict] = field(default_factory=list)
+    # An audio-stage checkpoint alone never means final candidate acceptance.
+    audio_verified_source: dict = field(default_factory=dict)
     status: str = "pending"
     status_label: str = "待分析"
     task_state: str = "waiting"
@@ -143,6 +158,7 @@ def load_profiles() -> list[PreferenceProfile]:
                     item["audio_policy"] = "universal"
         profiles = [PreferenceProfile(**item) for item in raw]
         for profile in profiles:
+            profile.subtitle_styles = normalize_subtitle_styles(profile.subtitle_styles)
             if not hasattr(profile, "prefer_compatible_main_audio"):
                 profile.prefer_compatible_main_audio = False
             if not hasattr(profile, "lazy_audio_mode"):
@@ -156,7 +172,12 @@ def load_profiles() -> list[PreferenceProfile]:
 def save_profiles(profiles: list[PreferenceProfile]) -> None:
     path = profile_file()
     temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps([asdict(profile) for profile in profiles], ensure_ascii=False, indent=2), encoding="utf-8")
+    records = []
+    for profile in profiles:
+        record = asdict(profile)
+        record["subtitle_styles"] = normalize_subtitle_styles(profile.subtitle_styles)
+        records.append(record)
+    temp.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temp, path)
 
 
@@ -180,6 +201,59 @@ def normalize_language(value: str) -> str:
     return code[:2] if len(code) >= 2 and code != "und" else "und"
 
 
+def normalize_subtitle_styles(styles: object) -> dict[str, dict]:
+    """Normalize preferences, including the old automatically inserted 38.
+
+    Older dialogs saved 38 without knowing whether it had been edited.  Only
+    a recorded user operation proves that 38 is a manual choice.  Other valid
+    legacy sizes preserve their deliberate deviation from that old default.
+    This is a preference migration, never a completed-track receipt migration.
+    """
+    if not isinstance(styles, dict):
+        return {}
+    result = {}
+    font_fields = ("font_id", "path", "sha256", "family", "ui_family")
+    for code, item in styles.items():
+        if not isinstance(code, str) or not isinstance(item, dict):
+            continue
+        if any(key in item and not isinstance(item[key], str) for key in font_fields):
+            continue
+        color = item.get("color", "keep")
+        if not isinstance(color, str) or (color != "keep" and not re.fullmatch(r"#[0-9A-Fa-f]{6}", color)):
+            continue
+        size = item.get("size", 0)
+        mode = item.get("size_mode", "manual" if size else "auto")
+        if not isinstance(mode, str) or mode not in {"auto", "manual"}:
+            continue
+        if mode == "manual":
+            if (isinstance(size, bool) or not isinstance(size, (int, float))
+                    or not 1 <= size <= 200 or not float(size).is_integer()):
+                continue
+            if size == 38 and item.get("size_origin") != "user":
+                mode = "auto"
+        normalized = {key: item[key] for key in font_fields if key in item}
+        normalized.setdefault("font_id", "")
+        normalized.update(size_mode=mode, size=0 if mode == "auto" else int(size),
+                          color=color if color == "keep" else color.upper())
+        if mode == "manual":
+            normalized["size_origin"] = "user"
+        result[normalize_language(code)] = normalized
+    return result
+
+
+def effective_subtitle_styles(styles: object, languages) -> dict[str, dict]:
+    """Return automatic settings for selected languages without a Save click."""
+    normalized = normalize_subtitle_styles(styles)
+    result = {}
+    for code in languages:
+        if not isinstance(code, str):
+            continue
+        code = normalize_language(code)
+        result[code] = dict(normalized.get(code, dict(
+            font_id="", size_mode="auto", size=0, color="keep")))
+    return result
+
+
 def audio_format(codec: str) -> str:
     value = (codec or "").lower()
     for label, tokens in AUDIO_FORMATS.items():
@@ -189,8 +263,8 @@ def audio_format(codec: str) -> str:
 
 
 def is_commentary(track) -> bool:
-    text = f"{getattr(track, 'name', '')} {getattr(track, 'codec', '')}".lower()
-    return any(token in text for token in ("commentary", "comment", "director", "解说", "评论"))
+    import audio_roles
+    return bool(audio_roles.excluded_reason(track))
 
 
 def language_label(code: str) -> str:

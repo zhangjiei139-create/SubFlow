@@ -92,7 +92,7 @@ class ImageRetentionLogTest(unittest.TestCase):
 
     def test_unselected_japanese_pgs_is_not_promised_as_retained(self):
         logs, kwargs = self.run_plan([])
-        self.assertTrue(any("当前偏好未保留" in line for line in logs))
+        self.assertTrue(any("本次输出不包含原图片字幕" in line for line in logs))
         self.assertFalse(any("原图片字幕继续保留" in line for line in logs))
         self.assertEqual(kwargs["keep_subtitle_ids"], [])
 

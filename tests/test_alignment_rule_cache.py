@@ -37,6 +37,7 @@ class AlignmentRuleCacheTests(unittest.TestCase):
     def test_seal_uses_the_current_alignment_rule_and_is_stable(self) -> None:
         payload = {
             "video": str(self.movie.resolve()).casefold(),
+            "media_signature": subtitle_identity_guard.media_signature(str(self.movie)),
             "subtitle_sha256": hashlib.sha256(self.source.read_bytes()).hexdigest(),
             "provider": "OpenSubtitles",
             "release": "Film.2014",

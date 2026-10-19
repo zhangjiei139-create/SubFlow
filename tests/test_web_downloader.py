@@ -19,6 +19,63 @@ import web_downloader
 
 
 class WebDownloaderTest(unittest.TestCase):
+    def run_main(self, root, prepare=None, **patches):
+        from contextlib import ExitStack
+        args = SimpleNamespace(status_file=root / "status.txt", result_file=root / "result.txt",
+                               cancel_file=root / "cancel.txt", log_file=root / "detail.log")
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(web_downloader, "parse_args", return_value=args))
+            work = stack.enter_context(patch.object(web_downloader, "prepare_assets", side_effect=prepare))
+            for name, failure in patches.items():
+                stack.enter_context(patch.object(web_downloader.StatusWriter, name, side_effect=failure))
+            result = web_downloader.main()
+        return result, args, work
+
+    def test_error_reporting_failures_do_not_hide_exit_or_skip_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result, args, _ = self.run_main(Path(folder), OSError(28, "disk full"),
+                                            update=OSError(28, "disk full"), log=PermissionError("log"))
+            self.assertEqual(result, 1)
+            self.assertEqual(args.result_file.read_text(encoding="utf-8").splitlines()[0], "1")
+
+    def test_no_result_can_be_written_but_helper_still_returns_nonzero(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(Path, "write_text", side_effect=OSError(28, "disk full")):
+            result, args, _ = self.run_main(Path(folder), OSError(28, "disk full"))
+            self.assertEqual(result, 1)
+            self.assertFalse(args.result_file.exists())
+
+    def test_reporter_initialization_failure_is_a_process_failure(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(web_downloader.StatusWriter, "__init__", side_effect=PermissionError("directory")):
+            result, args, prepare = self.run_main(Path(folder))
+            self.assertEqual(result, 1)
+            prepare.assert_not_called()
+            self.assertTrue(args.result_file.read_text(encoding="utf-8").startswith("1\n"))
+
+    def test_cancel_requested_during_startup_is_not_erased(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "cancel.txt").write_text("cancel", encoding="ascii")
+            result, args, prepare = self.run_main(root)
+            self.assertEqual(result, 2)
+            prepare.assert_not_called()
+            self.assertTrue(args.cancel_file.exists())
+            self.assertTrue(args.result_file.read_text(encoding="utf-8").startswith("2\n"))
+
+    def test_success_requires_result_write_and_final_cancel_check(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            result, args, prepare = self.run_main(root)
+            self.assertEqual(result, 0)
+            prepare.assert_called_once()
+            self.assertTrue(args.result_file.read_text(encoding="utf-8").startswith("0\n"))
+            result, args, _ = self.run_main(root, finish=OSError(28, "disk full"))
+            self.assertEqual(result, 1)
+            self.assertTrue(args.result_file.read_text(encoding="utf-8").startswith("1\n"))
+            result, args, _ = self.run_main(root, lambda *_: (root / "cancel.txt").write_text("cancel"))
+            self.assertEqual(result, 2)
+
     def test_download_resumes_partial_file_and_verifies_hash(self) -> None:
         payload = b"abcdefghijklmno"
         digest = hashlib.sha256(payload).hexdigest()

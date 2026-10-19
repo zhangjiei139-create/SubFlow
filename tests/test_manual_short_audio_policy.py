@@ -205,8 +205,8 @@ class ManualShortAudioPolicyTests(unittest.TestCase):
         self.assertEqual(sum(clip['short_audio_cache_hit'] for clip in clips),1)
         self.assertNotEqual(clips[0]['audio'],clips[1]['audio'])
 
-    def test_prepare_review_uses_existing_audio_choice_and_only_three_short_windows(self):
-        tracks=[core.Track(1,'audio','AC-3','de','',True,False,False,False,False),
+    def test_prepare_review_cheap_default_and_explicit_main_use_separate_short_audio(self):
+        tracks=[core.Track(1,'audio','AC-3','en','',True,False,False,False,False),
                 core.Track(9,'audio','TrueHD','en','',False,False,False,False,False)]
         subtitle=self.root/'sub.srt'
         subtitle.write_text('1\n00:01:42,000 --> 00:01:44,000\nFull subtitle candidate\n',encoding='utf8')
@@ -219,15 +219,19 @@ class ManualShortAudioPolicyTests(unittest.TestCase):
              patch.object(p,'_tool',return_value=str(self.engine)), \
              patch.object(review,'shortlist_windows',side_effect=shortlist), \
              patch.object(continuous_vad,'shared_audio',side_effect=AssertionError('whole-film fingerprint invoked')):
-            evidence=review.prepare_review(str(self.movie),str(subtitle),str(self.root/'prepare'),1,self.logs.append,source_language='de')
-        self.assertEqual(evidence['validation_audio_id'],9)
-        self.assertEqual(evidence['audio_stream_index'],1)
-        self.assertEqual(evidence['audio_codec'],'TrueHD')
-        self.assertEqual([clip['region'] for clip in evidence['clips']],[1,2,3])
-        decodes=[args for args in self.calls if str(self.movie) in args]
-        self.assertEqual(len(decodes),3)
-        self.assertTrue(all(args[args.index('-t')+1]=='60' for args in decodes))
-        self.assertTrue(all(args[args.index('-map')+1]=='0:a:1' for args in decodes))
+            for explicit,expected,index,codec in ((None,1,0,'AC-3'),(9,9,1,'TrueHD')):
+                with self.subTest(explicit=explicit):
+                    self.calls.clear()
+                    evidence=review.prepare_review(str(self.movie),str(subtitle),str(self.root/f'prepare-{expected}'),
+                        9,self.logs.append,source_language='en',reference_audio_id=explicit)
+                    self.assertEqual(evidence['validation_audio_id'],expected)
+                    self.assertEqual(evidence['audio_stream_index'],index)
+                    self.assertEqual(evidence['audio_codec'],codec)
+                    self.assertEqual([clip['region'] for clip in evidence['clips']],[1,2,3])
+                    decodes=[args for args in self.calls if str(self.movie) in args]
+                    self.assertEqual(len(decodes),3)
+                    self.assertTrue(all(args[args.index('-t')+1]=='60' for args in decodes))
+                    self.assertTrue(all(args[args.index('-map')+1]==f'0:a:{index}' for args in decodes))
 
 
 if __name__=='__main__': unittest.main()

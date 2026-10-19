@@ -58,16 +58,19 @@ class BatchEmbeddedAnchorHandoffTests(unittest.TestCase):
 
     def test_confirmed_source_is_forwarded_without_selecting_unused_sdh(self):
         handoff = object()
+        extracted = object()
         def prepare(*args, **kwargs):
             kwargs["verification_status"].update(verified_anchor=True, track_id=3,
-                                                  prepared_anchor=handoff)
+                                                  prepared_anchor=handoff, prepared_text_extraction=extracted)
             return {3: 60}, {3: self.root / "corrected.srt"}, 3
         shared, prepare_call, process = self.run_plan(self.plan(), prepare)
         shared.assert_called_once()
         prepare_call.assert_called_once()
         self.assertEqual(prepare_call.call_args.args[1], [3])
+        self.assertEqual(prepare_call.call_args.kwargs["prefetch_text_subtitle_ids"], [3, 6])
         kwargs = process.call_args.kwargs
         self.assertIs(kwargs["prepared_embedded_anchor"], handoff)
+        self.assertIs(kwargs["prepared_text_extraction"], extracted)
         self.assertIs(kwargs["shared_content_audio"], self.shared)
         self.assertEqual(kwargs["audio_source_id"], 1)
         self.assertEqual(kwargs["embedded_source_id"], 3)
@@ -99,6 +102,21 @@ class BatchEmbeddedAnchorHandoffTests(unittest.TestCase):
         self.assertEqual(process.call_args.kwargs["embedded_source_id"], 4)
         self.assertIs(process.call_args.kwargs["prepared_embedded_anchor"], accepted)
 
+    def test_failed_candidate_only_passes_extraction_to_next_candidate(self):
+        extracted, accepted = object(), object()
+        def prepare(*args, **kwargs):
+            if args[2] == 3:
+                kwargs["verification_status"]["prepared_text_extraction"] = extracted
+                raise RuntimeError("audio evidence unavailable")
+            self.assertIs(kwargs["prepared_text_extraction"], extracted)
+            self.assertNotIn("prepared_embedded_anchor", kwargs)
+            kwargs["verification_status"].update(verified_anchor=True, prepared_anchor=accepted)
+            return {}, {}, 4
+        _, prepared, process = self.run_plan(self.plan(), prepare)
+        self.assertEqual(prepared.call_count, 2)
+        self.assertIs(process.call_args.kwargs["prepared_text_extraction"], extracted)
+        self.assertIs(process.call_args.kwargs["prepared_embedded_anchor"], accepted)
+
     def test_legacy_preparer_without_handoff_remains_compatible(self):
         def prepare(*args, **kwargs):
             kwargs["verification_status"].update(verified_anchor=True)
@@ -113,6 +131,8 @@ class BatchEmbeddedAnchorHandoffTests(unittest.TestCase):
         plan.source_mode = "external"
         plan.external_subtitle = str(external)
         plan.external_subtitle_verified = True
+        plan.external_subtitle_media_signature = batch_core.media_signature(self.movie)
+        plan.external_subtitle_content_hash = batch_core.hashlib.sha256(external.read_bytes()).hexdigest()
         plan.external_language = "en"
         shared, prepared, process = self.run_plan(plan, None)
         shared.assert_not_called()

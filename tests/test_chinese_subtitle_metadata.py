@@ -116,6 +116,8 @@ class ChineseSubtitleMetadataTest(unittest.TestCase):
                 plan = batch_core.analyze_video(
                     str(movie), profile, str(downloaded), "zh-CN", True,
                     external_subtitle_origin="download",
+                    external_subtitle_media_signature=batch_core.media_signature(movie),
+                    external_subtitle_content_hash=batch_core.hashlib.sha256(downloaded.read_bytes()).hexdigest(),
                 )
             self.assertEqual(plan.subtitle_ids, [])
             self.assertEqual(plan.missing_subtitle_languages, ["zh-TW"])
@@ -154,6 +156,8 @@ class ChineseSubtitleMetadataTest(unittest.TestCase):
                 plan = batch_core.analyze_video(
                     str(movie), profile, str(downloaded), "zh-CN", True,
                     external_subtitle_origin="download",
+                    external_subtitle_media_signature=batch_core.media_signature(movie),
+                    external_subtitle_content_hash=batch_core.hashlib.sha256(downloaded.read_bytes()).hexdigest(),
                 )
             self.assertEqual(plan.subtitle_ids, [])
             self.assertEqual(plan.missing_subtitle_languages, [])

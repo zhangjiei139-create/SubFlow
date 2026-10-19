@@ -16,6 +16,7 @@ class FilmPreparationBudgetTests(unittest.TestCase):
         def build(movie,audio_id,cache,log,cancel):
             deadlines.append(cancel.deadline-time.monotonic());return Path('ref.npz')
         with tempfile.TemporaryDirectory() as td,patch.object(c,'inspect_tracks',return_value=[audio]),patch.object(c,'inspect_media',return_value={}),patch.object(c,'video_track_duration_ns',return_value=6727.68e9),patch.object(p,'_audio_stream_index',return_value=1),patch.object(p,'_build_continuous_alignment_audio',side_effect=build):
+            (Path(td)/'movie.mkv').write_bytes(b'test-media')
             v.shared_audio(str(Path(td)/'movie.mkv'),2,lambda _:None,budget=budget)
         return deadlines[0]
 

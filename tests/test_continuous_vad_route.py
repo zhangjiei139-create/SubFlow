@@ -22,21 +22,40 @@ def track(i,language,kind='audio',codec='AAC',name='',default=False,forced=False
 
 
 class ContinuousVADTests(unittest.TestCase):
-    def test_audio_choice_english_easy_decoder_excludes_commentary(self):
+    def test_audio_choice_cheap_dialogue_keeps_selected_tie_and_excludes_commentary(self):
         tracks=[track(1,'de',default=True),track(2,'en',codec='TrueHD'),track(3,'en',codec='AAC'),
                 track(4,'en',name='Director commentary',default=True)]
-        self.assertEqual(vad.audio_track(tracks,1).id,3)
+        self.assertEqual(vad.audio_track(tracks,1).id,1)
         self.assertEqual(vad.audio_track(tracks[:1],1).id,1)
 
-    def test_text_priority_same_language_then_english_then_other_text_never_image(self):
+    def test_text_priority_same_language_then_english_skips_redundant_foreign_clocks(self):
         audio=track(1,'ja',default=True)
         eng=track(2,'en','subtitles');jap=track(3,'ja','subtitles');partial=track(4,'ja','subtitles',forced=True)
         other=track(6,'zh-CN','subtitles',default=True)
-        self.assertEqual([t.id for t in batch_core.ordered_text_anchors([audio,eng,jap,partial,other],audio)], [3,2,6])
+        self.assertEqual([t.id for t in batch_core.ordered_text_anchors([audio,eng,jap,partial,other],audio)], [3,2])
+        self.assertEqual([t.id for t in batch_core.ordered_text_anchors([audio,other],audio)], [6])
         audio_en=track(5,'en')
         self.assertEqual(batch_core.ordered_text_anchors([audio,audio_en,eng,jap],audio)[0].id,2)
         audio_unknown=track(7,'und',default=True)
         self.assertEqual(batch_core.ordered_text_anchors([audio_unknown,other,eng],audio_unknown)[0].id,2)
+
+    def test_main_audio_priority_preserves_english_embedded_anchor(self):
+        english_audio = track(1, 'en', codec='TrueHD', default=True)
+        chinese_audio = track(2, 'zh-CN', codec='AC-3')
+        english_subtitle = track(3, 'en', 'subtitles')
+        chinese_subtitle = track(4, 'zh-CN', 'subtitles', default=True)
+        tracks = [english_audio, chinese_audio, english_subtitle, chinese_subtitle]
+        self.assertEqual(vad.audio_track(tracks, 1).id, 1)
+        self.assertEqual([t.id for t in batch_core.ordered_text_anchors(tracks, english_audio)], [3])
+
+    def test_mandarin_label_keeps_existing_embedded_language_priority(self):
+        audio = track(1, 'cmn', codec='TrueHD', default=True)
+        other_audio = track(2, 'ja', codec='AAC')
+        english = track(3, 'en', 'subtitles')
+        chinese = track(4, 'zh-CN', 'subtitles')
+        tracks = [audio, other_audio, english, chinese]
+        self.assertEqual(vad.audio_track(tracks, 1).id, 1)
+        self.assertEqual([t.id for t in batch_core.ordered_text_anchors(tracks, audio)], [4, 3])
 
     def test_other_language_embedded_anchor_is_used_before_download(self):
         from profile_model import PreferenceProfile

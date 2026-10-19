@@ -29,6 +29,12 @@ MIN_CUES_PER_REGION = 5
 MIN_COVERED_REGIONS = 3
 ALTERNATIVE_PEAK_RATIO = .95
 MAX_PEAK_WIDTH_SECONDS = 1.0
+MIN_REGIONAL_CUES = 8
+MIN_REGIONAL_SIGNAL_SECONDS = 5
+REGIONAL_OFFSET_TOLERANCE_SECONDS = 1.0
+MIN_REGIONAL_OVERLAP_RATIO = .65
+MIN_REGIONAL_OVERLAP_GAIN = .35
+MIN_SUPPORTING_REGIONS = 2
 
 _TIME = re.compile(r"^(-?)(\d+):([0-5]\d):([0-5]\d)[,.](\d{1,6})$")
 _MARKUP = re.compile(r"<[^>]+>|\{\\[^}]*\}")
@@ -128,7 +134,7 @@ def _peak_metrics(values: np.ndarray, offsets: np.ndarray) -> dict[str, Any]:
             "peak_contrast": contrast}
 
 
-def _correlate(reference: np.ndarray, subtitle: np.ndarray) -> dict[str, Any]:
+def _correlate(reference: np.ndarray, subtitle: np.ndarray, *, diagnostic=True) -> dict[str, Any]:
     total = len(reference) + len(subtitle)
     fft_length = 1 << (total - 1).bit_length()
     extra = fft_length - total
@@ -137,7 +143,7 @@ def _correlate(reference: np.ndarray, subtitle: np.ndarray) -> dict[str, Any]:
     correlation = np.fft.irfft(subtitle_fft * reference_fft, n=fft_length)
     center = fft_length - 1 - len(subtitle)
     # Exactly as FFTAligner: +10.00 is included, -10.00 is excluded.
-    diagnostic_enabled = len(reference) >= MIN_DIAGNOSTIC_DURATION_SECONDS * FRAME_RATE
+    diagnostic_enabled = diagnostic and len(reference) >= MIN_DIAGNOSTIC_DURATION_SECONDS * FRAME_RATE
     radius = (DIAGNOSTIC_OFFSET_SECONDS if diagnostic_enabled else MAX_OFFSET_SECONDS) * FRAME_RATE
     indexes = np.arange(max(0, center - radius), min(fft_length, center + radius))
     values = correlation[indexes]
@@ -176,6 +182,111 @@ def subtitle_guard_seconds(sample_duration_seconds: float) -> int:
             if sample_duration_seconds >= MIN_DIAGNOSTIC_DURATION_SECONDS else MAX_OFFSET_SECONDS)
 
 
+def _regional_offset_evidence(speech: np.ndarray, cues: Sequence[_Cue], observations=None) -> list[dict[str, Any]]:
+    """Only strongly supported, independent regions can contradict a fixed shift.
+
+    This reuses the decoded sample. Sparse, broad or ambiguous local peaks stay
+    unknown; they do not veto a globally supported result or force decoding.
+    """
+    dialogue = [cue for index, cue in enumerate(cues)
+                if _dialogue(cue, index == 0 or index + 1 == len(cues))]
+    guard = MAX_OFFSET_SECONDS * FRAME_RATE
+    result = []
+    for index in range(REGION_COUNT):
+        first, last = len(speech) * index // REGION_COUNT, len(speech) * (index + 1) // REGION_COUNT
+        local_cues = [cue for cue in dialogue
+                      if cue.start * FRAME_RATE >= first + guard
+                      and cue.end * FRAME_RATE <= last - guard]
+        record = dict(region=index, start_seconds=first / FRAME_RATE, end_seconds=last / FRAME_RATE,
+                      cue_count=len(local_cues), offset_seconds=None, trusted=False,
+                      reason="insufficient_local_data")
+        if observations is not None:
+            observations.append(record)
+        if len({cue.start for cue in local_cues}) < MIN_REGIONAL_CUES:
+            continue
+        reference = speech[first:last]
+        voiced = reference >= 1.
+        if min(np.count_nonzero(voiced), np.count_nonzero(~voiced)) < MIN_REGIONAL_SIGNAL_SECONDS * FRAME_RATE:
+            continue
+        signal = np.zeros(len(reference), dtype=np.float64)
+        for cue in local_cues:
+            start = int(round(cue.start * FRAME_RATE)) - first
+            end = start + int(round((cue.end - cue.start) * FRAME_RATE))
+            signal[start:end] = 1.
+        metrics = _correlate(reference, signal, diagnostic=False)
+        offset = metrics['offset_seconds']
+        ratio = metrics['alternative_peak_ratio']
+        record.update(offset_seconds=offset, alternative_peak_ratio=ratio,
+                      peak_width_seconds=metrics['peak_width_seconds'], reason="ambiguous_local_peak")
+        if (abs(offset) >= 9.9 or metrics['peak_contrast'] <= 1e-6
+                or ratio is None or ratio >= .8
+                or metrics['peak_width_seconds'] >= MAX_PEAK_WIDTH_SECONDS):
+            continue
+        shifted = np.zeros(len(signal), dtype=bool)
+        delta = int(round(offset * FRAME_RATE))
+        low, high = max(0, delta), min(len(signal), len(signal) + delta)
+        shifted[low:high] = signal[low - delta:high - delta] >= 1.
+        overlap = int(np.count_nonzero(voiced & shifted))
+        smaller = min(int(voiced.sum()), int(shifted.sum()))
+        expected = float(voiced.sum()) * float(shifted.sum()) / len(signal)
+        gain = (overlap - expected) / max(1., smaller - expected)
+        record.update(overlap_ratio=overlap / max(1, smaller), overlap_gain=gain,
+                      reason="insufficient_independent_regional_support")
+        # A unique random peak alone cannot veto a valid global proposal.
+        # Require both real overlap and support beyond chance occupancy.
+        if (overlap / max(1, smaller) < MIN_REGIONAL_OVERLAP_RATIO
+                or gain < MIN_REGIONAL_OVERLAP_GAIN):
+            continue
+        record.update(trusted=True, reason="supported")
+        result.append({'region': index, 'offset_seconds': offset,
+                       'cue_count': len(local_cues), 'overlap_gain': gain})
+    return result
+
+
+def _proposed_offset_support(speech: np.ndarray, cues: Sequence[_Cue],
+                             offset: float) -> list[dict[str, Any]]:
+    """Check the proposed global shift in disjoint regions of the same sample.
+
+    A region need not have a unique local peak: sparse speech can support the
+    global shift without identifying it independently. Require real overlap
+    beyond chance occupancy, using the same floors as the conflict check.
+    """
+    dialogue = [cue for index, cue in enumerate(cues)
+                if _dialogue(cue, index == 0 or index + 1 == len(cues))]
+    guard = MAX_OFFSET_SECONDS * FRAME_RATE
+    delta = int(round(offset * FRAME_RATE))
+    records = []
+    for index in range(REGION_COUNT):
+        first, last = len(speech) * index // REGION_COUNT, len(speech) * (index + 1) // REGION_COUNT
+        local_cues = [cue for cue in dialogue
+                      if cue.start * FRAME_RATE >= first + guard
+                      and cue.end * FRAME_RATE <= last - guard]
+        voiced = speech[first:last] >= 1.
+        record = {'region': index, 'cue_count': len(local_cues),
+                  'offset_seconds': offset, 'supported': False}
+        if (len({cue.start for cue in local_cues}) < MIN_REGIONAL_CUES
+                or min(np.count_nonzero(voiced), np.count_nonzero(~voiced))
+                < MIN_REGIONAL_SIGNAL_SECONDS * FRAME_RATE):
+            record['reason'] = 'insufficient_local_data'
+            records.append(record)
+            continue
+        subtitle = np.zeros(len(voiced), dtype=bool)
+        for cue in local_cues:
+            start = int(round(cue.start * FRAME_RATE)) - first + delta
+            end = start + int(round((cue.end - cue.start) * FRAME_RATE))
+            subtitle[max(0, start):min(len(subtitle), end)] = True
+        overlap = int(np.count_nonzero(voiced & subtitle))
+        smaller = min(int(voiced.sum()), int(subtitle.sum()))
+        expected = float(voiced.sum()) * float(subtitle.sum()) / len(subtitle)
+        ratio = overlap / max(1, smaller)
+        gain = (overlap - expected) / max(1., smaller - expected)
+        record.update(overlap_seconds=overlap / FRAME_RATE, overlap_ratio=ratio,
+                      overlap_gain=gain, supported=bool(ratio >= MIN_REGIONAL_OVERLAP_RATIO
+                                                       and gain >= MIN_REGIONAL_OVERLAP_GAIN))
+        records.append(record)
+    return records
+
+
 def evaluate_reference(reference: Path, local_events: list,
                        raw_offset: float | None = None) -> dict[str, Any]:
     """Inspect signal support, then optionally audit a fixed-offset tool result.
@@ -194,6 +305,9 @@ def evaluate_reference(reference: Path, local_events: list,
         "tool_coordinate_invalid": False, "fft_evaluated": False,
         "diagnostic_evaluated": False, "diagnostic_offset_seconds": None,
         "outside_peak_ratio": None, "outside_range_peak": False,
+        "regional_offset_conflict": False, "regional_offsets": [],
+        "proposed_region_support": [], "supporting_region_count": 0,
+        "region_observations": [],
     }
     reasons = result["reasons"]
     try:
@@ -272,6 +386,24 @@ def evaluate_reference(reference: Path, local_events: list,
                 reasons.append("alternative_peak")
             if metrics["peak_width_seconds"] >= MAX_PEAK_WIDTH_SECONDS:
                 reasons.append("broad_peak")
+            if not result["range_limited"]:
+                regional = _regional_offset_evidence(speech, cues, observations=result['region_observations'])
+                result['regional_offsets'] = regional
+                offsets = [region['offset_seconds'] for region in regional]
+                result['regional_variation_seconds'] = max(offsets) - min(offsets) if len(offsets) >= 2 else None
+                if len(offsets) >= 2 and (
+                        max(offsets) - min(offsets) > REGIONAL_OFFSET_TOLERANCE_SECONDS + 1e-9
+                        or any(abs(value - offset) > REGIONAL_OFFSET_TOLERANCE_SECONDS + 1e-9
+                               for value in offsets)):
+                    reasons.append('regional_offset_conflict')
+                    result['regional_offset_conflict'] = True
+    if (raw_offset is not None and result['fft_evaluated'] and not result['range_limited']
+            and not result['tool_coordinate_invalid'] and not result['regional_offset_conflict']):
+        support = _proposed_offset_support(speech, cues, result['offset_seconds'])
+        result['proposed_region_support'] = support
+        result['supporting_region_count'] = sum(region['supported'] for region in support)
+        if result['supporting_region_count'] < MIN_SUPPORTING_REGIONS:
+            reasons.append('insufficient_independent_regional_support')
     result["sufficient"] = not reasons
-    result["expandable"] = bool(reasons) and not result["range_limited"]
+    result["expandable"] = bool(reasons) and not result["range_limited"] and not result['regional_offset_conflict']
     return result

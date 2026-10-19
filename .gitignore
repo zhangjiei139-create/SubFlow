@@ -69,3 +69,10 @@ qml_frontend/fonts/
 runtime-data/
 experiments/
 test-results/
+
+# Only the five unchanged OFL fonts used by the product are public assets.
+!assets/subtitle-fonts/lxgw/LXGWWenKaiGBScreen.ttf
+!assets/subtitle-fonts/chill/ChillRoundF v3.0.ttf
+!assets/subtitle-fonts/ma/MaShanZheng-Regular.ttf
+!assets/subtitle-fonts/rubik/Rubik\[wght\].ttf
+!assets/subtitle-fonts/bree/BreeSerif-Regular.ttf

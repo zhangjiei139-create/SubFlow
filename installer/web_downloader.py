@@ -339,24 +339,40 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    reporter = StatusWriter(args.status_file, args.result_file, args.log_file)
-    args.status_file.unlink(missing_ok=True)
-    args.result_file.unlink(missing_ok=True)
-    args.cancel_file.unlink(missing_ok=True)
+    reporter = None
     try:
+        reporter = StatusWriter(args.status_file, args.result_file, args.log_file)
+        args.status_file.unlink(missing_ok=True)
+        args.result_file.unlink(missing_ok=True)
+        # Setup clears a previous run's cancellation before launch. Do not erase
+        # a new click that arrived while the one-file helper was starting.
+        if args.cancel_file.exists():
+            raise DownloadCancelled("cancelled")
         prepare_assets(args, reporter)
+        if args.cancel_file.exists():
+            raise DownloadCancelled("cancelled")
         reporter.finish(0)
         return 0
-    except DownloadCancelled as exc:
-        reporter.update("cancelled")
-        reporter.log(str(exc))
-        reporter.finish(2, str(exc))
-        return 2
     except Exception as exc:
-        reporter.update("error", detail=type(exc).__name__)
-        reporter.log(f"{type(exc).__name__}: {exc}")
-        reporter.finish(1, str(exc))
-        return 1
+        result = 2 if isinstance(exc, DownloadCancelled) else 1
+        # Diagnostics may fail for the same disk/permission reason as the work.
+        # Attempt each independently and always return a failing process code;
+        # Setup also monitors process exit when no result file can be written.
+        if reporter is not None:
+            try:
+                reporter.update("cancelled" if result == 2 else "error", detail=type(exc).__name__)
+            except Exception:
+                pass
+            try:
+                reporter.log(f"{type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+        try:
+            args.result_file.parent.mkdir(parents=True, exist_ok=True)
+            args.result_file.write_text(f"{result}\n{exc}", encoding="utf-8")
+        except Exception:
+            pass
+        return result
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 import batch_core as batch
 import pro_core as pro
 import subtitle_tool_core as core
+import translation_review as review
 
 
 class TranslationStageTest(unittest.TestCase):
@@ -188,6 +189,25 @@ class TranslationStageTest(unittest.TestCase):
                 start.assert_called_once_with()
                 end.assert_called_once_with()
                 mux.assert_not_called()
+
+    def test_repeated_cjk_leak_persists_review_and_muxes_in_both_routes(self):
+        for route in ("external", "embedded"):
+            with self.subTest(route=route):
+                start, end = Mock(), Mock()
+                def translate(lines, *_args, **_kwargs):
+                    return ["Die 橡胶haut."] * len(lines)
+                with self._mocks(), patch.object(core, "ensure_ollama_running"), \
+                        patch.object(core, "translate_batch", side_effect=translate) as model, \
+                        patch.object(core, "mux_video", side_effect=self._mux) as mux:
+                    self._run(route, label=route, start=start, end=end)
+                self.assertEqual([len(call.args[0]) for call in model.call_args_list], [2, 1, 1, 1, 1])
+                start.assert_called_once_with()
+                end.assert_called_once_with()
+                mux.assert_called_once()
+                self.assertTrue((self.root / f"{route}.mkv").exists())
+                reports = review.discover_reports(self.root / route)
+                self.assertEqual(len(reports), 1)
+                self.assertEqual(len(review.load_report(reports[0])['issues']), 2)
 
     def test_cache_script_same_language_and_empty_targets_need_no_scope(self):
         for route in ("external", "embedded"):

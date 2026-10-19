@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QItemSelectionModel, QObject, Property, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication,QDialog
 
 import batch_core
+import manual_review_state
 import online_subtitles
 import subdl_subtitles
 import system_resources
@@ -16,6 +18,8 @@ from qt_online_dialog import PROVIDERS
 
 class BackendBridge(QObject):
     toolStateChanged = Signal()
+    batchItemsChanged = Signal()
+    batchActionAvailabilityResolved = Signal(object)
     hardwareChanged = Signal()
     hardwareResolved = Signal(object)
     subtitleServiceChanged = Signal()
@@ -34,15 +38,33 @@ class BackendBridge(QObject):
         }
         self._service_validation_versions = {code: 0 for code in self._service_keys}
         self._tool_controller = None
+        self._batch_items = None
+        self._batch_availability = {}
+        self._batch_probe_running = False
+        self._batch_probe_next_at = 0.0
+        self._batch_closed = False
         self._hardware_profile: system_resources.HardwareProfile | None = None
 
+        self.toolStateChanged.connect(self._sync_batch_items)
+        self.batchActionAvailabilityResolved.connect(self._finish_batch_availability)
         self.subtitleServiceValidationResolved.connect(self._finish_service_validation)
         self.hardwareResolved.connect(self._apply_hardware_profile)
         self._tool_sync_timer = QTimer(self)
         self._tool_sync_timer.setInterval(400)
-        self._tool_sync_timer.timeout.connect(self.toolStateChanged.emit)
+        self._tool_sync_timer.timeout.connect(self._sync_tool_state)
         self._tool_sync_timer.start()
         threading.Thread(target=self._detect_hardware, daemon=True).start()
+
+    def _sync_tool_state(self):
+        # The native translucent listening window owns the interaction. Do not
+        # rebuild the QML movie delegates behind it every 400ms; resume on the
+        # first timer tick after closing. Remux dialogs still receive live state.
+        application=QApplication.instance()
+        modal=application.activeModalWidget() if application is not None else None
+        while modal is not None:
+            if modal.metaObject().className()=='ManualSubtitleReviewDialog': return
+            modal=modal.parentWidget()
+        self.toolStateChanged.emit()
 
     @Property(str, notify=hardwareChanged)
     def performanceSummary(self) -> str:
@@ -90,14 +112,52 @@ class BackendBridge(QObject):
             self._tool_controller = ProMaxQt()
         return self._tool_controller
 
-    @Property("QVariantList", notify=toolStateChanged)
+    @Property("QVariantList", notify=batchItemsChanged)
     def batchItems(self) -> list[dict]:
+        # QML can read this several times for one signal (selection, menus,
+        # model). Reading the model must never touch a movie/NAS filesystem.
+        if self._batch_items is None:
+            self._refresh_batch_items(notify=False)
+        return self._batch_items
+
+    def _sync_batch_items(self) -> None:
+        # Ignore notifications until the controller's batch view is ready.
+        if self._tool_controller is None or all(hasattr(self._tool_controller, name) for name in (
+            "batch_paths", "batch_plans", "batch_item_cancel_events",
+            "_batch_task_label", "_batch_row_color",
+        )):
+            self._refresh_batch_items()
+
+    def _refresh_batch_items(self, notify: bool = True) -> None:
         controller = self._tool_controller
         if controller is None:
-            return []
+            result = []
+            if result != self._batch_items:
+                self._batch_items = result
+                if notify:
+                    self.batchItemsChanged.emit()
+            return
         result = []
+        requests = set()
         for path in controller.batch_paths:
             plan = controller.batch_plans[path]
+            editable = manual_review_state.subtitle_editable(controller, plan)
+            source = str(getattr(plan, "external_subtitle", "") or "")
+            output = str(getattr(plan, "output_path", "") or "")
+            source_key = ("subtitle", source)
+            output_key = ("translation", output)
+            if editable and source:
+                requests.add(source_key)
+            translation_editable = (not controller.batch_running
+                                    and plan.task_state != "processing"
+                                    and plan.status != "processing")
+            if translation_editable and output:
+                requests.add(output_key)
+            available = (editable and bool(source)
+                         and self._batch_availability.get(source_key, False)
+                         and getattr(plan, "status_label", "") != "需换字幕")
+            pending = bool(available and getattr(plan, "manual_review_required", False))
+            active = bool(available and not pending)
             result.append(
                 {
                     "name": Path(path).name,
@@ -110,10 +170,20 @@ class BackendBridge(QObject):
                     "profileSlot": plan.profile_slot,
                     "summary": plan.summary or "待分析",
                     "detail": plan.detail or "",
+                    "detailText": batch_core.movie_detail_text(plan, controller._batch_task_label(plan)),
                     "status": controller._batch_task_label(plan),
                     "state": plan.status,
                     "burned": bool(plan.status == "burned" or plan.burned_subtitle),
                     "processing": plan.task_state == "processing" or plan.status == "processing",
+                    "rowColor": controller._batch_row_color(plan).name(),
+                    "subtitleEditable": editable,
+                    "canPendingReview": pending,
+                    "canActiveReview": active,
+                    "canListenSubtitle": pending or active,
+                    "canAlignSubtitle": pending or active,
+                    "canReviewTranslation": bool(translation_editable
+                        and self._batch_availability.get(output_key, False)),
+                    "manualReviewRequired": bool(getattr(plan, "manual_review_required", False)),
                     "stoppable": (
                         path in controller.batch_item_cancel_events
                         and plan.task_state in {"waiting", "processing"}
@@ -125,7 +195,47 @@ class BackendBridge(QObject):
                     "imageSubtitles": plan.has_image_subtitles,
                 }
             )
-        return result
+        self._queue_batch_availability(requests)
+        if result != self._batch_items:
+            self._batch_items = result
+            if notify:
+                self.batchItemsChanged.emit()
+
+    def _queue_batch_availability(self, requests: set) -> None:
+        if self._batch_closed or self._batch_probe_running or not requests:
+            return
+        if (time.monotonic() < self._batch_probe_next_at
+                and all(key in self._batch_availability for key in requests)):
+            return
+        self._batch_probe_running = True
+
+        def probe():
+            import translation_remux
+            results = {}
+            for kind, path in sorted(requests):
+                if self._batch_closed:
+                    return
+                try:
+                    results[(kind, path)] = (Path(path).is_file() if kind == "subtitle"
+                                            else translation_remux.available(path))
+                except (OSError, ValueError):
+                    results[(kind, path)] = False
+            try:
+                self.batchActionAvailabilityResolved.emit(results)
+            except RuntimeError:
+                # A slow/disconnected share may return after the bridge closes.
+                pass
+
+        threading.Thread(target=probe, daemon=True).start()
+
+    @Slot(object)
+    def _finish_batch_availability(self, results: dict) -> None:
+        self._batch_probe_running = False
+        if self._batch_closed:
+            return
+        self._batch_availability.update(results)
+        self._batch_probe_next_at = time.monotonic() + 5.0
+        self._refresh_batch_items()
 
     @Property(str, notify=toolStateChanged)
     def batchStatus(self) -> str:
@@ -137,9 +247,46 @@ class BackendBridge(QObject):
     def batchProgress(self) -> int:
         return self._tool_controller.batch_progress.value() if self._tool_controller is not None else 0
 
+    def _mux_state(self):
+        return getattr(self._tool_controller,'mux_progress',None)
+
+    @Property(bool, notify=toolStateChanged)
+    def muxVisible(self):
+        state=self._mux_state()
+        return bool(state and state.visible)
+
+    @Property(int, notify=toolStateChanged)
+    def muxProgress(self):
+        state=self._mux_state()
+        return state.value if state else 0
+
+    @Property(bool, notify=toolStateChanged)
+    def muxBusy(self):
+        state=self._mux_state()
+        return bool(state and state.busy)
+
+    @Property(str, notify=toolStateChanged)
+    def muxStatus(self):
+        state=self._mux_state()
+        return state.label if state else ''
+
     @Property(bool, notify=toolStateChanged)
     def batchRunning(self) -> bool:
         return bool(self._tool_controller is not None and self._tool_controller.batch_running)
+
+    @Property(str, notify=toolStateChanged)
+    def batchOutputFormat(self) -> str:
+        return getattr(self._tool_controller, "batch_output_format", "MKV")
+
+    @Property(bool, notify=toolStateChanged)
+    def batchOutputFormatLocked(self) -> bool:
+        return bool(self._tool_controller is not None
+                    and not self._tool_controller._batch_output_format_editable())
+
+    @Slot(str)
+    def batchSetOutputFormat(self, value: str) -> None:
+        self._ensure_tool_controller()._batch_set_output_format(value)
+        self.toolStateChanged.emit()
 
     @Property(str, notify=toolStateChanged)
     def batchLogText(self) -> str:
@@ -316,6 +463,7 @@ class BackendBridge(QObject):
             if self._hardware_profile is not None:
                 controller.batch_hardware = self._hardware_profile
                 controller.batch_mode.setCurrentText(self._hardware_profile.recommended_mode)
+            controller._batch_log_line(f'处理启动请求：右键“处理”；{len(paths)} 部；{time.strftime("%H:%M:%S")}。')
             controller._batch_start_paths(paths)
         self.toolStateChanged.emit()
 
@@ -337,10 +485,58 @@ class BackendBridge(QObject):
 
     @Slot(int)
     def batchManualSubtitles(self, row: int) -> None:
+        self._defer_movie_dialog(row, '_open_batch_online_search')
+
+    @Slot(int)
+    def batchAlignSubtitle(self, row: int) -> None:
+        self._defer_movie_dialog(row, '_force_batch_manual_review')
+
+    @Slot(int)
+    def batchPendingReview(self, row: int) -> None:
+        self._defer_movie_dialog(row, '_open_batch_pending_review')
+
+    @Slot(int)
+    def batchListenCurrentSubtitle(self, row: int) -> None:
+        self._defer_movie_dialog(row, '_listen_current_subtitle')
+
+    @Slot(int)
+    def batchReviewTranslation(self, row: int) -> None:
+        self._defer_movie_dialog(row, '_batch_edit_translation')
+
+    def _defer_movie_dialog(self, row: int, method: str) -> None:
         controller = self._ensure_tool_controller()
         if 0 <= row < len(controller.batch_paths):
-            controller._open_batch_online_search(controller.batch_paths[row])
-        self.toolStateChanged.emit()
+            path = controller.batch_paths[row]
+            plan = controller.batch_plans.get(path)
+
+            def open_dialog():
+                # A modal QWidget runs a nested event loop. Calling it inside
+                # MenuItem.onTriggered lets the 400ms model refresh destroy a
+                # delegate that is still executing JavaScript, which is fatal
+                # in Qt. Also capture the movie, not its transient row index.
+                if (self._tool_controller is not controller or plan is None
+                        or path not in controller.batch_paths
+                        or controller.batch_plans.get(path) is not plan):
+                    return
+                try:
+                    getattr(controller, method)(path)
+                finally:
+                    self.toolStateChanged.emit()
+
+            QTimer.singleShot(0, self, open_dialog)
+
+    @Slot(QUrl)
+    def reviewCompletedMovie(self, url: QUrl) -> None:
+        if not url.isLocalFile(): return
+        output=url.toLocalFile()
+        controller=self._ensure_tool_controller()
+        def open_dialog():
+            if self._tool_controller is not controller: return
+            try:
+                controller._edit_translation_output(output)
+            finally:
+                self.toolStateChanged.emit()
+        QTimer.singleShot(0,self,open_dialog)
 
     @Slot(int)
     def batchImportSubtitle(self, row: int) -> None:
@@ -497,6 +693,25 @@ class BackendBridge(QObject):
                     plan.profile_slot = index + 1
         self.toolStateChanged.emit()
 
+    @Slot()
+    def profileEditFonts(self):
+        if self.profileEditingLocked: return
+        controller=self._ensure_tool_controller()
+        slot=controller.profile_slot.currentIndex()
+        def open_dialog():
+            if self.profileEditingLocked or controller.profile_slot.currentIndex()!=slot: return
+            from subtitle_font_dialog import SubtitleFontDialog
+            from profile_model import save_profiles
+            dialog=SubtitleFontDialog(controller.profiles[slot],controller)
+            try:
+                if dialog.exec()==QDialog.DialogCode.Accepted and not self.profileEditingLocked:
+                    controller.profiles[slot].subtitle_styles=dialog.result_styles
+                    save_profiles(controller.profiles)
+            finally:
+                dialog.deleteLater()
+            self.toolStateChanged.emit()
+        QTimer.singleShot(0,self,open_dialog)
+
     @Slot(str)
     def profileSetName(self, value: str) -> None:
         if self.profileEditingLocked:
@@ -553,5 +768,6 @@ class BackendBridge(QObject):
 
     @Slot()
     def shutdown(self) -> None:
-        """The unified page has no independent single-movie worker to stop."""
-        return
+        """Stop polling; slow probes may finish without updating the closed UI."""
+        self._batch_closed = True
+        self._tool_sync_timer.stop()

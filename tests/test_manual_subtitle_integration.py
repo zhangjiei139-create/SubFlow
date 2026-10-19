@@ -10,12 +10,16 @@ from PySide6.QtWidgets import QDialog
 
 import pro_core
 import qt_app
+from profile_model import BatchPlan
 
 
 class ManualSubtitleIntegrationTest(unittest.TestCase):
     def test_confirmed_out_of_auto_range_is_shifted_and_sealed(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
+            movie = work / 'movie.mkv'
+            movie.write_bytes(b'movie identity')
+            movie_path = str(movie)
             selected = work / "selected.srt"
             text = (
                 "1\n00:00:30,000 --> 00:00:32,000\nA full dialogue line.\n\n"
@@ -33,7 +37,7 @@ class ManualSubtitleIntegrationTest(unittest.TestCase):
                 ],
             }
             fake = SimpleNamespace(
-                batch_plans={"movie.mkv": object()},
+                batch_plans={movie_path: BatchPlan(movie_path, 1, external_language="en")},
                 _batch_log_line=Mock(),
                 _batch_manual_review_failed=Mock(),
                 _batch_manual_review_cancelled=Mock(),
@@ -47,12 +51,12 @@ class ManualSubtitleIntegrationTest(unittest.TestCase):
                 dialog.exec.return_value = QDialog.DialogCode.Accepted
                 dialog.confirmed_offsets = [-13.52] * 3
                 qt_app.ProMaxQt._batch_manual_review_ready(
-                    fake, "movie.mkv", str(selected), candidate, evidence
+                    fake, movie_path, str(selected), candidate, evidence
                 )
             fake._batch_manual_review_failed.assert_not_called()
             fake._batch_online_verified.assert_called_once()
             passed_path, passed_candidate, result = fake._batch_online_verified.call_args.args
-            self.assertEqual((passed_path, passed_candidate), ("movie.mkv", candidate))
+            self.assertEqual((passed_path, passed_candidate), (movie_path, candidate))
             confirmed = Path(result[0])
             self.assertTrue(confirmed.is_file())
             shifted = pro_core.legacy.parse_subtitle(confirmed)

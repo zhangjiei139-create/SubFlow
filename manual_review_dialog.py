@@ -3,13 +3,14 @@
 from __future__ import annotations
 import ctypes, html, os, shutil, tempfile, time
 from pathlib import Path
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, QThreadPool, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QApplication, QDialog, QDoubleSpinBox, QFrame,
-    QGraphicsDropShadowEffect, QHBoxLayout, QLabel, QMessageBox, QPushButton,
+    QHBoxLayout, QLabel, QMessageBox, QPushButton, QComboBox,
     QScrollArea, QTabWidget, QVBoxLayout, QWidget)
 import manual_review_prepare
 from manual_timeline_widget import ManualTimelineWidget
+from qt_workers import FunctionWorker
 
 class WindowsWavPlayer:
     """Play the review WAV through the Windows system audio path."""
@@ -104,6 +105,8 @@ class ManualRegionPage(QWidget):
         self.manual_selection = False
         self.locked = False
         self.speed = 1.0
+        self.index = index
+        self.temp_dir = temp_dir
         self.players = {}
         try:
             for speed, suffix in ((1.0, ''), (0.5, '.half')):
@@ -125,6 +128,7 @@ class ManualRegionPage(QWidget):
         root.addWidget(self.heading)
         controls = QHBoxLayout()
         self.play_button = QPushButton('播放 / 暂停')
+        self.play_button.setFixedWidth(76)
         self.play_button.clicked.connect(self.toggle)
         controls.addWidget(self.play_button)
         for text,delta in (('后退 5 秒',-5),('前进 5 秒',5)):
@@ -132,9 +136,12 @@ class ManualRegionPage(QWidget):
             button.clicked.connect(lambda _=False,d=delta:self.seek(self.current()+d))
             controls.addWidget(button)
         self.speed_button = QPushButton('1× / 0.5× 慢放')
+        self.speed_button.setFixedWidth(144)
         self.speed_button.clicked.connect(self.switch_speed)
         controls.addWidget(self.speed_button)
         self.clock = QLabel('0.0 / 60 秒')
+        # The clock must not resize its row when digits change during playback.
+        self.clock.setFixedWidth(96)
         controls.addWidget(self.clock)
         self.prev_page = QPushButton('上一页')
         self.next_page = QPushButton('下一页')
@@ -187,6 +194,52 @@ class ManualRegionPage(QWidget):
         confirmation.addWidget(self.confirm_button)
         root.addLayout(confirmation)
         self.update_page_buttons()
+
+    def replace_clip(self, clip):
+        """Open the replacement first so failed audio never discards this page."""
+        players = {}
+        stamp = time.time_ns()
+        try:
+            for speed, suffix in ((1.0, ''), (0.5, '.half')):
+                source = Path(clip['audio'] if speed == 1.0 else clip['slow_audio'])
+                target = Path(self.temp_dir) / f'r{self.index}-{stamp}{suffix}.wav'
+                shutil.copyfile(source, target)
+                players[speed] = WindowsWavPlayer(
+                    str(target), f'sfmt_{os.getpid()}_{stamp}_{self.index}_{int(speed*10)}')
+        except Exception:
+            for player in players.values():
+                try: player.close()
+                except RuntimeError: pass
+            raise
+        self.close_audio()
+        self.players = players
+        self.clip = clip
+        self.offset = float(clip.get('initial_offset', 0.0))
+        self.selected = -1
+        self.manual_selection = False
+        self.locked = False
+        self.speed = 1.0
+        self.spin.blockSignals(True)
+        self.spin.setValue(self.offset)
+        self.spin.blockSignals(False)
+        self.spin.setEnabled(True)
+        for button in self.edit_buttons: button.setEnabled(True)
+        self.confirm_button.setText('确认本段偏移')
+        self.speed_button.setText('1× / 0.5× 慢放')
+        self.timeline.evidence = clip
+        self.timeline.offset = self.offset
+        self.timeline.position = 0.0
+        self.timeline.selected = -1
+        self.timeline.drag = None
+        self.timeline.cue_rects = []
+        self.timeline.set_view_start(0)
+        self.timeline.setEnabled(True)
+        name = ('前段', '中段', '后段')[self.index]
+        self.heading.setText(f'{name} · 影片 {clip["movie_start"]:.0f} 秒起 · 60 秒音频')
+        self.show_selected(-1)
+        self.refresh()
+        self.update_page_buttons()
+        self.confirmedChanged.emit(False)
 
     def current(self):
         return self.players[self.speed].position()/1000*self.speed
@@ -279,12 +332,16 @@ class ManualRegionPage(QWidget):
 
     def refresh(self):
         second=min(60.0,self.current())
-        self.clock.setText(f'{second:.1f} / 60 秒')
-        self.play_button.setText('暂停' if self.is_playing() else '播放')
+        playing=self.is_playing()
+        clock=f'{second:.1f} / 60 秒'
+        if self.clock.text()!=clock: self.clock.setText(clock)
+        button='暂停' if playing else '播放'
+        if self.play_button.text()!=button: self.play_button.setText(button)
+        moved=self.timeline.position!=second
         self.timeline.position=second
-        if self.is_playing() or not self.manual_selection:
+        if playing or not self.manual_selection:
             self.follow_position(second)
-        self.timeline.update()
+        if moved: self.timeline.update()
 
     def toggle_confirmation(self):
         if not self.locked:
@@ -317,7 +374,13 @@ class ManualSubtitleReviewDialog(QDialog):
         self.evidence=evidence
         self.confirmed_offsets=None
         self.confirmed_offset=None
+        self.requested_audio_id=None
         self.pages=[]
+        self.region_statuses=[]
+        self.region_buttons=[]
+        self.replace_buttons=[]
+        self._window_worker=None
+        self._evidence_save_failed=False
         self._audio_released=False
         self._audio_stage=tempfile.TemporaryDirectory(prefix='sf_manual_timeline_')
         self.setModal(True)
@@ -337,11 +400,9 @@ class ManualSubtitleReviewDialog(QDialog):
         shell=QFrame()
         shell.setObjectName('shell')
         shell.setStyleSheet('QFrame#shell{background:#f7faf9;border:1px solid #d3e3df;border-radius:15px}')
-        shadow=QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(18)
-        shadow.setOffset(0,3)
-        shadow.setColor(QColor(0,0,0,65))
-        shell.setGraphicsEffect(shadow)
+        # A graphics effect on the whole translucent shell recomposites every
+        # timeline tick, including controls and text. Keep the rounded border
+        # without the effect so playback only repaints the timeline itself.
         root.addWidget(shell)
         content=QVBoxLayout(shell)
         content.setContentsMargins(10,5,10,6)
@@ -351,6 +412,28 @@ class ManualSubtitleReviewDialog(QDialog):
         note.setWordWrap(True)
         note.setStyleSheet('font-size:11px;color:#526d6b')
         content.addWidget(note)
+        audio_row=QHBoxLayout()
+        audio_row.addWidget(QLabel('参照音轨'))
+        self.audio_combo=QComboBox()
+        self.audio_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.audio_combo.setMinimumContentsLength(20)
+        self.audio_combo.setMinimumWidth(0)
+        choices=evidence.get('audio_choices') or [dict(id=evidence.get('validation_audio_id'),
+            label=f"轨{evidence.get('validation_audio_id','?')} · {evidence.get('audio_codec','')}（当前）",enabled=True)]
+        for choice in choices:
+            self.audio_combo.addItem(choice['label'],choice['id'])
+            self.audio_combo.setItemData(self.audio_combo.count()-1,choice['label'],Qt.ItemDataRole.ToolTipRole)
+            item=self.audio_combo.model().item(self.audio_combo.count()-1)
+            if item is not None: item.setEnabled(choice.get('enabled',True))
+        current=self.audio_combo.findData(evidence.get('validation_audio_id'))
+        self.audio_combo.setCurrentIndex(current)
+        audio_row.addWidget(self.audio_combo,1)
+        self.audio_switch=QPushButton('切换音轨')
+        self.audio_switch.setToolTip('切换后重新准备三段音频，三段偏移全部需要重新确认。')
+        self.audio_switch.clicked.connect(self.request_audio_switch)
+        audio_row.addWidget(self.audio_switch)
+        self.audio_combo.currentIndexChanged.connect(self._audio_selection_changed)
+        content.addLayout(audio_row)
         self.tabs=QTabWidget()
         self.tabs.setStyleSheet('QTabWidget::pane{border:1px solid #d3e3df;border-radius:9px;background:#f7faf9}'
             ' QTabBar::tab{padding:7px 14px;border-top-left-radius:7px;border-top-right-radius:7px;background:#e8f1ef}'
@@ -376,18 +459,25 @@ class ManualSubtitleReviewDialog(QDialog):
                 card_scroll.setWidget(page.cue_card)
                 tab_layout.addWidget(card_scroll)
                 region_actions=QHBoxLayout()
-                region_status=QLabel('本段尚未确认')
+                region_status=QLabel(self._region_status_text(page))
+                region_status.setWordWrap(True)
                 region_button=QPushButton('确认本段偏移')
                 region_button.clicked.connect(page.toggle_confirmation)
                 page.confirmedChanged.connect(
                     lambda locked,p=page,b=region_button,label=region_status:
                     (b.setText('重新调整本段' if locked else '确认本段偏移'),
-                     label.setText(f'已确认 {p.offset:+.2f} 秒' if locked else '本段尚未确认')))
-                region_actions.addWidget(region_status)
-                region_actions.addStretch()
+                     label.setText(self._region_status_text(p))))
+                region_actions.addWidget(region_status,1)
+                replace_button=QPushButton('换同区片段')
+                replace_button.clicked.connect(lambda _checked=False,i=index:self.replace_region(i))
+                replace_button.setVisible(bool(evidence.get('region_options')))
+                region_actions.addWidget(replace_button)
                 region_actions.addWidget(region_button)
                 tab_layout.addLayout(region_actions)
                 self.pages.append(page)
+                self.region_statuses.append(region_status)
+                self.region_buttons.append(region_button)
+                self.replace_buttons.append(replace_button)
                 self.tabs.addTab(wrapper,('前段','中段','后段')[index])
         except Exception:
             self._release_audio()
@@ -406,6 +496,7 @@ class ManualSubtitleReviewDialog(QDialog):
         self.timer=QTimer(self)
         self.timer.timeout.connect(lambda:self.pages[self.tabs.currentIndex()].refresh())
         self.timer.start(80)
+        self._audio_selection_changed()
         self.ensurePolished()
         for page in self.pages:
             page.ensurePolished()
@@ -427,15 +518,85 @@ class ManualSubtitleReviewDialog(QDialog):
         self.move(max(bounds.left(),min(center.x(),bounds.right()-self.width()+1)),
                   max(bounds.top(),min(center.y(),bounds.bottom()-self.height()+1)))
 
+    def _audio_selection_changed(self,*_):
+        self.audio_switch.setEnabled(self._window_worker is None and
+            self.audio_combo.currentData()!=self.evidence.get('validation_audio_id'))
+        self.update_confirm_button()
+
+    def request_audio_switch(self):
+        if self._window_worker is not None or self._audio_released: return
+        selected=self.audio_combo.currentData()
+        if selected is None or selected==self.evidence.get('validation_audio_id'): return
+        self.requested_audio_id=selected
+        self.confirmed_offsets=None
+        self.done(2)
+
     def on_tab_changed(self,index):
         for i,page in enumerate(self.pages):
             if i!=index: page.pause()
         if 0<=index<len(self.pages): self.pages[index].refresh()
 
     def update_confirm_button(self,_confirmed=None):
-        self.confirm_button.setEnabled(len(self.pages)==3 and all(p.locked for p in self.pages))
+        self.confirm_button.setEnabled(self._window_worker is None and not self._evidence_save_failed and
+            self.audio_combo.currentData()==self.evidence.get('validation_audio_id') and
+            len(self.pages)==3 and all(p.locked for p in self.pages))
+
+    @staticmethod
+    def _region_status_text(page):
+        if page.locked: return f'已确认 {page.offset:+.2f} 秒'
+        warning = page.clip.get('selection_warning', '')
+        return str(warning) if warning else '本段尚未确认'
+
+    def replace_region(self,index):
+        if self._window_worker is not None or self._audio_released: return
+        for page in self.pages: page.pause()
+        previous = self.evidence['clips'][index]
+        self.region_statuses[index].setText('正在准备同区片段…')
+        self.tabs.setEnabled(False)
+        for button in self.replace_buttons: button.setEnabled(False)
+        worker=FunctionWorker(lambda signals:manual_review_prepare.replace_review_window(
+            self.evidence,index,log=signals.message.emit))
+        self._window_worker=worker
+        self._audio_selection_changed()
+        self.update_confirm_button()
+        worker.signals.result.connect(lambda clip:self._replacement_ready(index,previous,clip))
+        worker.signals.error.connect(lambda message:self._replacement_failed(index,message))
+        worker.signals.finished.connect(self._replacement_finished)
+        QThreadPool.globalInstance().start(worker)
+
+    def _replacement_ready(self,index,previous,clip):
+        if self._audio_released: return
+        try:
+            self.pages[index].replace_clip(clip)
+        except Exception as exc:
+            # The preparation may have committed a new evidence point. Keep it
+            # paired with the page's old audio if opening that new audio failed.
+            self.evidence['clips'][index]=previous
+            if self.evidence.get('review_dir'):
+                try: manual_review_prepare._save_evidence(self.evidence)
+                except OSError:
+                    self._evidence_save_failed=True
+                    self._replacement_failed(index,'原片段已恢复，但核听记录无法保存；请关闭后重新打开人工核听。')
+                    return
+            self._replacement_failed(index,f'无法播放新片段，已保留原片段：{exc}')
+
+    def _replacement_failed(self,index,message):
+        if self._audio_released: return
+        self.region_statuses[index].setText(self._region_status_text(self.pages[index]))
+        QMessageBox.information(self,'无法更换片段',message)
+
+    def _replacement_finished(self):
+        self._window_worker=None
+        self._audio_selection_changed()
+        if self._audio_released: return
+        self.tabs.setEnabled(True)
+        for button in self.replace_buttons: button.setEnabled(True)
+        self.update_confirm_button()
 
     def confirm(self):
+        if self.audio_combo.currentData()!=self.evidence.get('validation_audio_id'):
+            QMessageBox.information(self,'尚未切换参照','请先点击切换音轨，重新准备并确认三段偏移。')
+            return
         if not all(page.locked for page in self.pages):
             QMessageBox.information(self,'尚未完成','请分别确认前、中、后三段。')
             return

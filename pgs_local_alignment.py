@@ -21,6 +21,7 @@ FRAME_RATE_HZ = 100
 BOUNDED_SUBWINDOW_LENGTHS = (120.0, 180.0)
 BOUNDED_CENTER_DELTAS = (-150.0, -75.0, 0.0, 75.0, 150.0)
 MAX_BOUNDED_FINAL_CHECKS = 10
+REGIONAL_OFFSET_TOLERANCE_SECONDS = .5
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +78,14 @@ class LocalAlignmentResult:
     evidence: tuple[RegionEvidence, ...] = ()
     minimum_start_support: float | None = None
     sigma_seconds: float = .3
+    timing_conflict: bool = False
+    regional_offsets: tuple[float | None, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RegionConsistencyResult:
+    conflict: bool
+    offsets: tuple[float | None, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +246,52 @@ def _region_failure_reasons(starts, activity, anchors) -> tuple[str, ...]:
     return tuple(reasons)
 
 
+def _supported_region_offset(np, reference, candidate, window, meta):
+    """A region may contradict another only after passing its own evidence gates."""
+    best, score, ratio, ni, nt = meta
+    starts = StartEvidence(best, score, ratio, 1., 0., ni, nt)
+    activity = _activity(np, reference, candidate, window, best)
+    anchors = _anchors(np, reference, candidate, window, best)
+    return None if _region_failure_reasons(starts, activity, anchors) else best
+
+
+def _offset_consistency(offsets, proposed_offset=None) -> RegionConsistencyResult:
+    supported = [value for value in offsets if value is not None]
+    # Two independent, individually supported observations are required. A
+    # sparse/ambiguous region is unknown, never a vote against the fallback.
+    conflict = len(supported) >= 2 and (
+        max(supported) - min(supported) > REGIONAL_OFFSET_TOLERANCE_SECONDS + 1e-9
+        or (proposed_offset is not None and any(
+            abs(value - proposed_offset) > REGIONAL_OFFSET_TOLERANCE_SECONDS + 1e-9
+            for value in supported)))
+    return RegionConsistencyResult(bool(conflict), tuple(offsets))
+
+
+def evaluate_region_consistency(reference_intervals, windows, candidate_regions,
+                                *, proposed_offset=None) -> RegionConsistencyResult:
+    """Audit a full-scan proposal using existing intervals, without media IO.
+
+    Empty regions remain unknown. This supplements the full overlap gate; it
+    does not demand that the stricter three-window local verifier accept.
+    """
+    import numpy as np
+
+    reference = _intervals(reference_intervals)
+    regions = _windows(windows)
+    if len(candidate_regions) != len(regions):
+        raise _InvalidData("three_candidate_regions_required")
+    offsets = []
+    for window, values in zip(regions, candidate_regions):
+        candidate = _intervals(values)
+        try:
+            _, meta = _start_curve(np, reference, candidate, window,
+                                   np.linspace(-MAX_OFFSET_SECONDS, MAX_OFFSET_SECONDS, 1001), .3)
+            offsets.append(_supported_region_offset(np, reference, candidate, window, meta))
+        except _InvalidData:
+            offsets.append(None)
+    return _offset_consistency(offsets, proposed_offset)
+
+
 def evaluate_local_alignment(
     reference_intervals: Iterable[Interval],
     windows: Sequence[Window],
@@ -310,7 +365,12 @@ def evaluate_local_alignment(
                                        _region_failure_reasons(starts, activity, anchors)))
     failures = global_reasons + [reason for region in evidence for reason in region.reasons]
     if failures:
-        return LocalAlignmentResult(False, None, proposed, failures[0], tuple(evidence), support, sigma_seconds)
+        consistency = _offset_consistency([
+            _supported_region_offset(np, reference, items, window, meta)
+            for window, items, meta in zip(regions, candidates, metadata)])
+        reason = "regional_offset_conflict" if consistency.conflict else failures[0]
+        return LocalAlignmentResult(False, None, proposed, reason, tuple(evidence), support,
+                                    sigma_seconds, consistency.conflict, consistency.offsets)
     applied = 0. if abs(proposed) <= .25 + 1e-9 else proposed
     reason = "supported_no_move" if applied == 0. else "supported_fixed_shift"
     return LocalAlignmentResult(True, applied, proposed, reason, tuple(evidence), support, sigma_seconds)

@@ -29,6 +29,7 @@ class OllamaRuntimeControlTests(unittest.TestCase):
             core._OLLAMA_ACTIVE_REQUESTS = 0
             core._OLLAMA_STOPPING = False
             core._OLLAMA_SERVER_PROCESS = None
+            core._OLLAMA_SERVER_HOST = None
         core._OLLAMA_INFERENCE_GATE = threading.Semaphore(1)
 
     def test_environment_limits_ollama_to_one_inference_lane(self):

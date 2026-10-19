@@ -46,6 +46,7 @@ class VadEvidenceTests(unittest.TestCase):
         self.assertTrue(result["sufficient"], result)
         self.assertTrue(result["fft_evaluated"])
         self.assertEqual(result["computed_offset_seconds"], -3.25)
+        self.assertGreaterEqual(result['supporting_region_count'], 2)
         self.assertFalse(result["expandable"])
 
     def test_negative_raw_score_can_have_a_clear_unique_peak(self):
@@ -69,6 +70,7 @@ class VadEvidenceTests(unittest.TestCase):
         self.assertEqual(result["computed_offset_seconds"], 0)
         self.assertLess(result["alternative_peak_ratio"], evidence.ALTERNATIVE_PEAK_RATIO)
         self.assertLess(result["peak_width_seconds"], evidence.MAX_PEAK_WIDTH_SECONDS)
+        self.assertGreaterEqual(result['supporting_region_count'], 2)
 
     def test_coordinate_disagreement_never_expands(self):
         result = evidence.evaluate_reference(self.reference, self.events, 1.0)

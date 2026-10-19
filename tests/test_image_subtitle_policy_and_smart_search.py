@@ -312,6 +312,8 @@ class ImageSubtitlePolicyTest(unittest.TestCase):
                 plan = batch_core.analyze_video(
                     str(video), profile, str(downloaded), "zh-CN", True,
                     external_subtitle_origin="download",
+                    external_subtitle_media_signature=batch_core.media_signature(video),
+                    external_subtitle_content_hash=batch_core.hashlib.sha256(downloaded.read_bytes()).hexdigest(),
                 )
             self.assertEqual(plan.local_chinese_conversion_sources, {"zh-TW": 4})
             with patch.object(batch_core.core, "inspect_tracks", return_value=tracks), patch.object(
@@ -341,6 +343,7 @@ class ImageSubtitlePolicyTest(unittest.TestCase):
                     str(video), profile, str(subtitle), "en", True,
                     external_subtitle_origin="download",
                     manual_confirmation_hash=file_hash,
+                    external_subtitle_media_signature=batch_core.media_signature(video),
                 )
             with patch.object(batch_core.core, "inspect_tracks", return_value=self.tracks), patch.object(
                 batch_core.pro_core, "process_pro"

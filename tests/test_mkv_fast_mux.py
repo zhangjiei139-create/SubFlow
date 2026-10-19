@@ -21,10 +21,10 @@ def uint(eid, value):
     return elem(eid, value.to_bytes(max(1, (value.bit_length() + 7) // 8), 'big'))
 
 
-def track(number, codec, mapping=b''):
+def track(number, codec, mapping=b'', private=b'private'):
     kind = 1 if codec.startswith('V_') else 2 if codec.startswith('A_') else 17
     return elem(0xAE, uint(0xD7, number) + uint(0x73C5, number * 100) +
-                uint(0x83, kind) + elem(0x86, codec.encode()) + elem(0x63A2, b'private') + mapping)
+                uint(0x83, kind) + elem(0x86, codec.encode()) + elem(0x63A2, private) + mapping)
 
 
 def document(dv=None, *, audio='A_TRUEHD', chapters=b'', attachments=b'', extra_audio=False):
@@ -264,6 +264,111 @@ class FastMuxExecutionTests(unittest.TestCase):
                                              folder, lambda _: None, None)
             self.assertFalse(mux.call_args.kwargs['allow_fast_passthrough'])
             self.assertEqual(Path(mux.call_args.args[1]).suffix, '.mkv')
+
+
+class DtsFastMuxPolicyTests(unittest.TestCase):
+    """Use the existing fixture helpers without duplicating the TrueHD tests."""
+
+    def setUp(self):
+        FastMuxPolicyTests.setUp(self)
+
+    def assess(self, **kw):
+        return FastMuxPolicyTests.assess(self, **kw)
+
+    def dts_fixture(self, *, video_extra=b'', audio_extra=b'', subtitle_extra=b''):
+        tracks = track(1, 'V_MPEGH/ISO/HEVC', video_extra)
+        tracks += track(2, 'A_DTS', uint(0x23E383, 10666667) + audio_extra, private=b'')
+        tracks += track(3, 'S_HDMV/PGS', subtitle_extra)
+        self.source.write_bytes(elem(0x1A45DFA3, elem(0x4282, b'matroska')) + elem(
+            fast.SEGMENT, elem(fast.TRACKS, tracks) + elem(fast.CLUSTER, b'')))
+        self.metadata = media('A_DTS')
+        self.metadata['tracks'][1]['codec'] = 'DTS-HD Master Audio'
+        self.metadata['tracks'][1]['properties'].update(
+            audio_sampling_frequency=48000, audio_channels=6, audio_bits_per_sample=24,
+            default_duration=10666667,
+        )
+
+    def test_validated_single_ma_profile_and_plain_zlib_pgs_are_eligible(self):
+        for compression in (b'', elem(0x6D80, elem(0x6240, elem(0x5034, b'')))):
+            self.dts_fixture(subtitle_extra=compression)
+            plan = self.assess()
+            self.assertTrue(plan.enabled, plan.reason)
+            self.assertEqual(plan.audio_kind, 'DTS-HD MA')
+
+    def test_unverified_dts_profiles_stay_on_original_mux(self):
+        for field, value in (('audio_sampling_frequency', 96000), ('audio_channels', 8),
+                             ('audio_bits_per_sample', 16), ('default_duration', 21333333),
+                             ('codec_id', 'A_AC3')):
+            with self.subTest(field=field):
+                self.dts_fixture()
+                self.metadata['tracks'][1]['properties'][field] = value
+                self.assertFalse(self.assess().enabled)
+        for codec in ('DTS', 'DTS-HD High Resolution Audio', 'DTS Express', 'DTS:X', ''):
+            self.dts_fixture()
+            self.metadata['tracks'][1]['codec'] = codec
+            self.assertFalse(self.assess().enabled)
+
+    def test_explicit_dtsx_labels_do_not_enter_new_route(self):
+        self.dts_fixture()
+        self.metadata['tracks'][1]['properties']['track_name'] = 'English DTS:X 5.1'
+        self.assertFalse(self.assess().enabled)
+        self.dts_fixture()
+        source = self.source.with_name('film.DTS-X.mkv')
+        self.source.rename(source)
+        self.source = source
+        self.assertFalse(self.assess().enabled)
+
+    def test_dts_requires_all_profile_fields_and_one_retained_audio(self):
+        for field in ('audio_sampling_frequency', 'audio_channels', 'audio_bits_per_sample', 'default_duration'):
+            self.dts_fixture()
+            del self.metadata['tracks'][1]['properties'][field]
+            self.assertFalse(self.assess().enabled)
+        self.dts_fixture()
+        self.metadata['tracks'].append({**copy.deepcopy(self.metadata['tracks'][1]), 'id': 3})
+        self.assertFalse(self.assess(audio_ids=[1, 3]).enabled)
+
+    def test_dts_nondefault_scale_offset_delay_and_preroll_are_rejected(self):
+        for extra in (elem(0x23314F, struct.pack('>f', .5)), uint(0x537F, 100),
+                      uint(0x56AA, 1), uint(0x56BB, 1)):
+            self.dts_fixture(audio_extra=extra)
+            self.assertFalse(self.assess().enabled)
+        self.dts_fixture(audio_extra=elem(0x23314F, struct.pack('>d', 1.0)))
+        self.assertTrue(self.assess().enabled)
+
+    def test_encoding_restrictions_apply_to_every_retained_track(self):
+        zlib = elem(0x6D80, elem(0x6240, elem(0x5034, b'')))
+        for target in ('video_extra', 'audio_extra'):
+            self.dts_fixture(**{target: zlib})
+            self.assertFalse(self.assess().enabled)
+        for encoding in (
+            elem(0x5035, b''),  # Encryption.
+            uint(0x5032, 2) + elem(0x5034, b''),  # CodecPrivate scope.
+            elem(0x5034, uint(0x4254, 3)),  # Header stripping.
+            elem(0x5034, elem(0x4255, b'prefix')),
+        ):
+            self.dts_fixture(subtitle_extra=elem(0x6D80, elem(0x6240, encoding)))
+            self.assertFalse(self.assess().enabled)
+
+    def test_unknown_additions_reject_but_verified_dv_mapping_is_eligible(self):
+        self.dts_fixture(video_extra=uint(0x55EE, 1))
+        self.assertFalse(self.assess().enabled)
+        dv = elem(0x41E4, uint(0x41E7, int.from_bytes(b'dvvC', 'big')) +
+                  elem(0x41ED, bytes.fromhex('0100103510') + b'\0' * 19) + uint(0x41F0, 1))
+        self.dts_fixture(video_extra=uint(0x55EE, 1) + dv)
+        self.assertTrue(self.assess().enabled)
+        self.dts_fixture(video_extra=uint(0x55EE, 2) + dv)
+        self.assertFalse(self.assess().enabled)
+
+    def test_dts_output_temporal_or_encoding_change_fails_verification(self):
+        self.dts_fixture()
+        plan = self.assess()
+        for key, value in (('timestamp_offset', 1), ('timestamp_scale', struct.pack('>f', 2)),
+                           ('content_encodings', b'unknown')):
+            headers = copy.deepcopy(plan.headers)
+            headers['tracks'][1][key] = value
+            with patch.object(fast, 'read_headers', return_value=headers):
+                with self.assertRaises(fast.HeaderCheckError):
+                    fast.verify(plan, self.output, self.metadata, {}, {}, [])
 
 
 if __name__ == '__main__':

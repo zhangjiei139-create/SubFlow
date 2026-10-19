@@ -7,3 +7,6 @@
 *.svg text eol=lf
 *.ico binary
 *.png binary
+*.ttf binary
+assets/subtitle-fonts/*/OFL.txt -text whitespace=-blank-at-eol
+assets/subtitle-fonts/bree/FONTLOG.txt -text whitespace=-blank-at-eol

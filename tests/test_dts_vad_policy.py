@@ -25,21 +25,41 @@ def pcm(path):
 
 
 class SelectionTests(unittest.TestCase):
-    def test_english_priority_survives_cheaper_other_language(self):
-        self.assertEqual(vad.audio_track([track(1,'AC-3','de'),track(2,'TrueHD')],1).id,2)
+    def test_selected_dialogue_wins_without_changing_anchor_language(self):
+        tracks = [track(1, 'AC-3', 'zh-CN'), track(2, 'TrueHD', default=True)]
+        self.assertEqual(vad.audio_track(tracks, 2).id, 2)
+        self.assertEqual(vad.subtitle_anchor_language(tracks, 2), 'en')
 
-    def test_non_english_cost_order_stays_same_language(self):
-        ts=[track(1,'TrueHD','de'),track(2,'AC-3','ja'),track(3,'DTS-HD MA','de'),track(4,'DTS','de'),track(5,'AC-3','de')]
-        self.assertEqual(vad.audio_track(ts,1).id,5)
-        self.assertEqual(vad.audio_track(ts[:-1],1).id,4)
-        self.assertEqual(vad.audio_track(ts[:3],1).id,3)
+    def test_selected_multilingual_audio_precedes_decoder_cost(self):
+        ts=[track(1,'TrueHD','de'),track(3,'DTS-HD MA','en'),track(4,'DTS','fr'),track(5,'AC-3','ja')]
+        self.assertEqual(vad.audio_track(ts,1).id,1)
+        self.assertEqual(vad.audio_track(ts[:-1],1).id,1)
+        self.assertEqual(vad.audio_track(ts[:2],1).id,1)
+
+    def test_english_reference_prefers_cheaper_decoder(self):
+        tracks = [track(1, 'TrueHD', default=True), track(2, 'DTS-HD MA'), track(3, 'AAC')]
+        self.assertEqual(vad.audio_track(tracks, 1).id, 3)
+        self.assertEqual(vad.subtitle_anchor_language(tracks, 1), 'en')
 
     def test_commentary_description_partial_and_score_excluded(self):
-        for name in ('Director commentary','Audio Description','partial dialogue','isolated score'):
+        for name in ('Director commentary','Audio Description','partial dialogue','isolated score',
+                     '评论音轨', '口述影像', 'Music only', 'sample only'):
             self.assertEqual(vad.audio_track([track(1,'TrueHD'),track(2,'AC-3',name=name)],1).id,1)
 
-    def test_unknown_language_does_not_justify_switch(self):
-        self.assertEqual(vad.audio_track([track(1,'TrueHD','und'),track(2,'AC-3','und')],1).id,1)
+    def test_only_commentary_cannot_be_used_as_dialogue(self):
+        with self.assertRaisesRegex(RuntimeError, '正常对白'):
+            vad.audio_track([track(1, 'AC-3', name='commentary')])
+
+    def test_unknown_language_group_still_uses_cheaper_decoder(self):
+        self.assertEqual(vad.audio_track([track(1,'TrueHD','und'),track(2,'AC-3','und')],1).id,2)
+
+    def test_anchor_language_keeps_selected_or_default_and_ignores_english_commentary(self):
+        tracks = [track(1, 'TrueHD', 'ja', default=True), track(2, 'AC-3', 'de'),
+                  track(3, 'AAC', name='commentary')]
+        self.assertEqual(vad.audio_track(tracks, 1).id, 1)
+        self.assertEqual(vad.subtitle_anchor_language(tracks, 1), 'ja')
+        self.assertEqual(vad.subtitle_anchor_language(tracks, 2), 'de')
+        self.assertEqual(vad.subtitle_anchor_language(tracks), 'ja')
 
     def test_aliases_and_dca_are_recognized(self):
         self.assertTrue(vad.is_dts_codec('dca'))
@@ -187,7 +207,8 @@ class DecodeTests(unittest.TestCase):
         with patch.object(core,'inspect_media',return_value={}),patch.object(vad,'cache_directory',return_value=self.cache):
             with concurrent.futures.ThreadPoolExecutor(2) as pool:
                 results=list(pool.map(lambda _:vad.shared_audio(str(self.movie),2,self.logs.append),range(2)))
-        self.assertEqual(len(self.calls),2)
+        self.assertEqual(len(self.calls),2)  # one DTS decoder plus one VAD; shared by both requests
+        self.assertEqual([result.validation_audio_id for result in results], [2, 2])
         self.assertEqual(results[0].vad_reference,results[1].vad_reference)
 
 

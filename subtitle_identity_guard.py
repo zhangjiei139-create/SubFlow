@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
+from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 
@@ -65,9 +68,177 @@ def release_tags(value: str) -> set[str]:
     return set(re.findall(r"[A-Z0-9]+", normalized))
 
 
-def source_conflict(video_path: str, candidate_text: str) -> str:
-    input_sources = release_tags(Path(video_path).stem) & SOURCE_TAGS
-    candidate_sources = release_tags(candidate_text) & SOURCE_TAGS
+_IDENTITY_YEAR = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+_IDENTITY_TECH = re.compile(
+    r"(?<![^\W_])(?:4K|UHD|2160p|1080p|720p|Blu[- .]?Ray|WEB[- .]?DL|WEBRip|BDRip|HDR|DV|"
+    r"x26[45]|H\.?26[45]|REMUX|AAC|DDP?\d?(?:\.\d)?|Atmos)(?![^\W_])", re.I)
+_IDENTITY_SUFFIXES = {'.mkv', '.mp4', '.m4v', '.avi', '.mov', '.ts', '.m2ts',
+                      '.webm', '.wmv', '.srt', '.ass', '.ssa', '.vtt', '.sub', '.txt'}
+
+
+@dataclass(frozen=True)
+class ParsedMediaIdentity:
+    title: str
+    year: str = ''
+    year_confidence: str = 'unknown'
+    year_source: str = ''
+    title_protected: bool = False
+    raw_title: str = ''
+    metadata_years: tuple[str, ...] = ()
+
+
+def _identity_title(value: str) -> str:
+    value = re.sub(r"[._]+", " ", value)
+    value = re.sub(r"\[[^\]]*\]|【[^】]*】|\([^)]*(?:www\.|@)[^)]*\)", " ", value, flags=re.I)
+    return re.sub(r"\s+", " ", value).strip(" -._([{<").rstrip(" ")
+
+
+def _identity_words(value: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[^\W_]+", unicodedata.normalize('NFKC', value).casefold()))
+
+
+def parse_media_identity(value: str, *, kind: str = 'auto', known_titles=(),
+                         declared_year: str = '') -> ParsedMediaIdentity:
+    """Split title and release metadata without turning title digits into years.
+
+    Bare text is a title proposal. A filename/release needs contextual release
+    syntax or an exact known title prefix before a trailing year is evidence.
+    Unknown year is never identity agreement. Caller-supplied catalogue titles
+    are whole titles and retain their digits; no movie-specific whitelist.
+    """
+    if kind not in {'auto', 'filename', 'title', 'container', 'release'}:
+        raise ValueError('Unsupported identity text kind')
+    raw = unicodedata.normalize('NFKC', str(value or '')).strip()
+    if kind == 'filename' or (kind == 'auto' and Path(raw).suffix.lower() in _IDENTITY_SUFFIXES):
+        raw = Path(raw).name
+    suffix = Path(raw).suffix.lower()
+    has_suffix = suffix in _IDENTITY_SUFFIXES
+    if has_suffix:
+        raw = raw[:-len(suffix)]
+    effective_kind = ('filename' if has_suffix else 'title') if kind == 'auto' else kind
+    technical = _IDENTITY_TECH.search(raw)
+    content = raw[:technical.start()].strip() if technical else raw
+    raw_title = _identity_title(content)
+    declared = str(declared_year or '').strip()
+    declared = declared if _IDENTITY_YEAR.fullmatch(declared) else ''
+
+    # A complete known title is protected before considering any number inside
+    # it. Prefix removal is anchored and whole-token, never global digit removal.
+    for expected in sorted(set(str(item) for item in known_titles if item), key=len, reverse=True):
+        tokens = re.findall(r"[^\W_]+", unicodedata.normalize('NFKC', expected))
+        if not tokens:
+            continue
+        pattern = r"^[\W_]*" + r"[\W_]+".join(re.escape(token) for token in tokens) + r"(?![^\W_])"
+        match = re.match(pattern, content, flags=re.I)
+        if not match:
+            continue
+        remainder = content[match.end():]
+        rest_words = re.findall(r"[^\W_]+", remainder)
+        if rest_words and not _IDENTITY_YEAR.fullmatch(rest_words[0]):
+            # A truncated filename can be completed by a longer real title;
+            # Freakier -> Freakier Friday must not consume Friday as metadata.
+            continue
+        years = list(_IDENTITY_YEAR.finditer(remainder))
+        metadata_years = tuple(item.group(1) for item in _IDENTITY_YEAR.finditer(raw[match.end():]))
+        year = years[-1].group(1) if years else declared
+        source = 'release-after-title' if years else ('provider' if declared else '')
+        if not year and effective_kind == 'release' and metadata_years:
+            year, source = metadata_years[0], 'release-after-technical'
+        return ParsedMediaIdentity(_identity_title(expected), year,
+            ('inferred' if source == 'release-after-technical' else 'explicit') if year else 'unknown',
+            source, True, raw_title, metadata_years)
+
+    years = list(_IDENTITY_YEAR.finditer(content))
+    for match in reversed(years):
+        prefix = content[:match.start()].strip(" -._([{<")
+        # Pure numeric titles and leading numbers in 2001: A Space Odyssey
+        # cannot supply their own release year.
+        if not _identity_words(prefix):
+            continue
+        before, after = content[:match.start()], content[match.end():]
+        wrapped = bool(re.search(r"[\[(]\s*$", before) and re.match(r"\s*[)\]]", after))
+        filename_separator = bool(effective_kind == 'filename' and re.search(r"[._]\s*$", before))
+        dated_release = bool(technical or filename_separator or wrapped or effective_kind in {'container', 'release'})
+        # Undecorated container/catalogue text remains a complete title. A
+        # plain trailing number alone is not enough to change its identity.
+        if not dated_release:
+            continue
+        if not wrapped and int(match.group(1)) > date.today().year + 1:
+            # A future-looking number without independent release evidence is
+            # part of the unresolved title, never a guessed publication date.
+            continue
+        return ParsedMediaIdentity(_identity_title(prefix), match.group(1),
+            'explicit' if wrapped else 'inferred',
+            'bracketed' if wrapped else 'release-syntax', False, raw_title,
+            tuple(item.group(1) for item in _IDENTITY_YEAR.finditer(raw[match.start():])))
+    if effective_kind == 'release':
+        # A source/resolution tag terminates the title, not all meaningful
+        # release metadata. Preserve later years for the conservative conflict
+        # gate; an uploader's provider year must not hide Fury.BluRay.2019.
+        metadata_years = tuple(match.group(1) for match in _IDENTITY_YEAR.finditer(raw)
+            if _identity_words(raw[:match.start()].strip(" -._([{<")))
+        if metadata_years:
+            return ParsedMediaIdentity(raw_title, metadata_years[0], 'inferred',
+                                       'release-after-technical', False, raw_title, metadata_years)
+    return ParsedMediaIdentity(raw_title, declared, 'explicit' if declared else 'unknown',
+                               'provider' if declared else '', False, raw_title)
+
+
+def clean_video_title(path: str) -> tuple[str, str]:
+    """Compatibility tuple for both providers; unknown is not an invented year."""
+    parsed = parse_media_identity(path)
+    return parsed.title, parsed.year
+
+
+def parse_filename_and_container(video_path: str, embedded_title: str):
+    """Reconcile only an exact intact title; never assume unknown == verified."""
+    filename = parse_media_identity(video_path, kind='filename')
+    internal = parse_media_identity(embedded_title, kind='title')
+    if (_identity_words(filename.raw_title) == _identity_words(internal.title)
+            and _identity_words(filename.title) != _identity_words(internal.title)):
+        filename = parse_media_identity(video_path, kind='filename', known_titles=(internal.title,))
+    internal = parse_media_identity(embedded_title, kind='container', known_titles=(filename.title,))
+    return filename, internal
+
+
+def catalogue_title_aliases(title, year):
+    normalize = lambda value: " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+    names = {
+        '2004': ('Alien vs Predator', 'AVP: Alien vs Predator'),
+        '2007': ('Aliens vs Predator Requiem', 'AVPR: Aliens vs Predator Requiem',
+                 'AVP R: Aliens vs Predator Requiem'),
+    }.get(str(year), ())
+    return names if normalize(title) in {normalize(name) for name in names} else ()
+
+
+def controlled_film_title_alias(left, right, year):
+    """Two known AVP catalogue spellings, gated by installment year elsewhere."""
+    normalize = lambda value: " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
+    words = {normalize(left), normalize(right)}
+    return len(words) == 2 and words.issubset({normalize(name) for name in catalogue_title_aliases(left, year)})
+
+
+def release_metadata(value: str, titles: tuple[str, ...]) -> str:
+    """Remove one known film-title prefix while preserving trailing labels.
+
+    Parse release and file_name separately. Removing title words everywhere
+    would also hide a real trailing CAM/Forced label on a film of that name.
+    """
+    for title in sorted(set(titles), key=len, reverse=True):
+        tokens = re.findall(r"[^\W_]+", title, flags=re.UNICODE)
+        if not tokens:
+            continue
+        pattern = r"^[\W_]*" + r"[\W_]+".join(re.escape(token) for token in tokens) + r"(?![^\W_])"
+        match = re.match(pattern, value, flags=re.I)
+        if match:
+            return value[match.end():]
+    return value
+
+
+def source_conflict(video_path: str, candidate_text: str, *, titles: tuple[str, ...] = ()) -> str:
+    title, _year = clean_video_title(video_path)
+    input_sources = release_tags(release_metadata(Path(video_path).stem, (title,))) & SOURCE_TAGS
+    candidate_sources = release_tags(release_metadata(candidate_text, (title, *titles))) & SOURCE_TAGS
     if input_sources & DISC_SOURCES and candidate_sources & THEATRICAL_SOURCES:
         return "蓝光/REMUX 影片禁止使用 HDTS/TS/CAM/TC 等影院片源字幕"
     return ""
@@ -168,15 +339,14 @@ def release_year_conflict(
     exact_hash: bool = False,
 ) -> str:
     """Reject a different movie year before any expensive subtitle validation."""
-    video_years = re.findall(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", Path(video_path).stem)
-    if not video_years:
+    local = parse_media_identity(video_path, kind='filename')
+    if not local.year:
         return ""
-    # A title may itself contain a year (for example "The Legend of 1900").
-    # The release year is normally the last year token in the filename.
-    expected = int(video_years[-1])
+    expected = int(local.year)
     # A year written in the release/file name is direct evidence. Provider
     # metadata (and even a hash label) must not cancel an explicit conflict.
-    release_years = re.findall(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", candidate_text)
+    candidate = parse_media_identity(candidate_text, kind='release', known_titles=(local.title,))
+    release_years = list(candidate.metadata_years) or ([candidate.year] if candidate.year else [])
     release_conflicts = sorted({int(value) for value in release_years if abs(int(value) - expected) >= 2})
     release_matches = {int(value) for value in release_years if abs(int(value) - expected) <= 1}
     if release_conflicts and not release_matches:
@@ -193,12 +363,11 @@ def filename_container_identity_conflict(video_path: str) -> str:
     embedded = container_title(video_path)
     if not embedded:
         return ""
-    filename_years = re.findall(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", Path(video_path).stem)
-    embedded_years = re.findall(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", embedded)
-    if not filename_years or not embedded_years:
+    filename, internal = parse_filename_and_container(video_path, embedded)
+    if not filename.year or not internal.year:
         return ""
-    filename_year = int(filename_years[-1])
-    embedded_year = int(embedded_years[-1])
+    filename_year = int(filename.year)
+    embedded_year = int(internal.year)
     if abs(filename_year - embedded_year) < 2:
         return ""
     # Suggest a legal filename without treating metadata as verified content.
@@ -279,6 +448,12 @@ def container_title_can_replace_filename(filename_title: str, embedded_title: st
     )
 
 
+def media_signature(video_path: str) -> dict[str, int]:
+    """Identify the current local media revision without probing its tracks."""
+    stat = Path(video_path).stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
 def verification_seal(
     video_path: str,
     subtitle_path: str,
@@ -293,6 +468,7 @@ def verification_seal(
     subtitle = Path(subtitle_path)
     payload = {
         "video": str(Path(video_path).resolve()).casefold(),
+        "media_signature": media_signature(video_path),
         "subtitle_sha256": hashlib.sha256(subtitle.read_bytes()).hexdigest(),
         "provider": provider,
         "release": release,

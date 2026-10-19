@@ -1,0 +1,71 @@
+{
+  "fonts": [
+    {
+      "id": "lxgw",
+      "title": "霞鹜文楷 · 屏幕阅读版",
+      "file": "assets/subtitle-fonts/lxgw/LXGWWenKaiGBScreen.ttf",
+      "bytes": 26037854,
+      "sha256": "23ec023913e1851925eb94462c4b0ccd1d78bb89533745aaa8cc682ccd339dc0",
+      "source": "https://github.com/lxgw/LxgwWenKai-Screen",
+      "download": "https://github.com/lxgw/LxgwWenKai-Screen/releases/download/v1.522/LXGWWenKaiGBScreen.ttf",
+      "license": "SIL Open Font License 1.1",
+      "license_file": "assets/subtitle-fonts/lxgw/OFL.txt",
+      "additional_files": [],
+      "modified": false
+    },
+    {
+      "id": "chill",
+      "title": "寒蝉全圆体",
+      "file": "assets/subtitle-fonts/chill/ChillRoundF v3.0.ttf",
+      "bytes": 6168772,
+      "sha256": "7dae804b344f7bc1a1c8426b9515e9b54d7baac3e123263d0bae94d0a305a732",
+      "source": "https://github.com/Warren2060/ChillRound",
+      "download": "https://raw.githubusercontent.com/Warren2060/ChillRound/main/ChillRoundF%20v3.0.ttf",
+      "license": "SIL Open Font License 1.1",
+      "license_file": "assets/subtitle-fonts/chill/OFL.txt",
+      "additional_files": [],
+      "modified": false
+    },
+    {
+      "id": "ma",
+      "title": "Ma Shan Zheng · 毛笔楷体",
+      "file": "assets/subtitle-fonts/ma/MaShanZheng-Regular.ttf",
+      "bytes": 5857936,
+      "sha256": "6d2546bb189c732a8ca29af9e22457b152387d158aa459e4ac2ce1e51788b7fb",
+      "source": "https://github.com/googlefonts/mashanzheng",
+      "download": "https://raw.githubusercontent.com/google/fonts/main/ofl/mashanzheng/MaShanZheng-Regular.ttf",
+      "license": "SIL Open Font License 1.1",
+      "license_file": "assets/subtitle-fonts/ma/OFL.txt",
+      "additional_files": [],
+      "modified": false
+    },
+    {
+      "id": "rubik",
+      "title": "Rubik",
+      "file": "assets/subtitle-fonts/rubik/Rubik[wght].ttf",
+      "bytes": 359804,
+      "sha256": "1b3a7437ba2af80e465e773ed60c5036d1ba6ace492d89046dbcf18fb31e4e88",
+      "source": "https://github.com/google/fonts/tree/main/ofl/rubik",
+      "download": "https://raw.githubusercontent.com/google/fonts/main/ofl/rubik/Rubik%5Bwght%5D.ttf",
+      "license": "SIL Open Font License 1.1",
+      "license_file": "assets/subtitle-fonts/rubik/OFL.txt",
+      "additional_files": [],
+      "modified": false
+    },
+    {
+      "id": "bree",
+      "title": "Bree Serif",
+      "file": "assets/subtitle-fonts/bree/BreeSerif-Regular.ttf",
+      "bytes": 46572,
+      "sha256": "fd080582d70112ef479ba4ddd72407f9a4fcbcec4caa7d29de259b13eeb5f431",
+      "source": "https://github.com/google/fonts/tree/main/ofl/breeserif",
+      "download": "https://raw.githubusercontent.com/google/fonts/main/ofl/breeserif/BreeSerif-Regular.ttf",
+      "license": "SIL Open Font License 1.1",
+      "license_file": "assets/subtitle-fonts/bree/OFL.txt",
+      "additional_files": [
+        "assets/subtitle-fonts/bree/FONTLOG.txt"
+      ],
+      "modified": false
+    }
+  ]
+}

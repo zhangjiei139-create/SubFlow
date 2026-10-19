@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+import unicodedata
 from pathlib import Path
 
 
@@ -13,6 +14,38 @@ _PROPOSAL_LOCK = threading.RLock()
 _MODEL_PROPOSALS: dict[tuple[str, str, tuple[str, ...]], str] = {}
 _ROMAN_SEQUELS = {"I": "1", "II": "2", "III": "3", "IV": "4", "V": "5",
                   "VI": "6", "VII": "7", "VIII": "8", "IX": "9", "X": "10"}
+
+
+def _connector_title_words(title: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[A-Z0-9]+", unicodedata.normalize("NFKC", title).upper()))
+
+
+def controlled_connector_alias(left: str, right: str) -> bool:
+    """A full-title VS/X proposal, never sufficient by itself to identify a film.
+
+    Callers must also prove the exact year and one unique catalogue ID. The
+    substantial subtitle after the connector excludes bare franchise pairings.
+    """
+    a, b = _connector_title_words(left), _connector_title_words(right)
+    if len(a) != len(b) or len(a) < 5:
+        return False
+    differences = [(index, x, y) for index, (x, y) in enumerate(zip(a, b)) if x != y]
+    return bool(len(differences) == 1 and 0 < differences[0][0] < len(a) - 3
+                and set(differences[0][1:]) == {"VS", "X"})
+
+
+def connector_query_proposals(title: str) -> tuple[str, ...]:
+    """At most one bounded catalogue retry; no recursive alias expansion."""
+    words = _connector_title_words(title)
+    indexes = [index for index, word in enumerate(words) if word in {"VS", "X"}]
+    if len(indexes) != 1:
+        return ()
+    index = indexes[0]
+    if not (0 < index < len(words) - 3):
+        return ()
+    proposal = list(words)
+    proposal[index] = "X" if words[index] == "VS" else "VS"
+    return (" ".join(proposal),)
 
 
 def sequel_number(title: str) -> str:

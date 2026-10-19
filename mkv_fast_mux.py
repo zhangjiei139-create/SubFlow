@@ -1,4 +1,4 @@
-"""Conservative TrueHD Matroska passthrough policy and bounded header checks.
+"""Conservative, validated Matroska passthrough policy and bounded header checks.
 
 The experimental packetizer is global, so eligibility covers every retained
 track. Header inspection seeks directly to metadata; it never scans clusters.
@@ -21,7 +21,7 @@ class HeaderCheckError(ValueError):
 SEGMENT, CLUSTER, TRACKS = 0x18538067, 0x1F43B675, 0x1654AE6B
 CHAPTERS, ATTACHMENTS, SEEK_HEAD = 0x1043A770, 0x1941A469, 0x114D9B74
 LIMITS = {TRACKS: 1024 * 1024, CHAPTERS: 4 * 1024 * 1024,
-          ATTACHMENTS: 16 * 1024 * 1024, SEEK_HEAD: 64 * 1024}
+          ATTACHMENTS: 512 * 1024 * 1024, SEEK_HEAD: 64 * 1024}
 MASTER_IDS = {0x45B9, 0xB6, 0x80, 0x8F, 0x55B0, 0x55D0, 0x7670}
 UINT_IDS = {0x45BC, 0x45BD, 0x45DB, 0x45DD, 0x73C4, 0x91, 0x92, 0x98,
             0x4598, 0x46AE, 0xB0, 0xBA, 0x54B0, 0x54BA, 0x54B2, 0x54AA,
@@ -116,9 +116,45 @@ def _canonical(data: bytes, parent=0, depth=0):
     return tuple((eid, tuple(items)) for eid, items in sorted(values.items()))
 
 
+def _attachment_headers(handle,size):
+    """Hash attachment fields in 1MiB chunks; never allocate a whole font block."""
+    if size is None or size > LIMITS[ATTACHMENTS]: raise HeaderCheckError('附件超过安全检查范围')
+    end=handle.tell()+size; attachments=[]
+    while handle.tell()<end:
+        eid,length=_element(handle)
+        if length is None or handle.tell()+length>end: raise HeaderCheckError('附件长度无效')
+        stop=handle.tell()+length
+        if eid!=0x61A7:
+            handle.seek(stop); continue
+        fields=[]
+        if len(attachments)>=128: raise HeaderCheckError('附件数量超过安全范围')
+        while handle.tell()<stop:
+            child,length=_element(handle)
+            if length is None or handle.tell()+length>stop: raise HeaderCheckError('附件字段长度无效')
+            if child in {0xEC,0xBF}: handle.seek(length,1); continue
+            if len(fields)>=64: raise HeaderCheckError('附件字段数量超过安全范围')
+            h=hashlib.sha256()
+            if child==0x4660: # Equivalent old/new standardized font MIME labels.
+                if length>256: raise HeaderCheckError('附件MIME类型无效')
+                value=handle.read(length)
+                if len(value)!=length: raise HeaderCheckError('附件不完整')
+                value={b'application/x-truetype-font':b'font/ttf',b'application/vnd.ms-opentype':b'font/otf'}.get(value,value)
+                h.update(value)
+            else:
+                remaining=length
+                while remaining:
+                    data=handle.read(min(remaining,1024*1024))
+                    if not data: raise HeaderCheckError('附件不完整')
+                    h.update(data); remaining-=len(data)
+            fields.append((child,h.digest()))
+        attachments.append(tuple(sorted(fields)))
+    return tuple(attachments)
+
+
 def read_headers(path: str | Path) -> dict:
     """Read at most bounded metadata blocks, using SeekHead after first Cluster."""
     blocks, seeks = {}, {}
+    attachments=None
     with Path(path).open("rb") as handle:
         eid, size = _element(handle)
         if eid != 0x1A45DFA3:
@@ -141,6 +177,10 @@ def read_headers(path: str | Path) -> dict:
             if eid == CLUSTER:
                 break
             if eid in LIMITS:
+                if eid==ATTACHMENTS:
+                    if attachments is not None: raise HeaderCheckError('重复附件区块')
+                    attachments=_attachment_headers(handle,size)
+                    continue
                 data = _payload(handle, eid, size)
                 if eid == SEEK_HEAD:
                     for child, entry in _children(data):
@@ -160,12 +200,13 @@ def read_headers(path: str | Path) -> dict:
         if TRACKS not in blocks:
             raise HeaderCheckError("首个 Cluster 之前没有 Tracks")
         for target in (CHAPTERS, ATTACHMENTS):
-            if target in seeks and target not in blocks:
+            if target in seeks and target not in blocks and not (target==ATTACHMENTS and attachments is not None):
                 handle.seek(seeks[target])
                 eid, size = _element(handle)
                 if eid != target:
                     raise HeaderCheckError("元数据索引不一致")
-                blocks[eid] = _payload(handle, eid, size)
+                if eid==ATTACHMENTS: attachments=_attachment_headers(handle,size)
+                else: blocks[eid] = _payload(handle, eid, size)
     tracks = []
     for eid, entry in _children(blocks[TRACKS]):
         if eid != 0xAE:
@@ -186,6 +227,9 @@ def read_headers(path: str | Path) -> dict:
             "codec_delay": int.from_bytes(fields.get(0x56AA, b"\0"), "big"),
             "seek_preroll": int.from_bytes(fields.get(0x56BB, b"\0"), "big"),
             "max_addition_id": int.from_bytes(fields.get(0x55EE, b"\0"), "big"),
+            "timestamp_scale": fields.get(0x23314F, b""),
+            "timestamp_offset": int.from_bytes(fields.get(0x537F, b"\0"), "big", signed=True),
+            "content_encodings": fields.get(0x6D80, b""),
             "codec": fields.get(0x86, b"").decode("ascii", errors="replace"),
             "private": hashlib.sha256(fields.get(0x63A2, b"")).digest(),
             "mappings": tuple(mappings),
@@ -194,14 +238,8 @@ def read_headers(path: str | Path) -> dict:
         })
     chapters = blocks.get(CHAPTERS, b"")
     chapter_entries = _canonical(chapters)
-    attachments = []
-    for eid, entry in _children(blocks.get(ATTACHMENTS, b"")):
-        if eid == 0x61A7:
-            # All attachment fields including payload, filename, MIME and UID.
-            attachments.append(tuple(sorted((child, hashlib.sha256(data).digest())
-                                             for child, data in _children(entry))))
     return {"tracks": tracks, "chapters": chapter_entries,
-            "attachments": tuple(attachments)}
+            "attachments": attachments or ()}
 
 
 @lru_cache(maxsize=16)
@@ -221,6 +259,70 @@ class FastMuxPlan:
     reason: str
     headers: dict | None = None
     retained: tuple[dict, ...] = ()
+    audio_kind: str = "TrueHD"
+
+
+def _validated_dts_profile(tracks) -> bool:
+    """Only the single 5.1/48 kHz/24-bit MA profile covered by real-file tests."""
+    if len(tracks) != 1:
+        return False
+    track = tracks[0]
+    props = track.get("properties", {})
+    return (track.get("codec") == "DTS-HD Master Audio"
+            and not _explicit_dtsx(props.get("track_name", ""))
+            and props.get("codec_id") == "A_DTS"
+            and props.get("audio_sampling_frequency") == 48000
+            and props.get("audio_channels") == 6
+            and props.get("audio_bits_per_sample") == 24
+            and props.get("default_duration") == 10666667)
+
+
+def _explicit_dtsx(value) -> bool:
+    # A label can exclude a known untested variant; its absence is not proof
+    # of extension-layer identity. Do not advertise DTS:X as validated.
+    return bool(re.search(r"\bDTS[\s.:-]*X\b|\bXLL[\s.:-]+X\b", str(value), re.I))
+
+
+def _plain_pgs_zlib(data: bytes) -> bool:
+    """Allow only ordinary frame zlib compression, not encryption/header stripping."""
+    try:
+        entries = list(_children(data))
+        if len(entries) != 1 or entries[0][0] != 0x6240:
+            return False
+        pairs = list(_children(entries[0][1]))
+        fields = dict(pairs)
+        if len(fields) != len(pairs) or set(fields) - {0x5031, 0x5032, 0x5033, 0x5034}:
+            return False
+        if any(int.from_bytes(fields.get(eid, bytes([default])), "big") != default
+               for eid, default in ((0x5031, 0), (0x5032, 1), (0x5033, 0))):
+            return False
+        if 0x5034 not in fields:
+            return False
+        compression = list(_children(fields[0x5034]))
+        settings = dict(compression)
+        return (len(settings) == len(compression) and not set(settings) - {0x4254, 0x4255}
+                and int.from_bytes(settings.get(0x4254, b"\0"), "big") == 0
+                and not settings.get(0x4255, b""))
+    except (HeaderCheckError, ValueError):
+        return False
+
+
+def _dts_headers_supported(headers) -> bool:
+    # This extra gate is DTS-specific: the existing TrueHD eligibility is unchanged.
+    for h in headers:
+        if (h["timestamp_scale"] not in (b"", struct.pack(">f", 1.0), struct.pack(">d", 1.0))
+                or h["timestamp_offset"] != 0 or h["codec_delay"] or h["seek_preroll"]):
+            return False
+        if h["codec"] == "A_DTS" and (h["default_duration"] != 10666667 or
+                                      h["private"] != hashlib.sha256(b"").digest()):
+            return False
+        if h["content_encodings"] and not (
+                h["codec"] == "S_HDMV/PGS" and _plain_pgs_zlib(h["content_encodings"])):
+            return False
+        if h["max_addition_id"] and not (
+                h["codec"] == "V_MPEGH/ISO/HEVC" and h["max_addition_id"] == 1 and h["mappings"]):
+            return False
+    return True
 
 
 def assess(input_path, output_path, media, audio_ids, subtitle_ids, generated, tool,
@@ -231,9 +333,14 @@ def assess(input_path, output_path, media, audio_ids, subtitle_ids, generated, t
     tracks = (media or {}).get("tracks", [])
     selected_audio = [t for t in tracks if t.get("type") == "audio" and t.get("id") in audio_ids]
     if not selected_audio or len(selected_audio) != len(set(audio_ids)):
-        return no("没有可确认的 TrueHD 保留音轨")
-    if any(t.get("properties", {}).get("codec_id") != "A_TRUEHD" for t in selected_audio):
-        return no("保留了 DTS 或其他尚未覆盖的音轨编码")
+        return no("没有可确认的保留音轨")
+    truehd = all(t.get("properties", {}).get("codec_id") == "A_TRUEHD" for t in selected_audio)
+    dts = not truehd and _validated_dts_profile(selected_audio)
+    if dts and _explicit_dtsx(Path(input_path).stem):
+        return no("影片标记为尚未验证的 DTS:X，沿用原封装")
+    if not truehd and not dts:
+        return no("保留音轨不在已验证的 TrueHD 或单条 DTS-HD MA 5.1/48kHz/24bit 范围")
+    audio_kind = "DTS-HD MA" if dts else "TrueHD"
     videos = [t for t in tracks if t.get("type") == "video"]
     if len(videos) != 1 or videos[0].get("properties", {}).get("codec_id") != "V_MPEGH/ISO/HEVC":
         return no("视频结构超出已验证的单 HEVC 范围")
@@ -269,13 +376,16 @@ def assess(input_path, output_path, media, audio_ids, subtitle_ids, generated, t
                         config[3] & 7 == 5 and config[4] >> 4 == 1):
                     return no("杜比视界并非已验证的 DV8.1 单层结构")
             selected_headers.append(h)
+        if dts and not _dts_headers_supported(selected_headers):
+            return no("DTS 轨道的时间基准、延迟、压缩或附加数据结构超出已验证范围")
         if len(headers["attachments"]) != len((media or {}).get("attachments", [])):
             return no("附件头无法完整核对")
         chapter_count = sum(int(c.get("num_entries", 0)) for c in (media or {}).get("chapters", []))
         if chapter_count and not headers["chapters"]:
             return no("章节头无法完整核对")
         headers = {**headers, "tracks": selected_headers}
-        return FastMuxPlan(True, "TrueHD 单层 HEVC，PGS/SRT，已验证的 MKVToolNix 100.0", headers, retained)
+        return FastMuxPlan(True, f"{audio_kind} 单层 HEVC，PGS/SRT，已验证的 MKVToolNix 100.0",
+                           headers, retained, audio_kind)
     except (OSError, HeaderCheckError, ValueError, TypeError) as exc:
         return no(f"快速封装前置检查未通过：{exc}")
 
@@ -293,6 +403,8 @@ def verify(plan: FastMuxPlan, output_path, output_media, audio_defaults, subtitl
                 "codec", "private", "mappings", "video", "audio", "uid",
                 "default_duration", "codec_delay", "seek_preroll", "max_addition_id")):
             raise HeaderCheckError("快速封装编码私有数据、杜比视界或音视频头发生变化")
+    if plan.audio_kind == "DTS-HD MA" and not _dts_headers_supported(output_headers["tracks"]):
+        raise HeaderCheckError("快速封装后 DTS 时间基准、延迟、压缩或附加数据结构变化")
     if any(original[field] != output_headers[field] for field in ("chapters", "attachments")):
         raise HeaderCheckError("快速封装章节或附件发生变化")
     output_tracks = output_media["tracks"]

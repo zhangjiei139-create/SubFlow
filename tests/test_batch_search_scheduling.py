@@ -114,6 +114,8 @@ class BatchSearchSchedulingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
             self.pipeline_patches(stack, Service, prepare, verify)
             movies = [str(Path(folder) / f"{name}.mkv") for name in ("A", "B")]
+            for movie in movies:
+                Path(movie).write_bytes(b"fixture movie; decoder remains mocked")
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 first = pool.submit(smart.find_verified_english, movies[0], 0,
                                     lambda _message: None, candidate_acceptance=accept_first)

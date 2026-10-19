@@ -1,6 +1,9 @@
 import argparse
 import concurrent.futures
 import contextlib
+import contextvars
+import hashlib
+import http.client
 import importlib
 import json
 import locale
@@ -8,6 +11,7 @@ import os
 import re
 import subprocess
 import threading
+import tempfile
 import time
 import traceback
 import socket
@@ -15,7 +19,7 @@ import shutil
 import sys
 import urllib.request
 import urllib.error
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
@@ -43,9 +47,14 @@ _OLLAMA_LEASES = 0
 _OLLAMA_ACTIVE_REQUESTS = 0
 _OLLAMA_STOPPING = False
 _OLLAMA_SERVER_PROCESS: subprocess.Popen | None = None
+_OLLAMA_SERVER_HOST: str | None = None
+_OLLAMA_DIAGNOSTIC_LOCK = threading.Lock()
+_OLLAMA_DIAGNOSTIC_MAX_BYTES = 2 * 1024 * 1024
 OLLAMA_STREAM_IDLE_SECONDS = 60
 OLLAMA_REQUEST_MAX_SECONDS = 180
 OLLAMA_CONTEXT_SIZE = 4096
+_OLLAMA_BATCH_STREAM_RECOVERY = contextvars.ContextVar('ollama_batch_stream_recovery', default=False)
+_OLLAMA_SPLIT_BUDGET = contextvars.ContextVar('ollama_split_budget', default=None)
 TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 SECONV = "tools\\seconv\\seconv.exe"
 
@@ -98,6 +107,8 @@ LANGUAGES = {
     "ru": ("rus", "Russian", "俄语"),
     "hi": ("hin", "Hindi", "印地语"),
 }
+
+_NON_CJK_TRANSLATION_TARGETS = frozenset(LANGUAGES) - {"zh-CN", "zh-TW", "ja", "ko"}
 
 
 def app_base_dir() -> Path:
@@ -259,6 +270,10 @@ class Track:
     statistics_frame_count: int | None = None
     statistics_duration_seconds: float | None = None
     statistics_byte_count: int | None = None
+    commentary: bool = False
+    visual_impaired: bool = False
+    original: bool = False
+    channels: int | None = None
 
 
 @dataclass
@@ -385,12 +400,118 @@ def _mkvmerge_process_metrics(process, *, _kernel32=None) -> dict | None:
         return None
 
 
+_MKVMERGE_PROGRESS_INTERVAL_SECONDS = 5.0
+
+
+def _system_cpu_times(*, _kernel32=None) -> tuple[int, int] | None:
+    """Return cheap cumulative idle/total ticks; diagnostics never start a helper."""
+    try:
+        if _kernel32 is None and os.name != "nt":
+            return None
+        import ctypes
+
+        class FileTime(ctypes.Structure):
+            _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+        kernel32 = _kernel32 if _kernel32 is not None else ctypes.WinDLL("kernel32", use_last_error=True)
+        get_times = kernel32.GetSystemTimes
+        get_times.argtypes = [ctypes.POINTER(FileTime)] * 3
+        get_times.restype = ctypes.c_int
+        idle, kernel, user = (FileTime() for _ in range(3))
+        if not get_times(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        ticks = lambda value: (value.high << 32) | value.low
+        return ticks(idle), ticks(kernel) + ticks(user)
+    except Exception:
+        return None
+
+
+class _MkvmergeProgress:
+    """Read actual tool percentages without deriving progress from process I/O."""
+
+    _pattern = re.compile(rb"#GUI#progress\s+(\d{1,3})%")
+
+    def __init__(self, started: float, input_size: int):
+        self.started = started
+        self.input_size = input_size
+        self.next_report = started + _MKVMERGE_PROGRESS_INTERVAL_SECONDS
+        self._lock = threading.Lock()
+        self._tail = b""
+        self._latest: int | None = None
+        self._cpu_times = _system_cpu_times()
+
+    def feed(self, chunk: bytes) -> None:
+        with self._lock:
+            data = self._tail + chunk
+            for match in self._pattern.finditer(data):
+                percent = int(match[1])
+                if 0 <= percent <= 100 and (self._latest is None or percent > self._latest):
+                    self._latest = percent
+            # Keep only enough for a progress record split between pipe reads.
+            # CR-only output and unterminated diagnostics cannot grow this buffer.
+            self._tail = data[-256:]
+
+    def report(self, log: Callable[[str], None]) -> None:
+        now = time.monotonic()
+        if now < self.next_report:
+            return
+        self.next_report = now + _MKVMERGE_PROGRESS_INTERVAL_SECONDS
+        elapsed = max(0.001, now - self.started)
+        with self._lock:
+            percent = self._latest
+        progress = "等待工具报告百分比" if percent is None else f"进度 {percent}%"
+        message = f"mkvmerge 封装{progress}；已用 {elapsed:.1f} 秒"
+        if percent is not None and percent > 0 and self.input_size:
+            rate = self.input_size * percent / 100 / elapsed / (1024 ** 2)
+            message += f"；估算处理速率 {rate:.1f} MiB/s（按工具进度和主输入大小估算，非磁盘实测速率）"
+        cpu_times = _system_cpu_times()
+        if cpu_times is not None and self._cpu_times is not None:
+            idle = cpu_times[0] - self._cpu_times[0]
+            total = cpu_times[1] - self._cpu_times[1]
+            if total > 0 and 0 <= idle <= total:
+                busy = 100 * (1 - idle / total)
+                message += f"；系统 CPU {busy:.0f}%"
+                if busy >= 90:
+                    message += "（繁忙，可能拖慢封装）"
+        self._cpu_times = cpu_times
+        log(message + "。")
+
+
+class _MkvmergeProgressReader:
+    """Let Windows communicate() retain pipe ownership while observing chunks."""
+
+    def __init__(self, stream, progress: _MkvmergeProgress):
+        self._stream = stream
+        self._progress = progress
+
+    def read(self, size=-1):
+        if size >= 0:
+            data = self._stream.read(size)
+            self._progress.feed(data)
+            return data
+        chunks = []
+        # Popen's Windows reader normally calls read() once, blocking until EOF.
+        # read1() exposes each available chunk but keeps the same complete result
+        # and the same communicate()/tree-cancellation cleanup responsibility.
+        while True:
+            chunk = self._stream.read1(65536)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            self._progress.feed(chunk)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def run_command(
     args: list[str],
     log: Callable[[str], None] = log_noop,
     cancel_event: threading.Event | None = None,
     cwd: str | None = None,
     env: dict[str, str] | None = None,
+    *,
+    process_monitor=None,
 ) -> subprocess.CompletedProcess:
     command_started = time.monotonic()
     tool_name = Path(args[0]).name or args[0]
@@ -410,12 +531,33 @@ def run_command(
                 log(f"mkvmerge 封装开始：主输入文件 {mkvmerge_input_size / (1024 ** 3):.2f} GiB。")
         except OSError:
             mkvmerge_input_size = 0
+    is_mkvmerge_mux = tool_name.lower() == "mkvmerge.exe" and "-o" in args
+    command_args = list(args)
+    if is_mkvmerge_mux and "--gui-mode" not in command_args:
+        command_args.insert(1, "--gui-mode")
+    def monitor_call(method, *values):
+        try:
+            return getattr(process_monitor, method)(*values)
+        except Exception as exc:
+            # Observation and optional scheduling must not replace a tool's
+            # real success, failure or cancellation with a diagnostic error.
+            try:
+                log(f"音频准备调度观测失败（{method}）：{type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+            return None
+
+    creation_flags = EXTERNAL_PROCESS_CREATION_FLAGS
+    if process_monitor is not None:
+        observed_flags = monitor_call("creation_flags", creation_flags)
+        if isinstance(observed_flags, int) and not isinstance(observed_flags, bool):
+            creation_flags = observed_flags
     try:
         process = subprocess.Popen(
-            args,
+            command_args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            creationflags=EXTERNAL_PROCESS_CREATION_FLAGS,
+            creationflags=creation_flags,
             cwd=cwd,
             env=env,
         )
@@ -423,28 +565,47 @@ def run_command(
         raise RuntimeError(
             f"找不到外部工具：{args[0]}。请安装 MKVToolNix/FFmpeg，或在 product_config.json 里配置正确路径。"
         ) from exc
-    while True:
-        if cancel_event is not None and cancel_event.is_set():
-            log("正在终止当前外部处理进程...")
-            terminate_process_tree(process)
-            # Reap redirected pipes after killing the tree, before callers
-            # attempt to remove files opened by the external tools.
+    if process_monitor is not None:
+        monitor_call("started", process)
+    mux_progress = _MkvmergeProgress(command_started, mkvmerge_input_size) if is_mkvmerge_mux else None
+    if mux_progress is not None and os.name == "nt" and getattr(process, "stdout", None) is not None:
+        process.stdout = _MkvmergeProgressReader(process.stdout, mux_progress)
+    progress_output_seen = 0
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                log("正在终止当前外部处理进程...")
+                terminate_process_tree(process)
+                # Reap redirected pipes after killing the tree, before callers
+                # attempt to remove files opened by the external tools.
+                try:
+                    process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    # Reader threads can still own these streams if a descendant
+                    # failed to exit. Closing a busy BufferedReader could block.
+                    log("外部进程输出尚未关闭，保留原停止原因并交由临时文件重试清理。")
+                else:
+                    for stream in (process.stdout, process.stderr):
+                        if stream is not None:
+                            stream.close()
+                raise CancelledError("用户已停止处理。")
+            if process_monitor is not None:
+                monitor_call("poll", process)
             try:
-                process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                # Reader threads can still own these streams if a descendant
-                # failed to exit. Closing a busy BufferedReader could block.
-                log("外部进程输出尚未关闭，保留原停止原因并交由临时文件重试清理。")
-            else:
-                for stream in (process.stdout, process.stderr):
-                    if stream is not None:
-                        stream.close()
-            raise CancelledError("用户已停止处理。")
-        try:
-            stdout, stderr = process.communicate(timeout=0.2)
-            break
-        except subprocess.TimeoutExpired:
-            continue
+                stdout, stderr = process.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired as exc:
+                if mux_progress is not None:
+                    # POSIX communicate() uses select/os.read instead of the Windows
+                    # reader. TimeoutExpired exposes its accumulated stdout there.
+                    if isinstance(exc.output, bytes):
+                        mux_progress.feed(exc.output[progress_output_seen:])
+                        progress_output_seen = len(exc.output)
+                    mux_progress.report(log)
+                continue
+    finally:
+        if process_monitor is not None:
+            monitor_call("finished", process)
     completed = subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
     stdout_text = decode_external_output(completed.stdout)
     stderr_text = decode_external_output(completed.stderr)
@@ -453,7 +614,7 @@ def run_command(
         warning_lines = [
             line.strip()
             for line in details.splitlines()
-            if line.strip().lower().startswith(("warning", "警告"))
+            if line.strip().lower().startswith(("warning", "警告", "#gui#warning"))
         ]
         if warning_lines:
             first_warning = warning_lines[0]
@@ -599,45 +760,139 @@ def ollama_runtime_dir() -> Path:
     return base
 
 
+def _write_ollama_diagnostic(message: str, path: Path | None = None) -> None:
+    """Keep two bounded local logs, opening files only while holding our lock."""
+    try:
+        path = path or ollama_runtime_dir() / "logs" / "ollama-engine.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = (time.strftime("%Y-%m-%d %H:%M:%S ") + message[:8192] + "\n").encode("utf-8")
+        with _OLLAMA_DIAGNOSTIC_LOCK:
+            if path.exists() and path.stat().st_size + len(payload) > _OLLAMA_DIAGNOSTIC_MAX_BYTES:
+                path.replace(path.with_name("ollama-engine.previous.log"))
+            with path.open("ab") as stream:
+                stream.write(payload)
+    except OSError:
+        # A full/locked log directory must never block draining the engine pipe.
+        pass
+
+
+def _safe_ollama_diagnostic_line(line: str) -> str | None:
+    """Retain engine diagnostics, never request bodies or generated dialogue."""
+    line = line.strip()
+    if not line:
+        return None
+    if re.search(r'["\']?(?:prompt|messages|content|response|thinking)["\']?\s*[:=]', line, re.I):
+        return "engine entry omitted: request/response field"
+    # Ollama/llama.cpp operational prefixes and fatal messages. Discard arbitrary
+    # continuations, which could otherwise include a multi-line request body.
+    if re.match(
+        r"^(?:time=|\[GIN\]|llama[_ :]|ggml[_ :]|gguf[_ :]|llm[_ :]|load[_ :]|"
+        r"CUDA\b|HIP\b|Vulkan\b|GGML\b|fatal\b|panic\b|error\b|warning\b|"
+        r"runtime:|signal\b|Exception\b|Traceback\b|goroutine\b|out of memory\b)",
+        line, re.I,
+    ):
+        return line
+    return None
+
+
+def _capture_ollama_diagnostics(process: subprocess.Popen, path: Path) -> None:
+    """Continuously drain the owned engine; cap each input line and close the pipe."""
+    stream = process.stdout
+    if stream is None:
+        return
+    discarding_long_line = False
+    try:
+        with stream:
+            while True:
+                raw = stream.readline(8193)
+                if not raw:
+                    break
+                complete = raw.endswith(b"\n")
+                if discarding_long_line or (len(raw) > 8192 and not complete):
+                    discarding_long_line = not complete
+                    continue
+                line = _safe_ollama_diagnostic_line(raw.decode("utf-8", errors="replace"))
+                if line:
+                    _write_ollama_diagnostic(f"engine pid={process.pid}: {line}", path)
+    except (OSError, ValueError) as exc:
+        _write_ollama_diagnostic(f"engine pid={process.pid}: capture ended ({type(exc).__name__})", path)
+    finally:
+        try:
+            returncode = process.wait()
+            _write_ollama_diagnostic(f"engine pid={process.pid}: exit_code={returncode}", path)
+        except OSError:
+            pass
+
+
 def ensure_ollama_running(
     log: Callable[[str], None] = log_noop,
     cancel_event: threading.Event | None = None,
     host: str = OLLAMA_HOST,
     wait_seconds: int = 25,
 ) -> None:
-    global _OLLAMA_SERVER_PROCESS
+    global _OLLAMA_SERVER_PROCESS, _OLLAMA_SERVER_HOST
     with _OLLAMA_START_LOCK:
+        check_cancel(cancel_event)
         if ollama_available(host):
             return
         if not Path(OLLAMA_EXE).exists():
             raise RuntimeError("未找到 Ollama。需要翻译字幕时，请先安装 Ollama 或关闭目标语言勾选。")
 
-        log("本地翻译引擎未运行，正在启动 Ollama...")
-        process = subprocess.Popen(
-            [OLLAMA_EXE, "serve"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=PROCESS_CREATION_FLAGS,
-            cwd=str(ollama_runtime_dir()),
-            env=ai_runtime.ollama_environment(),
-        )
         with _OLLAMA_STATE_CHANGED:
-            _OLLAMA_SERVER_PROCESS = process
+            process = _OLLAMA_SERVER_PROCESS
+        created = process is None or process.poll() is not None
+        if created:
+            log("本地翻译引擎未运行，正在启动 Ollama...")
+            runtime_dir = ollama_runtime_dir()
+            diagnostic_path = runtime_dir / "logs" / "ollama-engine.log"
+            environment = ai_runtime.ollama_environment()
+            environment["OLLAMA_DEBUG"] = "false"
+            process = subprocess.Popen(
+                [OLLAMA_EXE, "serve"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=PROCESS_CREATION_FLAGS,
+                cwd=str(runtime_dir),
+                env=environment,
+            )
+            with _OLLAMA_STATE_CHANGED:
+                _OLLAMA_SERVER_PROCESS = process
+                _OLLAMA_SERVER_HOST = host.rstrip("/")
+            _write_ollama_diagnostic(f"engine pid={process.pid}: started", diagnostic_path)
+            threading.Thread(
+                target=_capture_ollama_diagnostics, args=(process, diagnostic_path),
+                name="subflow-ollama-diagnostics", daemon=True,
+            ).start()
+            log(f"本地翻译引擎诊断日志：{diagnostic_path}")
 
-        started = time.time()
-        while time.time() - started < wait_seconds:
-            check_cancel(cancel_event)
-            if ollama_available(host):
-                log("Ollama 已启动。")
-                return
-            if process.poll() is not None:
-                break
-            time.sleep(0.5)
-
-        terminate_process_tree(process)
-        with _OLLAMA_STATE_CHANGED:
-            if _OLLAMA_SERVER_PROCESS is process:
-                _OLLAMA_SERVER_PROCESS = None
+        try:
+            started = time.monotonic()
+            while time.monotonic() - started < wait_seconds:
+                check_cancel(cancel_event)
+                if ollama_available(host):
+                    log("Ollama 已启动。")
+                    return
+                if process.poll() is not None:
+                    break
+                if cancel_event is not None:
+                    cancel_event.wait(0.5)
+                else:
+                    time.sleep(0.5)
+        except BaseException:
+            if created:
+                terminate_process_tree(process)
+                with _OLLAMA_STATE_CHANGED:
+                    if _OLLAMA_SERVER_PROCESS is process:
+                        _OLLAMA_SERVER_PROCESS = None
+                        _OLLAMA_SERVER_HOST = None
+            raise
+        # Never stop an already running engine that another request may use.
+        if created:
+            terminate_process_tree(process)
+            with _OLLAMA_STATE_CHANGED:
+                if _OLLAMA_SERVER_PROCESS is process:
+                    _OLLAMA_SERVER_PROCESS = None
+                    _OLLAMA_SERVER_HOST = None
     raise RuntimeError("Ollama 启动超时。请手动打开 Ollama 后重试，或取消目标语言勾选。")
 
 
@@ -662,22 +917,29 @@ def ollama_request_scope(cancel_event: threading.Event | None = None):
     global _OLLAMA_ACTIVE_REQUESTS
     while not _OLLAMA_INFERENCE_GATE.acquire(timeout=0.25):
         check_cancel(cancel_event)
+        if _OLLAMA_SPLIT_BUDGET.get() is not None:
+            _OLLAMA_SPLIT_BUDGET.get().check(cancel_event)
+    registered = False
     try:
         with _OLLAMA_STATE_CHANGED:
             while _OLLAMA_STOPPING:
                 check_cancel(cancel_event)
+                if _OLLAMA_SPLIT_BUDGET.get() is not None:
+                    _OLLAMA_SPLIT_BUDGET.get().check(cancel_event)
                 _OLLAMA_STATE_CHANGED.wait(timeout=0.2)
             _OLLAMA_ACTIVE_REQUESTS += 1
+            registered = True
         yield
     finally:
         with _OLLAMA_STATE_CHANGED:
-            _OLLAMA_ACTIVE_REQUESTS = max(0, _OLLAMA_ACTIVE_REQUESTS - 1)
+            if registered:
+                _OLLAMA_ACTIVE_REQUESTS = max(0, _OLLAMA_ACTIVE_REQUESTS - 1)
             _OLLAMA_STATE_CHANGED.notify_all()
         _OLLAMA_INFERENCE_GATE.release()
 
 
 def _terminate_owned_ollama_server(log: Callable[[str], None]) -> bool:
-    global _OLLAMA_SERVER_PROCESS
+    global _OLLAMA_SERVER_PROCESS, _OLLAMA_SERVER_HOST
     with _OLLAMA_STATE_CHANGED:
         process = _OLLAMA_SERVER_PROCESS
     if process is None or process.poll() is not None:
@@ -686,6 +948,7 @@ def _terminate_owned_ollama_server(log: Callable[[str], None]) -> bool:
     with _OLLAMA_STATE_CHANGED:
         if _OLLAMA_SERVER_PROCESS is process:
             _OLLAMA_SERVER_PROCESS = None
+            _OLLAMA_SERVER_HOST = None
     log("本地翻译引擎未能正常释放，已安全结束本次自启动引擎；下次任务将自动重启。")
     return True
 
@@ -861,6 +1124,10 @@ def tracks_from_media(data: dict) -> list[Track]:
                 statistics_frame_count=_optional_nonnegative_int(props.get("tag_number_of_frames")),
                 statistics_duration_seconds=_tag_duration_seconds(props.get("tag_duration")),
                 statistics_byte_count=_optional_nonnegative_int(props.get("tag_number_of_bytes")),
+                commentary=props.get("flag_commentary") is True,
+                visual_impaired=props.get("flag_visual_impaired") is True,
+                original=props.get("flag_original") is True,
+                channels=_optional_nonnegative_int(props.get("audio_channels")),
             )
         )
     return tracks
@@ -974,6 +1241,14 @@ def parse_srt(path: Path) -> list[SubtitleEvent]:
 def parse_vtt(path: Path) -> list[SubtitleEvent]:
     text = read_text(path).replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"^\s*WEBVTT[^\n]*\n", "", text, flags=re.I)
+    # WebVTT allows mm:ss.mmm as well as hh:mm:ss.mmm. Normalize only
+    # timing lines; numbers in dialogue and cue identifiers are untouched.
+    text = re.sub(
+        r"^(\s*)((?:\d+:)?\d{2}:\d{2}\.\d{3})(\s*-->\s*)((?:\d+:)?\d{2}:\d{2}\.\d{3})",
+        lambda m: m[1] + ("00:" if m[2].count(":") == 1 else "") + m[2]
+        + m[3] + ("00:" if m[4].count(":") == 1 else "") + m[4],
+        text, flags=re.M,
+    )
     return parse_srt_from_text(text)
 
 
@@ -1049,6 +1324,96 @@ def write_srt(path: Path, events: list[SubtitleEvent], translations: dict[int, s
     path.write_text("\n".join(lines), encoding="utf-8-sig")
 
 
+_SUBTITLE_EXTRACTION_LOCKS: dict[str, threading.RLock] = {}
+_SUBTITLE_EXTRACTION_LOCKS_GUARD = threading.Lock()
+
+
+def _extraction_signature(video_path: str, track: Track) -> dict | None:
+    try:
+        source = Path(video_path).stat()
+    except OSError:
+        return None
+    return {"version": 1, "path": str(Path(video_path).resolve()),
+            "size": source.st_size, "mtime_ns": source.st_mtime_ns,
+            "track_id": track.id, "codec": track.codec, "language": track.language}
+
+
+def _extraction_files(path: Path, track: Track) -> list[Path]:
+    return [path, path.with_suffix(".idx")] if track.vobsub_subtitle else [path]
+
+
+def _extraction_hashes(paths: list[Path]) -> dict[str, str]:
+    hashes = {}
+    for path in paths:
+        if path.stat().st_size <= 0:
+            raise ValueError("empty extracted subtitle")
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        hashes[path.name] = digest.hexdigest()
+    return hashes
+
+
+def extract_subtitles(
+    video_path: str,
+    requests: list[tuple[Track, Path]],
+    log: Callable[[str], None],
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Extract a batch once; reuse only atomically completed, source-bound files."""
+    with _SUBTITLE_EXTRACTION_LOCKS_GUARD:
+        locks = [_SUBTITLE_EXTRACTION_LOCKS.setdefault(key, threading.RLock())
+                 for key in sorted({os.path.normcase(str(path.resolve())) for _, path in requests})]
+    with contextlib.ExitStack() as stack:
+        for lock in locks:
+            stack.enter_context(lock)
+        pending = []
+        for track, path in requests:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            signature = _extraction_signature(video_path, track)
+            marker = path.with_name(path.name + ".complete.json")
+            try:
+                receipt = json.loads(marker.read_text(encoding="utf-8"))
+                cached = (signature is not None and receipt["source"] == signature
+                          and receipt["files"] == _extraction_hashes(_extraction_files(path, track)))
+            except (OSError, ValueError, KeyError, TypeError):
+                cached = False
+            if cached:
+                log(f"复用已完成抽取的字幕：{path}")
+                continue
+            # A cancellation or crash can leave a nonempty file. It is never
+            # a cache hit without the completion receipt and matching hashes.
+            marker.unlink(missing_ok=True)
+            temporary_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(
+                prefix=".subtitle-extract-", dir=path.parent)))
+            pending.append((track, path, temporary_dir / path.name, marker, signature))
+        if not pending:
+            return
+        log(f"一次读取 {len(pending)} 条字幕轨，避免重复扫描影片。")
+        run_command([MKVEXTRACT, "tracks", video_path,
+                     *(f"{track.id}:{temporary}" for track, _, temporary, _, _ in pending)],
+                    log=log, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError("字幕抽取已取消。")
+        completed = []
+        for track, path, temporary, marker, signature in pending:
+            if signature != _extraction_signature(video_path, track):
+                raise RuntimeError("字幕抽取期间影片发生变化，请重新分析。")
+            try:
+                hashes = _extraction_hashes(_extraction_files(temporary, track))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(f"字幕轨 {track.id} 抽取完成后没有生成有效文件。") from exc
+            completed.append((track, path, temporary, marker, signature, hashes))
+        for track, path, temporary, marker, signature, hashes in completed:
+            for source, target in zip(_extraction_files(temporary, track), _extraction_files(path, track)):
+                source.replace(target)
+            receipt_path = temporary.parent / "complete.json"
+            receipt_path.write_text(json.dumps({"source": signature, "files": hashes}), encoding="utf-8")
+            receipt_path.replace(marker)
+
+
 def extract_subtitle(
     video_path: str,
     track: Track,
@@ -1058,17 +1423,7 @@ def extract_subtitle(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     subtitle_path = output_dir / f"track-{track.id}-{track.language}{subtitle_extension(track)}"
-    companion_idx = subtitle_path.with_suffix(".idx") if track.vobsub_subtitle else None
-    cached = subtitle_path.exists() and subtitle_path.stat().st_size > 0
-    if companion_idx is not None:
-        cached = cached and companion_idx.exists() and companion_idx.stat().st_size > 0
-    if cached:
-        log(f"复用已抽取字幕：{subtitle_path}")
-        return subtitle_path
-    log(f"抽取字幕轨 {track.id}：{track.language} {track.codec}")
-    run_command([MKVEXTRACT, "tracks", video_path, f"{track.id}:{subtitle_path}"], log=log, cancel_event=cancel_event)
-    if not subtitle_path.exists() or subtitle_path.stat().st_size <= 0:
-        raise RuntimeError(f"字幕轨 {track.id} 抽取完成后没有生成有效文件。")
+    extract_subtitles(video_path, [(track, subtitle_path)], log, cancel_event)
     return subtitle_path
 
 
@@ -1642,31 +1997,41 @@ def strip_thinking(text: str) -> str:
 
 
 def parse_numbered_response(response: str, expected: int) -> list[str] | None:
-    parsed: dict[int, str] = {}
-    for line in response.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        match = re.match(r"^\s*(\d+)\s*(?:[\.\)\]:：、）-]\s*)?(.*)$", line)
-        if match:
-            parsed[int(match.group(1))] = match.group(2).strip()
-    if len(parsed) == expected and all(index in parsed for index in range(1, expected + 1)):
-        return [parsed[index] for index in range(1, expected + 1)]
     compact = [line.strip() for line in response.splitlines() if line.strip()]
-    if len(compact) == expected:
-        return [re.sub(r"^\s*\d+\s*(?:[\.\)\]:：、）-]\s*)?", "", line).strip() for line in compact]
-    return None
+    if len(compact) != expected:
+        return None
+    matches = [re.match(r"^(\d+)\s*([.)\]:：、）-])\s*(.+)$", line) for line in compact]
+    # Decimal amounts (1.5元) cannot be distinguished from an unspaced list
+    # marker. Retry rather than silently dropping part of the dialogue.
+    if any(m and re.match(r"^\d+[.:：-]\d", line)
+           for line, m in zip(compact, matches)):
+        return None
+    if all(matches) and [int(m[1]) for m in matches] == list(range(1, expected + 1)):
+        return [m[3].strip() for m in matches]
+    if any(m and 1 <= int(m[1]) <= expected for m in matches):
+        return None  # Mixed or duplicated numbering needs a clean retry.
+    return compact
 
 
 @dataclass
 class TranslationMetrics:
-    """Per-target numeric diagnostics; never retains prompts or generated text."""
+    """Per-target diagnostics; never retains prompts or generated text."""
 
     requests: int = 0
     completed_requests: int = 0
     retries: int = 0
     batch_parse_failures: int = 0
     fallback_lines: int = 0
+    quality_repairs: int = 0
+    context_repairs: int = 0
+    request_wall_seconds: float = 0.0
+    successful_request_seconds: float = 0.0
+    failed_request_seconds: float = 0.0
+    cancelled_request_seconds: float = 0.0
+    failed_requests: int = 0
+    cancelled_requests: int = 0
+    retry_wait_seconds: float = 0.0
+    translation_wall_seconds: float | None = None
     total_duration_ns: float = 0.0
     load_duration_ns: float = 0.0
     prompt_eval_duration_ns: float = 0.0
@@ -1679,6 +2044,79 @@ class TranslationMetrics:
     eval_duration_samples: int = 0
     prompt_count_samples: int = 0
     eval_count_samples: int = 0
+    diagnostic_log: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
+    diagnostic_indices: tuple[int, ...] = field(default=(), repr=False, compare=False)
+    diagnostic_count: int = field(default=0, repr=False, compare=False)
+
+    def log_stream_split(self, target_code, error, count, cancel_event=None):
+        check_cancel(cancel_event)
+        if self.diagnostic_log is None or self.diagnostic_count >= 20:
+            return
+        self.diagnostic_count += 1
+        indices = self.diagnostic_indices
+        location = f'字幕第 {indices[0]}—{indices[-1]} 行' if indices else '字幕行范围未提供'
+        target = LANGUAGES.get(target_code, ('', '', target_code))[2]
+        capped = '；本轮详细异常日志已达20条' if self.diagnostic_count == 20 else ''
+        try:
+            self.diagnostic_log(f'翻译断流恢复：目标 {target}（{target_code}），{location}；'
+                f'{error.diagnostic()}；引擎服务正常，丢弃未完成响应；'
+                f'将本批{count}条拆成{count//2}+{count-count//2}条，已完成小段立即保存{capped}。')
+        except CancelledError:
+            raise
+        except Exception:
+            pass
+        check_cancel(cancel_event)
+
+    def log_batch_fallback(self, target_code: str, reason_code: str, reason: str,
+                           elapsed: float, line_count: int,
+                           cancel_event: threading.Event | None = None) -> None:
+        """Best-effort, bounded context for an existing recovery decision."""
+        check_cancel(cancel_event)
+        if self.diagnostic_log is None or self.diagnostic_count >= 20:
+            return
+        self.diagnostic_count += 1
+        indices = self.diagnostic_indices
+        location = (f"字幕第 {indices[0]}—{indices[-1]} 行" if indices else "字幕行范围未提供")
+        target = LANGUAGES.get(target_code, ("", "", target_code))[2]
+        # Only a bounded exception description is used, never the model response.
+        reason = " ".join(str(reason).split())[:240]
+        capped = "；本轮详细异常日志已达20条，后续仍按原策略处理并计入统计" if self.diagnostic_count == 20 else ""
+        message = (f"翻译异常：目标 {target}（{target_code}），{location}（本批{line_count}条）；"
+                   f"原因类型 {reason_code}；原因：{reason}；本批请求耗时 {max(0.0, elapsed):.2f} 秒；"
+                   f"恢复动作：改为逐条重译，本批{line_count}条{capped}。")
+        try:
+            self.diagnostic_log(message)
+        except CancelledError:
+            raise
+        except Exception:
+            pass  # Diagnostic I/O must not discard a recoverable translation.
+        check_cancel(cancel_event)
+
+    def record_request_time(self, elapsed: float, outcome: str) -> None:
+        elapsed = max(0.0, elapsed)
+        self.request_wall_seconds += elapsed
+        if outcome == "completed":
+            self.successful_request_seconds += elapsed
+        elif outcome == "cancelled":
+            self.cancelled_requests += 1
+            self.cancelled_request_seconds += elapsed
+        else:
+            self.failed_requests += 1
+            self.failed_request_seconds += elapsed
+
+    @contextlib.contextmanager
+    def measure_request(self, started: float):
+        outcome = "completed"
+        try:
+            yield
+        except CancelledError:
+            outcome = "cancelled"
+            raise
+        except BaseException:
+            outcome = "failed"
+            raise
+        finally:
+            self.record_request_time(time.monotonic() - started, outcome)
 
     def record_done(self, response: dict) -> None:
         self.completed_requests += 1
@@ -1705,20 +2143,28 @@ class TranslationMetrics:
         def seconds(total: float, samples: int) -> str:
             if not samples:
                 return "未提供"
-            return f"{total / 1_000_000_000:.2f}秒（{samples}次）"
+            return f"{total / 1_000_000_000:.2f}秒（{samples}份响应统计）"
 
         def count(total: int, samples: int) -> str:
-            return f"{total}（{samples}次）" if samples else "未提供"
+            return f"{total}（{samples}份响应统计）" if samples else "未提供"
 
+        wall = (f"{self.translation_wall_seconds:.2f}秒"
+                if self.translation_wall_seconds is not None else "未记录")
         return (
             f"翻译模型统计：请求{self.requests}次，完成{self.completed_requests}次，"
-            f"重试{self.retries}次；模型请求总耗时{seconds(self.total_duration_ns, self.total_samples)}，"
+            f"重试{self.retries}次，失败{self.failed_requests}次，取消{self.cancelled_requests}次；"
+            f"整轮实际耗时{wall}，"
+            f"请求实际耗时{self.request_wall_seconds:.2f}秒"
+            f"（成功{self.successful_request_seconds:.2f}秒，失败{self.failed_request_seconds:.2f}秒，"
+            f"取消{self.cancelled_request_seconds:.2f}秒），重试等待{self.retry_wait_seconds:.2f}秒；"
+            f"引擎已完成响应耗时{seconds(self.total_duration_ns, self.total_samples)}，"
             f"模型加载{seconds(self.load_duration_ns, self.load_samples)}，"
             f"提示词处理{seconds(self.prompt_eval_duration_ns, self.prompt_duration_samples)}，"
             f"文本生成{seconds(self.eval_duration_ns, self.eval_duration_samples)}；"
             f"提示词token {count(self.prompt_eval_count, self.prompt_count_samples)}，"
             f"生成token {count(self.eval_count, self.eval_count_samples)}；"
-            f"批次格式回退{self.batch_parse_failures}批，逐条重译{self.fallback_lines}条。"
+            f"批次格式回退{self.batch_parse_failures}批，逐条重译{self.fallback_lines}条；"
+            f"质量修复{self.quality_repairs}次，连续字幕恢复{self.context_repairs}次。"
         )
 
 
@@ -1729,8 +2175,14 @@ def call_ollama(
     timeout: int,
     cancel_event: threading.Event | None = None,
     metrics: TranslationMetrics | None = None,
+    *,
+    response_schema: dict | None = None,
+    max_tokens: int = 2048,
 ) -> str:
     check_cancel(cancel_event)
+    budget = _OLLAMA_SPLIT_BUDGET.get()
+    if budget is not None:
+        budget.take(cancel_event)
     if metrics is not None:
         metrics.requests += 1
     body = {
@@ -1743,8 +2195,11 @@ def call_ollama(
             "temperature": 0.12,
             "top_p": 0.9,
             "num_ctx": OLLAMA_CONTEXT_SIZE,
+            "num_predict": max(32, min(2048, int(max_tokens))),
         },
     }
+    if response_schema is not None:
+        body["format"] = response_schema
     request = urllib.request.Request(
         f"{host.rstrip('/')}/api/generate",
         data=json.dumps(body).encode("utf-8"),
@@ -1752,14 +2207,37 @@ def call_ollama(
         method="POST",
     )
     parts: list[str] = []
+    tail = ""
+    response_chars = 0
+    next_repeat_check = 128
+    response_frames = 0
     started = time.monotonic()
     last_activity = started
     maximum_seconds = min(OLLAMA_REQUEST_MAX_SECONDS, max(90, int(timeout)))
     socket_timeout = min(OLLAMA_STREAM_IDLE_SECONDS, max(30, int(timeout)))
-    with ollama_request_scope(cancel_event):
+    if budget is not None:
+        remaining = budget.check(cancel_event)
+        maximum_seconds = min(maximum_seconds, remaining)
+        socket_timeout = min(socket_timeout, remaining)
+    timer = metrics.measure_request(started) if metrics is not None else contextlib.nullcontext()
+    with timer, ollama_request_scope(cancel_event):
         with urllib.request.urlopen(request, timeout=socket_timeout) as response:
+            status = getattr(response, 'status', None)
+            headers = getattr(response, 'headers', {})
+            content_type = headers.get('Content-Type', '') if hasattr(headers, 'get') else ''
+            def stream_error(reason_code, message):
+                return TranslationStreamError(message, reason_code=reason_code,
+                    http_status=status, response_frames=response_frames, response_chars=response_chars,
+                    elapsed=time.monotonic()-started, content_type=content_type)
             while True:
                 check_cancel(cancel_event)
+                if budget is not None:
+                    remaining = budget.check(cancel_event)
+                    # urllib's HTTPResponse keeps the socket here. Cap every
+                    # blocking read by the shared remaining recovery time.
+                    stream_socket = getattr(getattr(getattr(response, 'fp', None), 'raw', None), '_sock', None)
+                    if stream_socket is not None:
+                        stream_socket.settimeout(min(socket_timeout, remaining))
                 now = time.monotonic()
                 if now - started >= maximum_seconds:
                     raise TimeoutError(f"本地模型单批处理超过 {maximum_seconds} 秒。")
@@ -1772,14 +2250,35 @@ def call_ollama(
                         ) from exc
                     continue
                 if not raw_line:
-                    break
+                    raise stream_error('stream_eof', "本地模型连接提前结束，未收到完成标记；本批译文未采用。")
                 last_activity = time.monotonic()
-                item = json.loads(raw_line.decode("utf-8", errors="replace"))
+                try:
+                    item = json.loads(raw_line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError as exc:
+                    if not raw_line.endswith(b"\n"):
+                        raise stream_error('truncated_json', "本地模型响应在传输中截断；本批译文未采用。") from exc
+                    raise
+                response_frames += 1
                 if item.get("error"):
+                    error = item['error']
+                    message = error.get('message', '') if isinstance(error, dict) else str(error)
+                    if isinstance(message, str) and re.fullmatch(r'The model produced output that does not match the expected [\w -]{1,80} format', message):
+                        raise stream_error('engine_output_format', '本地模型引擎的输出格式解析失败；本批译文未采用。')
                     raise RuntimeError(str(item["error"]))
                 if item.get("response"):
-                    parts.append(str(item["response"]))
+                    fragment = str(item["response"])
+                    parts.append(fragment)
+                    tail = (tail + fragment)[-768:]
+                    response_chars += len(fragment)
+                    if response_chars >= next_repeat_check:
+                        next_repeat_check = response_chars + 64
+                        if re.search(r"(.{4,64}?)\1{5,}\s*$", " ".join(tail.split())):
+                            raise TranslationGenerationError("本地模型持续重复相同片段；已终止本次生成，不原样重试。",
+                                                             reason_code="repetition_detected")
                 if item.get("done"):
+                    if item.get("done_reason") == "length":
+                        raise TranslationGenerationError("本地模型达到生成长度上限，未完成的响应未采用。",
+                                                         reason_code="generation_length_limit")
                     if metrics is not None:
                         metrics.record_done(item)
                     break
@@ -1795,31 +2294,93 @@ def call_ollama_retry(
     cancel_event: threading.Event | None = None,
     attempts: int = 2,
     metrics: TranslationMetrics | None = None,
+    *,
+    response_schema: dict | None = None,
+    max_tokens: int | None = None,
 ) -> str:
+    generation_options = {}
+    if response_schema is not None:
+        generation_options["response_schema"] = response_schema
+    if max_tokens is not None:
+        generation_options["max_tokens"] = max_tokens
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         check_cancel(cancel_event)
+        budget = _OLLAMA_SPLIT_BUDGET.get()
+        if budget is not None:
+            budget.check_request(cancel_event)
         if attempt > 1 and metrics is not None:
             metrics.retries += 1
         try:
             if metrics is None:
-                return call_ollama(prompt, model=model, host=host, timeout=timeout, cancel_event=cancel_event)
+                return call_ollama(prompt, model=model, host=host, timeout=timeout, cancel_event=cancel_event,
+                                   **generation_options)
             return call_ollama(
                 prompt, model=model, host=host, timeout=timeout,
-                cancel_event=cancel_event, metrics=metrics,
+                cancel_event=cancel_event, metrics=metrics, **generation_options,
             )
-        except (socket.timeout, TimeoutError, urllib.error.URLError) as exc:
+        except (socket.timeout, TimeoutError, ConnectionError, http.client.IncompleteRead,
+                urllib.error.URLError) as exc:
             last_error = exc
+            _write_ollama_diagnostic(
+                f"translation attempt={attempt}/{attempts}: {type(exc).__name__} "
+                f"errno={getattr(exc, 'errno', None)} winerror={getattr(exc, 'winerror', None)}"
+                + (' ' + exc.diagnostic() if isinstance(exc, TranslationStreamError) else '')
+            )
+            if (isinstance(exc, TranslationStreamError) and exc.split_candidate
+                    and _OLLAMA_BATCH_STREAM_RECOVERY.get()):
+                check_cancel(cancel_event)
+                budget = _OLLAMA_SPLIT_BUDGET.get()
+                remaining = budget.check(cancel_event) if budget is not None else 2.0
+                healthy = ollama_available(host, timeout=min(2.0, remaining))
+                check_cancel(cancel_event)
+                if healthy:
+                    exc.transport_attempts = attempt
+                    raise  # A complete child response is required, never partial text.
             if attempt < attempts:
-                time.sleep(2)
+                # Retry the unfinished batch only. An external or live engine is
+                # never killed/replaced; restart only our own confirmed exit.
+                with _OLLAMA_STATE_CHANGED:
+                    process = _OLLAMA_SERVER_PROCESS
+                    restart_owned = (
+                        process is not None and process.poll() is not None
+                        and _OLLAMA_SERVER_HOST == host.rstrip("/")
+                        and _OLLAMA_ACTIVE_REQUESTS == 0 and not _OLLAMA_STOPPING
+                    )
+                check_cancel(cancel_event)
+                if restart_owned:
+                    _write_ollama_diagnostic(
+                        f"translation recovery: owned engine pid={process.pid} "
+                        f"exit_code={process.poll()}; restarting"
+                    )
+                    ensure_ollama_running(host=host, cancel_event=cancel_event)
+                wait_started = time.monotonic() if metrics is not None else None
+                try:
+                    budget = _OLLAMA_SPLIT_BUDGET.get()
+                    delay = min(2, budget.check(cancel_event)) if budget is not None else 2
+                    if cancel_event is not None:
+                        cancel_event.wait(delay)
+                        check_cancel(cancel_event)
+                    else:
+                        time.sleep(delay)
+                finally:
+                    if wait_started is not None:
+                        metrics.retry_wait_seconds += max(0.0, time.monotonic() - wait_started)
                 continue
-    raise RuntimeError("本地模型响应超时。建议把并行数调为 1，或减少目标语言后重试。") from last_error
+    raise RuntimeError(
+        f"本地模型请求未完成（{type(last_error).__name__}），已达到 {attempts} 次尝试上限；"
+        "已完成的翻译缓存保留，请重试以继续。"
+        + (' ' + last_error.diagnostic() if isinstance(last_error, TranslationStreamError) else '')
+    ) from last_error
 
 
 def make_prompt(lines: list[str], target_code: str, source_language: str, *, require_target_script: bool = False,
-                context_lines: tuple[str, str] | None = None) -> str:
+                context_lines: tuple[str, str] | None = None, repair_feedback: str = "") -> str:
     target_name = LANGUAGES[target_code][1]
     numbered = "\n".join(f"{idx}. {line}" for idx, line in enumerate(lines, start=1))
+    feedback = ("\nThe previous attempt still failed this check: " + repair_feedback
+                + "\nWrite a fresh, idiomatic translation in the target language; do not copy the faulty wording.\n"
+                if repair_feedback else "")
     if require_target_script and target_code.startswith("zh"):
         context = (
             f"\n仅供理解的相邻台词，不要输出它们：\n前句：{context_lines[0]}\n后句：{context_lines[1]}\n"
@@ -1830,8 +2391,22 @@ def make_prompt(lines: list[str], target_code: str, source_language: str, *, req
             "常用词即使单独出现或大小写混杂也必须翻译，不能当成人名照抄。\n"
             "只输出中文译文，禁止夹带原文英文单词、解释和思考过程。\n"
             "结合上下文理解含义，不要把后句的意思补进本句。\n"
-            f"严格输出{len(lines)}行，格式为：1. 中文译文{context}\n字幕原文：\n{numbered}\n译文："
+            f"严格输出{len(lines)}行，格式为：1. 中文译文{context}{feedback}\n字幕原文：\n{numbered}\n译文："
         )
+    repair_rules = ""
+    context = ""
+    if require_target_script and target_code in _NON_CJK_TRANSLATION_TARGETS:
+        repair_rules = (
+            "- Rewrite this line: the previous translation contained text outside the target language.\n"
+            "- Do not introduce Chinese, Japanese, or Korean text. A name or quotation in those scripts "
+            "may be retained only if it appears verbatim in the source line.\n"
+            "- Use context to understand this line, without adding meaning from adjacent lines.\n"
+        )
+        if context_lines:
+            context = (
+                "\nAdjacent source lines for context only; do not output them:\n"
+                f"Previous: {context_lines[0]}\nNext: {context_lines[1]}\n"
+            )
     return f"""Translate these movie subtitle lines into {target_name}.
 Source language hint: {source_language or "auto-detect"}.
 Rules:
@@ -1840,11 +2415,71 @@ Rules:
 - Keep subtitles concise and natural for on-screen reading.
 - Preserve names, tone, and meaning.
 - Do not add explanations, notes, markdown, or extra lines.
-
+{repair_rules}{context}{feedback}
 Subtitle lines:
 {numbered}
 
 Translated output:"""
+
+
+class InvalidTranslationResponseError(RuntimeError):
+    """A model response cannot supply even one structurally usable subtitle."""
+
+
+class TranslationGenerationError(InvalidTranslationResponseError):
+    """Completed transport, but generation repeated or exhausted its budget."""
+
+    def __init__(self, message: str, *, reason_code: str = "generation_failure"):
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+class TranslationStreamError(ConnectionError):
+    """An HTTP stream ended without a complete generation, not a valid result."""
+    def __init__(self, message, *, reason_code, http_status=None, response_frames=0,
+                 response_chars=0, elapsed=0., content_type=''):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.http_status = http_status
+        self.response_frames = response_frames
+        self.response_chars = response_chars
+        self.elapsed = max(0., elapsed)
+        self.content_type = str(content_type)[:80]
+
+    @property
+    def split_candidate(self):
+        return self.http_status == 200 and (self.reason_code == 'engine_output_format' or
+            (self.reason_code == 'stream_eof' and self.response_frames > 0 and self.response_chars > 0))
+
+    def diagnostic(self):
+        return (f'reason={self.reason_code} http={self.http_status} frames={self.response_frames} '
+                f'chars={self.response_chars} elapsed={self.elapsed:.2f}s')
+
+
+class TranslationRecoveryLimitError(RuntimeError):
+    pass
+
+
+@dataclass
+class _TranslationSplitBudget:
+    deadline: float
+    remaining_requests: int
+
+    def check(self, cancel_event=None):
+        check_cancel(cancel_event)
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TranslationRecoveryLimitError('失败批次拆分恢复已达到时间预算；已完成的小段缓存保留。')
+        return remaining
+
+    def check_request(self, cancel_event=None):
+        self.check(cancel_event)
+        if self.remaining_requests <= 0:
+            raise TranslationRecoveryLimitError('失败批次拆分恢复已达到请求上限；已完成的小段缓存保留。')
+
+    def take(self, cancel_event=None):
+        self.check_request(cancel_event)
+        self.remaining_requests -= 1
 
 
 def translate_batch(
@@ -1858,41 +2493,104 @@ def translate_batch(
     metrics: TranslationMetrics | None = None,
     require_target_script: bool = False,
     context_lines: tuple[str, str] | None = None,
+    repair_feedback: str = "",
+    on_fallback_translation: Callable[[int, str], None] | None = None,
 ) -> list[str]:
     check_cancel(cancel_event)
-    response = call_ollama_retry(
-        make_prompt(lines, target_code, source_language, require_target_script=require_target_script,
-                    context_lines=context_lines),
-        model=model,
-        host=host,
-        timeout=timeout,
-        cancel_event=cancel_event,
-        **({"metrics": metrics} if metrics is not None else {}),
-    )
-    parsed = parse_numbered_response(response, len(lines))
-    if parsed is not None:
-        return parsed
+    started = time.monotonic()
+    original_indices = metrics.diagnostic_indices if metrics is not None else ()
+    published = set()
+    budget_token = None
 
-    if metrics is not None:
-        metrics.batch_parse_failures += 1
+    def publish(offset, text):
+        if on_fallback_translation is not None and offset not in published:
+            on_fallback_translation(offset, text)
+            published.add(offset)
 
-    result: list[str] = []
-    for line in lines:
+    def request(group):
+        token = _OLLAMA_BATCH_STREAM_RECOVERY.set(len(group) > 1)
+        try:
+            return call_ollama_retry(
+                make_prompt(group, target_code, source_language, require_target_script=require_target_script,
+                            context_lines=context_lines, repair_feedback=repair_feedback),
+                model=model, host=host, timeout=timeout, cancel_event=cancel_event,
+                **({'metrics': metrics} if metrics is not None else {}))
+        finally:
+            _OLLAMA_BATCH_STREAM_RECOVERY.reset(token)
+
+    def run(group, offset):
+        nonlocal budget_token
         check_cancel(cancel_event)
         if metrics is not None:
-            metrics.fallback_lines += 1
-        single = call_ollama_retry(
-            make_prompt([line], target_code, source_language, require_target_script=require_target_script,
-                        context_lines=context_lines),
-            model=model,
-            host=host,
-            timeout=timeout,
-            cancel_event=cancel_event,
-            **({"metrics": metrics} if metrics is not None else {}),
-        )
-        parsed_single = parse_numbered_response(single, 1)
-        result.append(parsed_single[0] if parsed_single else single.splitlines()[0].strip())
-    return result
+            metrics.diagnostic_indices = original_indices[offset:offset+len(group)]
+        request_seconds_before = metrics.request_wall_seconds if metrics is not None else 0.
+        generation_error = None
+        try:
+            response = request(group)
+        except TranslationStreamError as exc:
+            if len(group) <= 1 or not exc.split_candidate:
+                raise
+            if _OLLAMA_SPLIT_BUDGET.get() is None:
+                budget_token = _OLLAMA_SPLIT_BUDGET.set(_TranslationSplitBudget(
+                    started + min(OLLAMA_REQUEST_MAX_SECONDS, max(90, int(timeout))),
+                    max(0, 2*len(lines)-1-getattr(exc, 'transport_attempts', 1))))
+            _OLLAMA_SPLIT_BUDGET.get().check(cancel_event)
+            if metrics is not None:
+                metrics.log_stream_split(target_code, exc, len(group), cancel_event)
+            middle = len(group)//2
+            result = []
+            for part, child_offset in ((group[:middle], offset), (group[middle:], offset+middle)):
+                child = run(part, child_offset)
+                for index, text in enumerate(child):
+                    publish(child_offset+index, text)
+                result.extend(child)
+            return result
+        except TranslationGenerationError as exc:
+            if len(group) == 1:
+                raise
+            generation_error = exc
+            response = ''
+        except TranslationRecoveryLimitError:
+            raise
+        except RuntimeError as exc:
+            if _OLLAMA_SPLIT_BUDGET.get() is not None:
+                indices = original_indices[offset:offset+len(group)]
+                location = (f'字幕第 {indices[0]}—{indices[-1]} 行' if indices else
+                            f'本批第 {offset+1}—{offset+len(group)} 条')
+                raise RuntimeError(f'{location}拆分恢复失败：{exc}') from exc
+            raise
+        parsed = parse_numbered_response(response, len(group))
+        if parsed is not None:
+            return parsed
+        if metrics is not None:
+            metrics.batch_parse_failures += 1
+            metrics.log_batch_fallback(target_code,
+                generation_error.reason_code if generation_error else 'batch_response_format',
+                str(generation_error) if generation_error else
+                f'模型响应条数或编号不符合本批{len(group)}条字幕要求，未采用该批响应。',
+                metrics.request_wall_seconds-request_seconds_before, len(group), cancel_event)
+        result = []
+        for index, line in enumerate(group):
+            check_cancel(cancel_event)
+            if metrics is not None:
+                metrics.fallback_lines += 1
+                metrics.diagnostic_indices = original_indices[offset+index:offset+index+1]
+            single = request([line])
+            parsed_single = parse_numbered_response(single, 1)
+            if not single.strip():
+                raise InvalidTranslationResponseError('本地模型返回空响应，未生成有效字幕。')
+            text = parsed_single[0] if parsed_single else single.splitlines()[0].strip()
+            result.append(text)
+            publish(offset+index, text)
+        return result
+
+    try:
+        return run(lines, 0)
+    finally:
+        if metrics is not None:
+            metrics.diagnostic_indices = original_indices
+        if budget_token is not None:
+            _OLLAMA_SPLIT_BUDGET.reset(budget_token)
 
 
 _DIALOGUE_WORDS = frozenset("""a an the i you he she it we they me us my your his her our their is are was were
@@ -1904,20 +2602,132 @@ i'm i'll i've i'd you're you'll you've he's she's it's we're we'll we've they're
 don't doesn't didn't can't cannot won't isn't aren't wasn't weren't couldn't
 """.split())
 
+_CJK_TEXT_RUN = re.compile(
+    r"[\u3005-\u3007\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+    r"\U00020000-\U0002fa1f\U00030000-\U000323af"
+    r"\u3041-\u3096\u3099-\u309f\u30a1-\u30fa\u30fc-\u30ff\u31f0-\u31ff\uff66-\uff9f"
+    r"\u1100-\u11ff\u3131-\u318e\ua960-\ua97f\uac00-\ud7a3\ud7b0-\ud7ff]+"
+)
+
+
+
+_IDENTIFIER_QUOTE = r"""["'“”‘’]"""
+_IDENTIFIER_LETTER = rf"{_IDENTIFIER_QUOTE}*\s*([A-Z])\s*{_IDENTIFIER_QUOTE}*"
+_IDENTIFIER_MATH_OPERATORS = {
+    "times": "*", "multipliedby": "*", "乘以": "*", "乘": "*", "×": "*", "*": "*",
+    "plus": "+", "加上": "+", "加": "+", "+": "+",
+    "minus": "-", "减去": "-", "减": "-",
+    "dividedby": "/", "除以": "/", "÷": "/", "/": "/",
+    "equals": "=", "等于": "=", "=": "=",
+}
+_IDENTIFIER_MATH_OPERATOR = (
+    r"multiplied\s+by|divided\s+by|times|plus|minus|equals|乘以|乘|加上|加|减去|减|除以|等于|[×*+÷/=]"
+)
+_IDENTIFIER_LABELS = {
+    "checkpoint": ("检查点", "检查站", "哨卡"),
+    "point": ("点位", "位置", "地点", "点"),
+    "plan": ("计划", "方案"), "option": ("选项",),
+    "section": ("区段", "区域", "节"), "zone": ("区域", "区"),
+    "route": ("路线",), "gate": ("登机口", "闸口", "门"),
+    "block": ("街区", "区块"), "room": ("房间", "室"),
+}
+
+
+def _identifier_roles(text: str, *, translated: bool) -> list[tuple[tuple, tuple[tuple[int, int], ...]]]:
+    """Return explicit identifier occurrences, strongest context first.
+
+    An occurrence is consumed once; protecting one A never protects another A/a.
+    Bare capitals and quoted I (a possible pronoun) have no blanket exemption.
+    """
+    # These patterns distinguish zero/one whitespace and at most two adjacent
+    # quote delimiters (a closing and an opening quote), never longer runs.
+    # Compact redundant runs before regex scanning to avoid quadratic suffix
+    # retries on damaged subtitle text; return letter spans in original indices.
+    compact: list[str] = []
+    positions: list[int] = []
+    run_kind, run_length = '', 0
+    for position, character in enumerate(text):
+        kind = 'space' if character.isspace() else 'quote' if character in "\"'“”‘’" else ''
+        run_length = run_length + 1 if kind and kind == run_kind else 1
+        run_kind = kind
+        if (kind == 'space' and run_length > 1) or (kind == 'quote' and run_length > 2):
+            continue
+        compact.append(character)
+        positions.append(position)
+    text = ''.join(compact)
+    result: list[tuple[tuple, tuple[tuple[int, int], ...]]] = []
+    occupied: set[int] = set()
+
+    def add(key: tuple, spans: tuple[tuple[int, int], ...]) -> None:
+        positions = {position for start, end in spans for position in range(start, end)}
+        if not positions or positions & occupied:
+            return
+        result.append((key, spans))
+        occupied.update(positions)
+
+    for match in re.finditer(r"(?<![A-Za-z])(?:[A-Z]\.){2,}(?![A-Za-z])", text):
+        add(("initialism", match.group(0)), ((match.start(), match.end()),))
+    formula = rf"(?<![A-Za-z]){_IDENTIFIER_LETTER}(?:\s*(?:{_IDENTIFIER_MATH_OPERATOR})\s*{_IDENTIFIER_LETTER})+(?![A-Za-z])"
+    for match in re.finditer(formula, text):
+        value = match.group(0)
+        letters = tuple(re.finditer(r"(?<![A-Za-z])[A-Z](?![A-Za-z])", value))
+        operators = tuple(_IDENTIFIER_MATH_OPERATORS[re.sub(r"\s+", "", item.group(0))]
+                          for item in re.finditer(_IDENTIFIER_MATH_OPERATOR, value))
+        if len(operators) == len(letters) - 1:
+            add(("formula", tuple(item.group(0) for item in letters), operators),
+                tuple((match.start() + item.start(), match.start() + item.end()) for item in letters))
+    for role, names in _IDENTIFIER_LABELS.items():
+        if translated:
+            label = "(?:" + "|".join(map(re.escape, names)) + ")"
+            patterns = (rf"{label}\s*{_IDENTIFIER_LETTER}(?![A-Za-z])",
+                        rf"(?<![A-Za-z]){_IDENTIFIER_LETTER}\s*{label}")
+        else:
+            patterns = (rf"(?<![A-Za-z])(?i:{role})\s+{_IDENTIFIER_LETTER}(?![A-Za-z])",)
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                add(("label", role, match.group(1)), (match.span(1),))
+    quoted = rf"{_IDENTIFIER_QUOTE}\s*(A)\s*[,，]?{_IDENTIFIER_QUOTE}"
+    for match in re.finditer(quoted, text):
+        add(("quoted_letter", match.group(1)), (match.span(1),))
+    return [(key, tuple((positions[start], positions[end - 1] + 1) for start, end in spans))
+            for key, spans in result]
+
+
+def _translation_identifier_spans(source: str, translation: str) -> set[int]:
+    """Match source and translated identifier roles with occurrence budgets."""
+    budgets: dict[tuple, int] = {}
+    for key, _ in _identifier_roles(source, translated=False):
+        budgets[key] = budgets.get(key, 0) + 1
+    protected: set[int] = set()
+    for key, spans in _identifier_roles(translation, translated=True):
+        if budgets.get(key, 0) <= 0:
+            continue
+        budgets[key] -= 1
+        protected.update(position for start, end in spans for position in range(start, end))
+    return protected
+
 
 def translation_quality_issue(source: str, translation: str, target_code: str) -> str:
-    """Catch empty/Latin-only Chinese dialogue without rejecting names or codes.
+    """Catch empty translations and narrow script leaks while preserving source names.
 
-    This is a script check, not a claim that translated meaning is correct.
+    Retained CJK source text may be a name or quote; only newly introduced CJK
+    spans are rejected for supported non-CJK targets. This does not verify meaning.
     """
     if not source.strip():
         return ""
     if not translation.strip():
         return "译文为空"
+    if target_code in _NON_CJK_TRANSLATION_TARGETS:
+        if any(match.group(0) not in source for match in _CJK_TEXT_RUN.finditer(translation)):
+            return "译文混入原文没有的中日韩文字，疑似错译"
+        return ""
     if not target_code.startswith("zh"):
         return ""
     source_words = {word.casefold() for word in re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", source)}
-    translated_words = {word.casefold() for word in re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", translation)}
+    identifier_spans = _translation_identifier_spans(source, translation)
+    translated_words = {match.group(0).casefold()
+                        for match in re.finditer(r"[A-Za-z]+(?:['’][A-Za-z]+)?", translation)
+                        if not all(position in identifier_spans for position in range(*match.span()))}
     preserved_name_words: set[str] = set()
     for match in re.finditer(r"(?<![A-Za-z])[A-Z][A-Za-z]*(?:[ -]+(?:and|of|the|[A-Z][A-Za-z]*)){1,5}(?![A-Za-z])", translation):
         phrase = match.group(0)
@@ -1940,6 +2750,9 @@ def translation_quality_issue(source: str, translation: str, target_code: str) -
         if len(words) <= 3 and all(word[0].isupper() for word in words):
             return ""  # Standalone names (Chloe, Darth Vader) and identifiers (R2).
     return "中文译文仍为外文，疑似漏译"
+
+
+TRANSLATION_PARSER_VERSION = "explicit-numbering-v2"
 
 
 def load_cache(
@@ -1970,6 +2783,11 @@ def load_cache(
                 stale_indices.add(index)
                 cache.pop(index, None)
                 continue
+            if (item.get("parser_version") != TRANSLATION_PARSER_VERSION
+                    and re.search(r"\d", current_source)):
+                stale_indices.add(index)
+                cache.pop(index, None)
+                continue
             cache[index] = translation
             stale_indices.discard(index)
         except (ValueError, KeyError, TypeError):
@@ -1990,7 +2808,8 @@ def append_cache_records(
         return
     payload = "".join(
         json.dumps(
-            {"target": target_code, "index": index, "source": source, "translation": translation},
+            {"target": target_code, "index": index, "source": source, "translation": translation,
+             "parser_version": TRANSLATION_PARSER_VERSION},
             ensure_ascii=False,
         )
         + "\n"
@@ -2041,6 +2860,7 @@ def rewrite_cache(
                         "index": index,
                         "source": sources[index],
                         "translation": translations[index],
+                        "parser_version": TRANSLATION_PARSER_VERSION,
                     },
                     ensure_ascii=False,
                 )
@@ -2049,14 +2869,45 @@ def rewrite_cache(
     retry_file_operation(lambda: temp_path.replace(path), path, "replace translation cache")
 
 
+def _rechecked_identifier_reviews(review_rows: dict[int, dict], target_code: str) -> dict[int, str]:
+    """Recheck only the former common-word warning, without changing user text."""
+    if not target_code.startswith("zh"):
+        return {}
+    import translation_review
+    result: dict[int, str] = {}
+    for index, item in review_rows.items():
+        if (item.get("status") != "needs_review"
+                or item.get("reason") != "中文译文残留原文常用词，疑似漏译"):
+            continue
+        source, translation = item.get("source"), item.get("translation")
+        if not isinstance(source, str) or not isinstance(translation, str):
+            continue
+        try:
+            translation_review.validate_text(translation)
+        except (ValueError, TypeError):
+            continue
+        if (_translation_identifier_spans(source, translation)
+                and not translation_quality_issue(source, translation, target_code)):
+            result[index] = translation
+    return result
+
+
 def _translation_cache_state(
     events: list[SubtitleEvent],
     target_code: str,
     cache_path: Path,
+    retry_issues: bool = False,
+    output_srt: Path | None = None,
 ) -> tuple[dict[int, str], dict[int, str], int, list[int]]:
     cleaned = {idx: event.text.strip() for idx, event in enumerate(events, start=1)}
     cache, stale_count = load_cache(cache_path, target_code, cleaned)
-    pending = [idx for idx in range(1, len(events) + 1) if idx not in cache and cleaned[idx]]
+    import translation_review
+    review_rows = translation_review.restore_issues(events, target_code, cache_path, output_srt)
+    if output_srt is not None:
+        for index, translation in _rechecked_identifier_reviews(review_rows, target_code).items():
+            cache.setdefault(index, translation)
+    pending = [idx for idx in range(1, len(events) + 1)
+               if idx not in cache and (idx not in review_rows or (retry_issues and review_rows[idx].get('status') == 'needs_review')) and cleaned[idx]]
     return cleaned, cache, stale_count, pending
 
 
@@ -2065,6 +2916,8 @@ def needs_model_translation(
     target: str,
     cache_path: Path,
     source_code: str,
+    retry_issues: bool = False,
+    output_srt: Path | None = None,
 ) -> bool:
     """Use the exact translation-cache rules before reserving model resources."""
     source_language = subtitle_languages.subtitle_language(source_code)
@@ -2073,7 +2926,7 @@ def needs_model_translation(
         return False
     if chinese_script_converter.is_script_conversion(source_language, target_language):
         return False
-    return bool(_translation_cache_state(events, target, cache_path)[3])
+    return bool(_translation_cache_state(events, target, cache_path, retry_issues, output_srt)[3])
 
 
 def translate_events(
@@ -2088,70 +2941,220 @@ def translate_events(
     batch_size: int = 12,
     timeout: int = 600,
     cancel_event: threading.Event | None = None,
+    retry_issues: bool = False,
 ) -> None:
+    import translation_review
     check_cancel(cancel_event)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     output_srt.parent.mkdir(parents=True, exist_ok=True)
-    cleaned, cache, stale_count, pending = _translation_cache_state(events, target_code, cache_path)
+    cleaned, cache, stale_count, pending = _translation_cache_state(events, target_code, cache_path, retry_issues, output_srt)
+    issues = translation_review.restore_issues(events, target_code, cache_path, output_srt)
+    had_issue_report = bool(issues)
+    retry_indices = {idx for idx, item in issues.items()
+                     if retry_issues and item.get('status') == 'needs_review' and idx not in cache and cleaned[idx]}
+    pending = [idx for idx in range(1, len(events) + 1)
+               if idx not in cache and (idx not in issues or idx in retry_indices) and cleaned[idx]]
+    translations = {index: item['translation'] for index, item in issues.items()}
+    translations.update(cache)
+    rechecked = _rechecked_identifier_reviews(issues, target_code)
+    rechecked_count = 0
+    for index, item in issues.items():
+        if index in cache and cache[index] != item['translation']:
+            item.update(translation=cache[index], reason='', status='resolved')
+        elif index in rechecked and index in cache and cache[index] == item['translation']:
+            item.setdefault('original_reason', item['reason'])
+            item.update(reason='', status='resolved', resolution='identifier-context-rechecked-v1')
+            rechecked_count += 1
+    if rechecked_count:
+        log(f"旧翻译提醒复核：{rechecked_count}条已确认保留变量、编号或缩写；复用原译文，不重新请求模型。")
     log(
         f"字幕行数：{len(events)}，缓存匹配：{len(cache)}，"
         f"缓存失效：{stale_count}，待翻译：{len(pending)}"
     )
+    if issues:
+        if retry_indices:
+            log(f"翻译问题记录：{len(issues)}条；本轮重试未解决的{len(retry_indices)}条，已人工确认的译文保持。")
+        else:
+            unresolved_reviews = sum(item.get('status') == 'needs_review' for item in issues.values())
+            if unresolved_reviews:
+                log(f"复用问题译文记录：{unresolved_reviews}条；仍保留质量标记，不作为正常翻译缓存。")
 
-    started = time.time()
+    started = time.monotonic()
     cursor = 0
     metrics = TranslationMetrics()
+    metrics.diagnostic_log = log
+
+    def save_validated(records: list[tuple[int, str, str]]) -> None:
+        changed = [record for record in records if cache.get(record[0]) != record[2]]
+        if changed:
+            append_cache_records(cache_path, target_code, changed)
+            cache.update((index, text) for index, _source, text in changed)
+        for index, _source, _text in records:
+            issues.pop(index, None)
+
     try:
         while cursor < len(pending):
             check_cancel(cancel_event)
             batch_indices = pending[cursor : cursor + batch_size]
             batch_lines = [cleaned[idx] for idx in batch_indices]
+
+            def save_fallback(offset: int, text: str) -> None:
+                # The next single-line fallback can fail before translate_batch
+                # returns. Persist only already validated results from it.
+                check_cancel(cancel_event)
+                idx = batch_indices[offset]
+                try:
+                    text = translation_review.validate_text(text.strip().strip('"').strip("'"))
+                except ValueError:
+                    return
+                if not translation_quality_issue(cleaned[idx], text, target_code):
+                    save_validated([(idx, cleaned[idx], text)])
+
+            metrics.diagnostic_indices = tuple(batch_indices)
             translated = translate_batch(
                 batch_lines, target_code, source_language, model, host, timeout,
                 cancel_event=cancel_event, metrics=metrics,
+                on_fallback_translation=save_fallback,
             )
             check_cancel(cancel_event)
             if len(translated) != len(batch_indices):
                 raise RuntimeError(f"翻译返回行数不一致：{len(translated)} / {len(batch_indices)}")
-            cache_records: list[tuple[int, str, str]] = []
+            recovered: dict[int, str] = {}
+            recovery_tried: set[int] = set()
+            recoverable_indices = set(batch_indices) - (set(issues) - retry_indices)
             for idx, text in zip(batch_indices, translated):
+                text = recovered.get(idx, text)
+                if not isinstance(text, str):
+                    raise RuntimeError(f"字幕第 {idx} 行模型响应损坏，未生成有效字幕。")
                 text = text.strip().strip('"').strip("'")
+                try:
+                    text = translation_review.validate_text(text)
+                except ValueError as exc:
+                    raise RuntimeError(f"字幕第 {idx} 行：{exc}") from exc
                 issue = translation_quality_issue(cleaned[idx], text, target_code)
+                initial_reason = issue
+                repair_errors = []
+                generation_failed = False
+                repair_attempts = 0
                 for repair in range(2):
                     if not issue:
                         break
                     check_cancel(cancel_event)
                     log(f"字幕第 {idx} 行：{issue}；仅重译本行（{repair + 1}/2）。")
-                    repaired = translate_batch(
-                        [cleaned[idx]], target_code, source_language, model, host, timeout,
-                        cancel_event=cancel_event, metrics=metrics,
-                        require_target_script=True,
-                        context_lines=(cleaned.get(idx - 1, ""), cleaned.get(idx + 1, "")),
-                    )
-                    text = repaired[0].strip().strip('"').strip("'") if len(repaired) == 1 else ""
+                    metrics.quality_repairs += 1
+                    repair_attempts += 1
+                    try:
+                        metrics.diagnostic_indices = (idx,)
+                        repaired = translate_batch(
+                            [cleaned[idx]], target_code, source_language, model, host, timeout,
+                            cancel_event=cancel_event, metrics=metrics,
+                            require_target_script=True,
+                            context_lines=(cleaned.get(idx - 1, ""), cleaned.get(idx + 1, "")),
+                            repair_feedback=(f"{issue}. Faulty translation: {text}" if repair else ""),
+                        )
+                    except TranslationGenerationError as exc:
+                        check_cancel(cancel_event)
+                        generation_failed = True
+                        repair_errors.append(str(exc))
+                        log(f"字幕第 {idx} 行：{exc}；改变修复方式。")
+                        break
+                    except InvalidTranslationResponseError as exc:
+                        check_cancel(cancel_event)
+                        repair_errors.append(str(exc))
+                        log(f"字幕第 {idx} 行修复响应无效：{exc}；保留上一份有效译文。")
+                        continue
+                    check_cancel(cancel_event)
+                    candidate = repaired[0] if isinstance(repaired, (list, tuple)) and len(repaired) == 1 else ""
+                    if isinstance(candidate, str):
+                        candidate = candidate.strip().strip('"').strip("'")
+                    try:
+                        candidate = translation_review.validate_text(candidate)
+                    except ValueError as exc:
+                        repair_errors.append(str(exc))
+                        log(f"字幕第 {idx} 行修复响应无效：{exc}；保留上一份有效译文。")
+                        continue
+                    text = candidate
                     issue = translation_quality_issue(cleaned[idx], text, target_code)
+                recovery_diagnostics = []
+                if (issue and (generation_failed or idx in retry_indices) and target_code in {"zh-CN", "zh-TW"}
+                        and (source_language or "").casefold() in {"en", "eng", "english"}
+                        and idx not in recovery_tried):
+                    repair_attempts += 1
+                    import translation_recovery
+                    available = recoverable_indices | (set(cache) if idx in retry_indices else set())
+                    available -= set(issues) - {idx}
+                    indices = translation_recovery.window_indices(idx, available, cleaned)
+                    recovery_tried.update(indices)
+                    log(f"字幕第 {idx} 行：{issue}；使用现有模型恢复连续对白（第 {indices[0]}—{indices[-1]} 行）。")
+                    try:
+                        def recovery_request(prompt, schema):
+                            return call_ollama_retry(
+                                prompt, model=model, host=host, timeout=timeout,
+                                cancel_event=cancel_event, metrics=metrics,
+                                response_schema=schema, max_tokens=1536,
+                            )
+                        segments = translation_recovery.recover(
+                            [cleaned[i] for i in indices], LANGUAGES[target_code][2],
+                            recovery_request, recovery_diagnostics, log)
+                        check_cancel(cancel_event)
+                        for i, segment in zip(indices, segments):
+                            translation_review.validate_text(segment)
+                            if translation_quality_issue(cleaned[i], segment, target_code):
+                                raise ValueError("恢复译文仍未通过目标语言检查。")
+                    except (ValueError, InvalidTranslationResponseError) as exc:
+                        repair_errors.append(str(exc))
+                        log(f"字幕连续对白恢复未采用：{exc}；本行保留质量标记，继续处理其他字幕。")
+                    else:
+                        save_validated([(i, cleaned[i], segment) for i, segment in zip(indices, segments)])
+                        for i, segment in zip(indices, segments):
+                            recovered[i] = translations[i] = segment
+                        text = recovered[idx]
+                        issue = ""
+                        metrics.context_repairs += 1
+                        log(f"字幕第 {indices[0]}—{indices[-1]} 行：连续对白恢复完成，原时间戳保持。")
                 if issue:
-                    raise RuntimeError(f"字幕第 {idx} 行翻译验收失败：{issue}；未写入成品，请重试。")
-                cache[idx] = text
-                cache_records.append((idx, cleaned[idx], text))
-            append_cache_records(cache_path, target_code, cache_records)
+                    event = events[idx - 1]
+                    issues[idx] = dict(index=idx, start=event.start, end=event.end,
+                        source=cleaned[idx], translation=text, reason=issue,
+                        original_reason=initial_reason, status='needs_review', repair_attempts=repair_attempts)
+                    if repair_errors:
+                        issues[idx]['repair_errors'] = repair_errors
+                    if recovery_diagnostics:
+                        issues[idx]['recovery_diagnostics'] = recovery_diagnostics
+                    log(f"字幕第 {idx} 行质量提醒：{issue}；原文：{cleaned[idx]}；译文：{text}；"
+                        "自动修复后仍有问题，已标记供编辑，继续生成字幕。")
+                    translation_review.save_progress(events, target_code, source_language,
+                                                     cache_path, output_srt, issues)
+                else:
+                    save_validated([(idx, cleaned[idx], text)])
+                translations[idx] = text
             cursor += len(batch_indices)
-            elapsed = max(1, int(time.time() - started))
-            done = len(cache)
-            rate = max(0.01, done / elapsed)
-            remaining = int(max(0, (len(events) - done) / rate))
+            elapsed = max(0.001, time.monotonic() - started)
+            done = len(translations)
+            # Reused rows took no time this run and must not inflate throughput.
+            remaining = int(max(0, (len(pending) - cursor) * elapsed / cursor))
             log(f"翻译进度：{done}/{len(events)}，预计剩余 {remaining} 秒")
     finally:
         if metrics.requests:
+            metrics.translation_wall_seconds = max(0.0, time.monotonic() - started)
             log(f"{LANGUAGES.get(target_code, ('', '', target_code))[2]}：{metrics.summary()}")
 
     for idx in range(1, len(events) + 1):
-        cache.setdefault(idx, "")
-        issue = translation_quality_issue(cleaned[idx], cache[idx], target_code)
-        if issue:
-            raise RuntimeError(f"字幕第 {idx} 行翻译验收失败：{issue}；未写入成品。")
+        translations.setdefault(idx, "")
+        if cleaned[idx]:
+            translation_review.validate_text(translations[idx])
+        issue = translation_quality_issue(cleaned[idx], translations[idx], target_code)
+        if issue and idx not in issues:
+            raise RuntimeError(f"字幕第 {idx} 行缺少质量问题记录，未写入成品。")
+    check_cancel(cancel_event)
     rewrite_cache(cache_path, target_code, cleaned, cache)
-    write_srt(output_srt, events, cache)
+    if issues or had_issue_report:
+        translation_review.save_progress(events, target_code, source_language, cache_path,
+                                         output_srt, issues, complete=True, translations=translations)
+        unresolved = sum(item.get('status') == 'needs_review' for item in issues.values())
+        log(f"翻译问题记录：{translation_review.report_path(cache_path)}；仍待修改{unresolved}条。")
+    else:
+        write_srt(output_srt, events, translations)
     log(f"写入新字幕：{output_srt}")
 
 
@@ -2249,7 +3252,33 @@ def mux_video(
             (path, code, name, default_subtitle == ("generated", index))
             for index, (path, code, name, _default) in enumerate(generated_subtitles)
         ]
+    import subtitle_fonts
+    style_result = None
+    if subtitle_fonts.CONTEXT.get():
+        input_media = input_media if input_media is not None else inspect_media(input_path)
+        style_result = subtitle_fonts.prepare_mux(
+            input_path, output_path, input_media, keep_subtitle_ids, generated_subtitles,
+            subtitle_sync_offsets, default_subtitle, log, cancel_event, chinese_script_equivalent,
+        )
+        if style_result:
+            keep_subtitle_ids = style_result['kept']
+            generated_subtitles = style_result['generated']
     args = [MKVMERGE, "-o", output_path]
+    if style_result and style_result['fonts']:
+        args += ['--enable-legacy-font-mime-types']
+    if style_result and style_result['replacements']:
+        order=[]
+        for track in input_media['tracks']:
+            track_id=track['id']
+            if track['type']=='video' or (track['type']=='audio' and track_id in keep_audio_ids):
+                order.append(f'0:{track_id}')
+            elif track_id in style_result['replacements']:
+                order.append(f'{style_result["replacements"][track_id]+1}:0')
+            elif track['type']=='subtitles' and track_id in keep_subtitle_ids:
+                order.append(f'0:{track_id}')
+        original_generated_count=len(generated_subtitles)-len(style_result['replacements'])
+        order += [f'{i+1}:0' for i in range(original_generated_count)]
+        args += ['--track-order', ','.join(order)]
     if keep_audio_ids:
         args += ["--audio-tracks", ",".join(str(item) for item in keep_audio_ids)]
         if not preserve_audio_defaults:
@@ -2275,6 +3304,13 @@ def mux_video(
 
     for subtitle_path, lang_code, track_name, is_default in generated_subtitles:
         mkv_lang = LANGUAGES.get(lang_code, ("und", lang_code, lang_code))[0]
+        props = style_result['metadata'].get(str(subtitle_path), {}) if style_result else {}
+        mkv_lang = props.get('language_ietf') or props.get('language') or mkv_lang
+        for key, option in {'forced_track':'--forced-display-flag', 'enabled_track':'--track-enabled-flag',
+                'hearing_impaired':'--hearing-impaired-flag', 'visual_impaired':'--visual-impaired-flag',
+                'text_descriptions':'--text-descriptions-flag', 'original':'--original-flag',
+                'commentary':'--commentary-flag'}.items():
+            if key in props: args += [option, f'0:{int(bool(props[key]))}']
         args += [
             "--language",
             f"0:{mkv_lang}",
@@ -2284,6 +3320,16 @@ def mux_video(
             "0:yes" if is_default else "0:no",
             str(subtitle_path),
         ]
+
+    if style_result:
+        # Attach once per content hash, including when multiple languages use
+        # the same font. Existing original attachments remain on the main input.
+        for font in style_result['fonts']:
+            mime='application/x-truetype-font' if Path(font['path']).suffix.lower()=='.ttf' else 'application/vnd.ms-opentype'
+            if font.get('embed',True):
+                args += ['--attachment-mime-type',mime,'--attachment-name',f'SubFlow-{font["sha256"][:16]}{Path(font["path"]).suffix.lower()}', '--attach-file',font['path']]
+            for notice in font.get('notices',[]):
+                args += ['--attachment-mime-type','text/plain','--attachment-name',f'SubFlow-{font["sha256"][:16]}-{Path(notice).name}', '--attach-file',notice]
 
     log(f"封装输出：{output_path}")
     check_cancel(cancel_event)
@@ -2296,7 +3342,7 @@ def mux_video(
         log(f"封装方式：原封装；{fast_plan.reason}。")
         run_command(args, log=log, cancel_event=cancel_event)
         return
-    log("封装方式：TrueHD 快速直通；保持原音视频、字幕偏移、章节与附件。")
+    log(f"封装方式：{fast_plan.audio_kind} 快速直通；保持原音视频、字幕偏移、章节与附件。")
     fast_args = args[:3] + ["--engage", "force_passthrough_packetizer"] + args[3:]
     try:
         run_command(fast_args, log=log, cancel_event=cancel_event)
@@ -2658,6 +3704,11 @@ def validate_media_output(
         raise RuntimeError(f"输出完整性验证失败：音轨 {actual_audio_tracks}/{expected_audio_tracks}。")
     if actual_subtitle_tracks != expected_subtitle_tracks:
         raise RuntimeError(f"输出完整性验证失败：字幕轨 {actual_subtitle_tracks}/{expected_subtitle_tracks}。")
+    import subtitle_audit
+    audit = subtitle_audit.current()
+    if audit is not None:
+        audit.check_output_purposes(output_media)
+        log('成品字幕用途检查通过；每轨时间轴和内容验证状态另列于字幕报告。')
 
     # A matching count is insufficient: an MP4-to-MKV work copy can renumber
     # tracks, accidentally preserving a different language with the same count.
@@ -2843,6 +3894,7 @@ def process_video(
                 events, code,
                 work / f"translation-cache-track-{source_track.id}-{code}.jsonl",
                 source_code,
+                output_srt=work / f"translated-track-{source_track.id}-{code}.srt",
             )
         ]
 

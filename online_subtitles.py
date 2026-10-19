@@ -17,10 +17,14 @@ import zipfile
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from subtitle_candidate_priority import author_name
+from work_identity_resolver import WorkProfile, read_cached_resolution, resolve as resolve_work_identity
 
 from media_title_resolver import (
     TITLE_SETTINGS_LOCK,
     canonical_title_source,
+    connector_query_proposals,
+    controlled_connector_alias,
     needs_canonical_title,
     reject_canonical_title,
     remember_canonical_title,
@@ -29,11 +33,15 @@ from media_title_resolver import (
     sequel_title_conflict,
 )
 from subtitle_identity_guard import (
+    clean_video_title,
+    catalogue_title_aliases,
+    controlled_film_title_alias,
     container_title,
     container_title_can_replace_filename,
     edition_label,
     filename_container_identity_conflict,
     media_specification,
+    parse_filename_and_container,
 )
 
 
@@ -136,6 +144,17 @@ class SubtitleCandidate:
     feature_tmdb_id: str = ""
     identity_verified: bool = False
     identity_key: str = ""
+    feature_type: str = ""
+    feature_season_number: str = ""
+    feature_episode_number: str = ""
+    feature_parent_imdb_id: str = ""
+    feature_parent_tmdb_id: str = ""
+    author: str = ""
+    author_role: str = ""
+    priority_reason: str = ""
+    identity_admission_state: str = ""
+    identity_admission_reason: str = ""
+    identity_admission_evidence: tuple[dict, ...] = ()
 
 
 @dataclass
@@ -149,6 +168,12 @@ class SearchMeta:
     feature_lookup_reason: str = ""
     feature_lookup_attempts: tuple[str, ...] = ()
     fallback_reason: str = ""
+    identity_resolution_status: str = ""
+    identity_resolution_reason: str = ""
+    identity_resolution_requests: int = 0
+    identity_resolution_seconds: float = 0.0
+    identity_resolution_cache_hit: bool = False
+    identity_resolution_evidence: tuple[dict, ...] = ()
 
 
 class SubtitleAuthenticationError(RuntimeError):
@@ -165,6 +190,7 @@ class _FeatureLookupDiagnostics:
     reason: str = ""
     attempts: list[str] = field(default_factory=list)
     proposal_conflict: bool = False
+    profiles: list[WorkProfile] = field(default_factory=list)
 
 
 # Batch lookups may run concurrently. Keep diagnostics attached to this search
@@ -172,6 +198,7 @@ class _FeatureLookupDiagnostics:
 _FEATURE_LOOKUP_DIAGNOSTICS: ContextVar[_FeatureLookupDiagnostics | None] = ContextVar(
     "opensubtitles_feature_lookup_diagnostics", default=None,
 )
+_WORK_IDENTITY_CONTEXT: ContextVar[dict | None] = ContextVar('opensubtitles_work_identity_context', default=None)
 
 
 def _provider_id_key(value: object, *, imdb: bool = False) -> str:
@@ -223,7 +250,7 @@ IDENTITY_DESCRIPTORS = {
 
 def _strip_identity_descriptors(value: str) -> str:
     value = html.unescape(value or "")
-    value = re.sub(r"^\s*(?:19|20)\d{2}\s*[-–—:]\s*", "", value)
+    value = re.sub(r"^\s*(?:19|20)\d{2}\s+[-–—]\s+", "", value)
     while True:
         match = re.search(r"\s*\(([^()]*)\)\s*$", value)
         if not match:
@@ -237,11 +264,17 @@ def _strip_identity_descriptors(value: str) -> str:
 
 def _identity_title_tokens(value: str) -> tuple[str, ...]:
     value = _strip_identity_descriptors(value).replace("’", "'").replace("'", "")
+    # OpenSubtitles movie_name may prefix its year. Numeric film titles (1917,
+    # 2001: A Space Odyssey, Blade Runner 2049) are part of the identity.
+    value = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", value)
+    raw_tokens = re.findall(r"[A-Z0-9]+", value.upper())
     tokens = [
-        ROMAN_NUMERALS.get(token, token)
-        for token in re.findall(r"[A-Z0-9]+", value.upper())
-        if not re.fullmatch(r"(?:19|20)\d{2}", token)
-        and token not in TITLE_CONNECTORS
+        (token if token == "X" and 0 < index < len(raw_tokens) - 1
+         and raw_tokens[index + 1].isalpha()
+         and raw_tokens[index + 1] not in {"BLURAY", "BDRIP", "REMUX", "WEB", "WEBRIP", "HDR"}
+         and raw_tokens[index - 1] not in {"EPISODE", "EP", "PART", "CHAPTER"}
+         else ROMAN_NUMERALS.get(token, token))
+        for index, token in enumerate(raw_tokens) if token not in TITLE_CONNECTORS
     ]
     while tokens and tokens[0] in LEADING_ARTICLES:
         tokens.pop(0)
@@ -270,7 +303,8 @@ def _titles_typo_equivalent(left: str, right: str) -> bool:
     if len(left_tokens) != len(right_tokens) or not left_tokens:
         return False
     differences = [(a, b) for a, b in zip(left_tokens, right_tokens) if a != b]
-    return len(differences) == 1 and _edit_distance_one(*differences[0])
+    return (len(differences) == 1 and not any(token.isdigit() for token in differences[0])
+            and _edit_distance_one(*differences[0]))
 
 
 def _titles_equivalent(left: str, right: str) -> bool:
@@ -320,6 +354,9 @@ def _candidate_matches_identity(candidate: SubtitleCandidate, identity: MediaIde
         return any(
             _titles_equivalent(expected, candidate.feature_title)
             or _titles_typo_equivalent(expected, candidate.feature_title)
+            or (getattr(candidate, 'feature_year', '') == identity.year
+                and _candidate_matches_strong_identity(candidate, identity)
+                and controlled_film_title_alias(expected, candidate.feature_title, identity.year))
             for expected in expected_titles
         )
 
@@ -346,13 +383,62 @@ def _title_year_identity_key(candidate: SubtitleCandidate, identity: MediaIdenti
 
 def _candidate_matches_strong_identity(candidate: SubtitleCandidate, identity: MediaIdentity) -> bool:
     pairs = (
-        (_provider_id_key(identity.imdb_id, imdb=True),
-         _provider_id_key(candidate.feature_imdb_id, imdb=True)),
-        (_provider_id_key(identity.tmdb_id),
-         _provider_id_key(candidate.feature_tmdb_id)),
+        (_provider_id_key(getattr(identity, "imdb_id", ""), imdb=True),
+         _provider_id_key(getattr(candidate, "feature_imdb_id", ""), imdb=True)),
+        (_provider_id_key(getattr(identity, "tmdb_id", "")),
+         _provider_id_key(getattr(candidate, "feature_tmdb_id", ""))),
     )
     comparable = [(expected, actual) for expected, actual in pairs if expected and actual]
     return bool(comparable) and all(expected == actual for expected, actual in comparable)
+
+
+def _candidate_identity_metadata_conflict(candidate: object, identity: object) -> str:
+    """Reject explicit contradictions and anonymous broad-search placeholders.
+
+    Ordinary named aliases without IDs remain eligible for content validation.
+    A hash or a matching strong ID can establish an anonymous catalogue row;
+    the unqualified identity_verified flag cannot.
+    """
+    for name, imdb in (("imdb_id", True), ("tmdb_id", False)):
+        expected = _provider_id_key(getattr(identity, name, ""), imdb=imdb)
+        actual = _provider_id_key(getattr(candidate, "feature_" + name, ""), imdb=imdb)
+        if expected and actual and expected != actual:
+            return f"候选 {name.upper()} 与已确认影片身份冲突"
+    feature_type = re.sub(r"[^a-z]", "", str(getattr(candidate, "feature_type", "")).lower())
+    episodic = any(_provider_id_key(getattr(candidate, name, ""), imdb="imdb" in name)
+                   for name in ("feature_season_number", "feature_episode_number",
+                                "feature_parent_imdb_id", "feature_parent_tmdb_id"))
+    if feature_type in {"episode", "tvepisode", "tvseries", "series", "tvshow"} or episodic:
+        return "候选属于剧集条目，与本片电影身份不符"
+    title = str(getattr(candidate, "feature_title", "") or "")
+    tokens = _identity_title_tokens(title)
+    placeholder = not tokens or " ".join(tokens) in {
+        "EMPTY MOVIE", "EMPTY MOVIE SUBSCENE", "UNKNOWN", "UNKNOWN MOVIE",
+        "UNTITLED", "UNTITLED MOVIE", "NONE", "NULL", "N A", "UNAVAILABLE",
+    }
+    if not placeholder:
+        return ""
+    if (getattr(candidate, "moviehash_match", False)
+            or _candidate_matches_strong_identity(candidate, identity)):
+        return ""
+    # A complete, contiguous title in a release can support a genuinely missing
+    # catalogue title. A placeholder title is affirmative bad metadata, so it
+    # additionally needs its declared year to agree.
+    year = str(getattr(identity, "year", "") or "")
+    actual_year = str(getattr(candidate, "feature_year", "") or "")
+    if title and (not year or actual_year != year):
+        return "候选站点影片身份为占位记录，缺少可核对的年份或身份"
+    titles = (getattr(identity, "title", ""), getattr(identity, "original_title", ""))
+    for expected_title in titles:
+        expected = _identity_title_tokens(str(expected_title or ""))
+        if not expected:
+            continue
+        for name in ("release", "file_name"):
+            release = _identity_title_tokens(str(getattr(candidate, name, "") or ""))
+            if any(release[index:index + len(expected)] == expected
+                   for index in range(len(release) - len(expected) + 1)):
+                return ""
+    return "候选缺少可确认的影片身份，站点占位信息及发布名均不能证明同片"
 
 
 def settings_path() -> Path:
@@ -379,20 +465,6 @@ def save_settings(api_key: str) -> None:
         )
 
 
-def clean_video_title(path: str) -> tuple[str, str]:
-    stem = Path(path).stem
-    year_matches = list(re.finditer(r"\b(19\d{2}|20\d{2})\b", stem))
-    year_match = year_matches[-1] if year_matches else None
-    year = year_match.group(1) if year_match else ""
-    title = re.sub(r"[._]+", " ", stem)
-    if year_match:
-        title = title[: title.find(year)].strip()
-    title = re.sub(r"\[[^\]]*\]|【[^】]*】|\([^)]*(?:www\.|@)[^)]*\)", " ", title, flags=re.I)
-    title = re.sub(r"\b(?:2160p|1080p|720p|BluRay|WEB[- .]?DL|WEBRip|BDRip|HDR|DV|x26[45]|H\.?26[45]|REMUX|AAC|DDP?\d?(?:\.\d)?|Atmos)\b.*$", "", title, flags=re.I)
-    title = re.sub(r"\s+", " ", title).strip(" -._([{<")
-    return title or Path(path).stem, year
-
-
 def identify_media(video_path: str) -> MediaIdentity:
     title, year = clean_video_title(video_path)
     embedded_title = container_title(video_path)
@@ -403,7 +475,9 @@ def identify_media(video_path: str) -> MediaIdentity:
             embedded_title,
             flags=re.I,
         ).strip()
-        resolved_title, embedded_year = clean_video_title(embedded_title)
+        filename, internal = parse_filename_and_container(video_path, embedded_title)
+        title, year = filename.title, filename.year
+        resolved_title, embedded_year = internal.title, internal.year
         if container_title_can_replace_filename(title, resolved_title):
             title = resolved_title
             year = year or embedded_year
@@ -428,6 +502,8 @@ def _episode_number(value: str) -> str:
 
 def _feature_title_variants(identity: MediaIdentity, *, strict: bool = False) -> list[str]:
     titles = list(dict.fromkeys(value for value in (identity.original_title, identity.title) if value))
+    for title in list(titles):
+        titles.extend(catalogue_title_aliases(title, identity.year))
     # Some sites file the 1977 film under its original title, "Star Wars".
     # These aliases still require the exact film year in strict ID resolution.
     if strict:
@@ -487,6 +563,13 @@ def _feature_identity_from_response(
         imdb_id = re.sub(r"^tt", "", str(attrs.get("imdb_id") or "").strip(), flags=re.I)
         tmdb_id = str(attrs.get("tmdb_id") or "").strip()
         year = str(attrs.get("year") or "").strip()
+        if diagnostics is not None:
+            aliases = attrs.get('title_aka') or []
+            aliases = [aliases] if isinstance(aliases, str) else aliases
+            aliases = tuple(value for value in aliases if isinstance(value, str)) if isinstance(aliases, (list, tuple)) else ()
+            diagnostics.profiles.append(WorkProfile(
+                original_title or title, year, imdb_id, tmdb_id, 'opensubtitles-features',
+                feature_type, tuple(dict.fromkeys((title, original_title, *aliases)))))
         id_keys = set()
         if imdb_key := _provider_id_key(imdb_id, imdb=True):
             id_keys.add(("imdb", imdb_key))
@@ -532,6 +615,13 @@ def _feature_identity_from_response(
                 ),
                 "",
             )
+        connector_match = False
+        if not matched_title and identity.year and year == identity.year and id_keys:
+            matched_title = next((candidate_title for expected in expected_titles
+                                  for candidate_title in candidate_titles
+                                  if feature_type in {"movie", "feature"}
+                                  and controlled_connector_alias(expected, candidate_title)), "")
+            connector_match = bool(matched_title)
         if not matched_title:
             # A native-name query may return only the catalogue's English name.
             # Use its exact original year, explicit installment (when present),
@@ -561,7 +651,8 @@ def _feature_identity_from_response(
                 if identity.year != year:
                     reject("年份格式或内容不符")
                     continue
-        resolved_original = ((identity.original_title or identity.title) if strict and not localized_query
+        resolved_original = ((identity.original_title or identity.title)
+                             if strict and not localized_query and not connector_match
                              else matched_title)
         if localized and needs_canonical_title(resolved_original):
             resolved_original = next((value for value in (original_title, title)
@@ -651,40 +742,45 @@ def _resolve_feature_identity(
         return None
     queries = (_feature_title_variants(identity, strict=True) if strict
                else _title_query_variants(title))
-    for exact in ((True,) if strict else (True, False)):
-        for query in queries:
-            params = {"query": query, "type": "movie"}
-            if exact:
-                params["query_match"] = "exact"
-            try:
-                response = _request(api_key, "/features", params=params)
-            except (SubtitleAuthenticationError, SubtitleQuotaError) as exc:
-                if diagnostics is not None:
-                    diagnostics.status = "authentication-error" if isinstance(exc, SubtitleAuthenticationError) else "quota-error"
-                    diagnostics.reason = str(exc)
-                    diagnostics.attempts.append(f"{query}：{diagnostics.reason}")
-                raise
-            except Exception as exc:
-                if diagnostics is not None:
-                    diagnostics.status = "request-failed"
-                    safe_error = str(exc).replace(api_key, "[已隐藏]") if api_key else str(exc)
-                    diagnostics.reason = f"影片条目请求失败（{type(exc).__name__}）：{safe_error[:240]}"
-                    diagnostics.attempts.append(f"{query}：{diagnostics.reason}")
-                continue
-            resolved = _feature_identity_from_response(
-                response, identity, strict=strict, diagnostics=diagnostics,
-            )
+    attempts = [(query, exact) for exact in ((True,) if strict else (True, False)) for query in queries]
+    # Only a title with a substantial unchanged subtitle can generate this one
+    # retry. The response still needs exact year, strong IDs and unique identity.
+    if identity.year:
+        attempts.extend((query, False) for query in connector_query_proposals(title)
+                        if query.casefold() not in {value.casefold() for value in queries})
+    for query, exact in attempts:
+        params = {"query": query, "type": "movie"}
+        if exact:
+            params["query_match"] = "exact"
+        try:
+            response = _request(api_key, "/features", params=params)
+        except (SubtitleAuthenticationError, SubtitleQuotaError) as exc:
             if diagnostics is not None:
-                mode = "精确" if exact else "宽搜后身份筛选"
-                diagnostics.attempts.append(f"{mode} {query}：{diagnostics.reason}")
-            if resolved:
-                return resolved
-            if (needs_canonical_title(identity.title) and diagnostics is not None
-                    and diagnostics.status == "identity-conflict"):
-                # This English proposal is already contradicted by the site's
-                # catalogue. Search the original name next, not more variants
-                # of the same wrong sequel.
-                return None
+                diagnostics.status = "authentication-error" if isinstance(exc, SubtitleAuthenticationError) else "quota-error"
+                diagnostics.reason = str(exc)
+                diagnostics.attempts.append(f"{query}：{diagnostics.reason}")
+            raise
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.status = "request-failed"
+                safe_error = str(exc).replace(api_key, "[已隐藏]") if api_key else str(exc)
+                diagnostics.reason = f"影片条目请求失败（{type(exc).__name__}）：{safe_error[:240]}"
+                diagnostics.attempts.append(f"{query}：{diagnostics.reason}")
+            continue
+        resolved = _feature_identity_from_response(
+            response, identity, strict=strict, diagnostics=diagnostics,
+        )
+        if diagnostics is not None:
+            mode = "精确" if exact else "宽搜后身份筛选"
+            diagnostics.attempts.append(f"{mode} {query}：{diagnostics.reason}")
+        if resolved:
+            return resolved
+        if (needs_canonical_title(identity.title) and diagnostics is not None
+                and diagnostics.status == "identity-conflict"):
+            # This English proposal is already contradicted by the site's
+            # catalogue. Search the original name next, not more variants
+            # of the same wrong sequel.
+            return None
     return None
 
 
@@ -781,7 +877,9 @@ def _candidates_from_response(response: dict, language: str) -> list[SubtitleCan
             rating=float(attrs.get("ratings") or 0),
             trusted=bool(attrs.get("from_trusted")),
             hearing_impaired=bool(attrs.get("hearing_impaired")),
-            moviehash_match=bool(attrs.get("moviehash_match")),
+            moviehash_match=attrs.get("moviehash_match") is True,
+            author=author_name(attrs.get("uploader")),
+            author_role="上传者",
             feature_title=str(
                 feature.get("movie_name") or feature.get("title") or feature.get("name") or ""
             ),
@@ -789,6 +887,11 @@ def _candidates_from_response(response: dict, language: str) -> list[SubtitleCan
             feature_id=str(feature.get("feature_id") or ""),
             feature_imdb_id=str(feature.get("imdb_id") or "").removeprefix("tt"),
             feature_tmdb_id=str(feature.get("tmdb_id") or ""),
+            feature_type=str(feature.get("feature_type") or ""),
+            feature_season_number=str(feature.get("season_number") or ""),
+            feature_episode_number=str(feature.get("episode_number") or ""),
+            feature_parent_imdb_id=str(feature.get("parent_imdb_id") or ""),
+            feature_parent_tmdb_id=str(feature.get("parent_tmdb_id") or ""),
         ))
     return results
 
@@ -940,7 +1043,146 @@ def _search_localized_title(
     )
 
 
-def search(
+def _candidate_work_profiles(candidates):
+    return [WorkProfile(
+        str(getattr(item, 'feature_title', '') or ''), str(getattr(item, 'feature_year', '') or ''),
+        str(getattr(item, 'feature_imdb_id', '') or ''), str(getattr(item, 'feature_tmdb_id', '') or ''),
+        'opensubtitles-subtitles', str(getattr(item, 'feature_type', '') or 'movie'))
+        for item in candidates]
+
+
+def _apply_identity_admission(candidates, identity, status='', evidence=()):
+    """Positive same-work admission, before the unchanged purpose/timing gates.
+
+    Keep all rows for manual search. Automatic callers must respect state.
+    In particular, ambiguous catalogue IDs cannot become verified merely by
+    a later title/year fallback.
+    """
+    exact_rows = [item for item in candidates
+                  if getattr(item, 'feature_title', '') and _title_year_identity_key(item, identity)]
+    ids = {('imdb', value) for item in exact_rows
+           if (value := _provider_id_key(item.feature_imdb_id, imdb=True))}
+    ids.update(('tmdb', value) for item in exact_rows
+               if (value := _provider_id_key(item.feature_tmdb_id)))
+    competing = any(len({value for source, value in ids if source == provider}) > 1
+                    for provider in ('imdb', 'tmdb'))
+    ambiguous = status in {'ambiguous', 'identity-conflict'} or competing
+    for item in candidates:
+        conflict = _candidate_identity_metadata_conflict(item, identity)
+        if conflict:
+            state, reason = 'filtered', conflict
+        elif item.moviehash_match is True:
+            state, reason = 'auto', '站点逐条明确Hash命中，仍需用途、正文及时间轴核验'
+        elif _candidate_matches_strong_identity(item, identity):
+            state, reason = 'auto', '与已确认作品ID一致，仍需用途、正文及时间轴核验'
+        elif getattr(item, 'feature_title', '') and _title_year_identity_key(item, identity):
+            if ambiguous:
+                state, reason = 'pending', '片名和年份相符，但作品ID歧义未解除，不能降格为确认'
+            else:
+                state, reason = 'auto', '完整目录片名及明确年份一致，仍需用途、正文及时间轴核验'
+        else:
+            expected = _identity_title_tokens(identity.original_title or identity.title)
+            actual = _identity_title_tokens(item.feature_title)
+            same_year = bool(identity.year and identity.year == item.feature_year)
+            prefix = bool(len(actual) >= 2 and len(actual) < len(expected) and expected[:len(actual)] == actual)
+            if not actual or (same_year and prefix) or (actual == expected and not item.feature_year):
+                state, reason = 'pending', '候选尚缺完整同片身份或别名证据，保留供字幕选择确认'
+            else:
+                state, reason = 'filtered', '宽搜记录缺少明确Hash、一致作品ID或完整片名年份证据'
+        item.identity_admission_state = state
+        item.identity_admission_reason = reason
+        item.identity_admission_evidence = tuple(evidence) if state == 'auto' else ()
+        item.identity_verified = state == 'auto'
+        if state != 'auto':
+            item.identity_key = f'opensubtitles-file:{item.file_id}'
+            item.recommendation = '身份待确认' if state == 'pending' else '影片身份不符'
+        elif getattr(identity, 'imdb_id', ''):
+            item.identity_key = 'imdb:' + str(identity.imdb_id)
+        elif getattr(identity, 'tmdb_id', ''):
+            item.identity_key = 'tmdb:' + str(identity.tmdb_id)
+        elif item.moviehash_match is not True:
+            # Preserve the established verification/checkpoint key for an
+            # unambiguous full-title/year fallback without catalogue IDs.
+            # This branch must never overwrite an explicit hash identity.
+            item.identity_key = _title_year_identity_key(item, identity) or item.identity_key
+        item.match_reason = reason
+    return candidates
+
+
+def _resolution_meta(meta, resolution):
+    meta.identity_resolution_status = resolution.state
+    meta.identity_resolution_reason = resolution.reason
+    meta.identity_resolution_requests = resolution.request_count
+    meta.identity_resolution_seconds = resolution.elapsed_seconds
+    meta.identity_resolution_cache_hit = resolution.cache_hit
+    meta.identity_resolution_evidence = resolution.evidence
+    return meta
+
+
+def _recover_work_identity(api_key, identity, candidates, meta, lookup=None):
+    context = _WORK_IDENTITY_CONTEXT.get()
+    if context is not None and context['attempted']:
+        return None
+    if context is not None:
+        context['attempted'] = True
+    profiles = tuple(getattr(lookup, 'profiles', ()) or ()) + tuple(_candidate_work_profiles(candidates))
+    resolution = resolve_work_identity(identity, profiles,
+                                       cancel_event=context.get('cancel_event') if context else None,
+                                       time_budget_seconds=min(15.0, max(0.0, context.get('metadata_budget_seconds', 15.0))) if context else 15.0)
+    if context is not None:
+        context['resolution'] = resolution
+    _resolution_meta(meta, resolution)
+    if lookup is not None:
+        lookup.attempts.extend(resolution.attempts)
+    if resolution.state != 'confirmed':
+        return None
+    return _search_confirmed_work_identity(api_key, identity, candidates, meta, resolution, lookup)
+
+
+def _search_confirmed_work_identity(api_key, identity, candidates, meta, resolution, lookup=None):
+    context = _WORK_IDENTITY_CONTEXT.get()
+    if context is not None:
+        context['resolution'] = resolution
+    _resolution_meta(meta, resolution)
+    resolved = replace(identity, original_title=resolution.title, year=resolution.year,
+                       imdb_id=resolution.imdb_id, tmdb_id=resolution.tmdb_id)
+    # The confirmed ID, never the shorter name, scopes the actual subtitle query.
+    params = {'languages': context.get('language', 'en') if context else 'en',
+              'imdb_id': resolved.imdb_id, 'type': 'movie'}
+    fresh, total, truncated = _search_pages(api_key, params, params['languages'])
+    # Preserve already discovered candidates for manual inspection and audit;
+    # nonmatching rows remain filtered and cannot consume download attempts.
+    combined = {item.file_id: item for item in (*candidates, *fresh)}
+    results = list(combined.values())
+    _apply_identity_admission(results, resolved, 'resolved', resolution.evidence)
+    meta.total_count = total
+    meta.loaded_count = len(results)
+    meta.truncated = truncated
+    meta.query_mode = 'confirmed-work-id'
+    meta.feature_lookup_status = 'resolved'
+    meta.feature_lookup_reason = resolution.reason
+    meta.feature_lookup_attempts = tuple(getattr(lookup, 'attempts', ())) or resolution.attempts
+    meta.fallback_reason = ''
+    return resolved, results, meta
+
+
+def search(api_key: str, video_path: str, language: str, *, skip_hash: bool = False,
+           cancel_event=None, identity_time_budget_seconds: float = 15.0) -> tuple[MediaIdentity, list[SubtitleCandidate], SearchMeta]:
+    context = {'cancel_event': cancel_event, 'attempted': False, 'resolution': None, 'language': language,
+               'metadata_budget_seconds': identity_time_budget_seconds}
+    token = _WORK_IDENTITY_CONTEXT.set(context)
+    try:
+        identity, candidates, meta = _search_impl(api_key, video_path, language, skip_hash=skip_hash)
+        if context['resolution'] is not None and not meta.identity_resolution_status:
+            _resolution_meta(meta, context['resolution'])
+        _apply_identity_admission(candidates, identity, meta.feature_lookup_status,
+                                  meta.identity_resolution_evidence)
+        return identity, candidates, meta
+    finally:
+        _WORK_IDENTITY_CONTEXT.reset(token)
+
+
+def _search_impl(
     api_key: str, video_path: str, language: str, *, skip_hash: bool = False,
 ) -> tuple[MediaIdentity, list[SubtitleCandidate], SearchMeta]:
     if not api_key.strip():
@@ -976,7 +1218,25 @@ def search(
             return identity, exact, SearchMeta(total_count=total, loaded_count=len(exact), query_mode="hash", moviehash=moviehash, truncated=truncated)
 
     if needs_canonical_title(identity.title):
-        return _search_localized_title(api_key, base_identity, language, moviehash)
+        # Reading this source does not start the local model. Already confirmed
+        # aliases (or their bounded series proposal) retain their existing fast
+        # provider-confirmation path. Without one, try lightweight native-name
+        # metadata before a possible first 90-second model request.
+        source = canonical_title_source(identity.title, identity.year, settings_path())
+        cached_proposal = source in {'缓存', '已确认系列别名与续集编号'}
+        localized = (_search_localized_title(api_key, base_identity, language, moviehash)
+                     if cached_proposal else None)
+        if localized is not None and localized[1]:
+            return localized
+        native_meta = localized[2] if localized is not None else SearchMeta(
+            query_mode='unresolved-title', moviehash=moviehash,
+            feature_lookup_status='unresolved', feature_lookup_reason='原片名尚无已确认英文别名')
+        recovered = _recover_work_identity(api_key, identity,
+                                            localized[1] if localized is not None else [], native_meta)
+        if recovered is not None:
+            return recovered
+        return localized if localized is not None else _search_localized_title(
+            api_key, base_identity, language, moviehash)
 
     # A hash miss/rejection must not carry the site's hash identity forward.
     # Resolve the local film afresh; only a unique title/year-confirmed ID may
@@ -1028,6 +1288,26 @@ def search(
             )
         fallback_reason = "已定位影片身份，但该身份未返回字幕；改用原片名和年份搜索"
 
+    if (feature_identity is None and base_identity.year
+            and lookup.status != 'identity-conflict' and not lookup.proposal_conflict):
+        cached = read_cached_resolution(base_identity, lookup.profiles)
+        if cached is not None:
+            context = _WORK_IDENTITY_CONTEXT.get()
+            if context is not None:
+                context['attempted'] = True
+            lookup.attempts.append('复用完整片名和年份绑定的已确认作品证据；跳过重复宽搜')
+            meta = SearchMeta(moviehash=moviehash, feature_lookup_attempts=tuple(lookup.attempts))
+            return _search_confirmed_work_identity(api_key, base_identity, [], meta, cached, lookup)
+
+    if not base_identity.year:
+        reason = ("未取得可用的已确认影片身份，文件名也没有年份；停止按未确认片名宽搜。"
+                  "请补全正确片名和年份，或使用字幕选择。")
+        return feature_identity or base_identity, [], SearchMeta(
+            query_mode="unresolved-title", moviehash=moviehash,
+            feature_lookup_status=lookup.status, feature_lookup_reason=lookup.reason,
+            feature_lookup_attempts=tuple(lookup.attempts), fallback_reason=reason,
+        )
+
     # A tentative provider feature must never replace the original filename
     # identity. If the provider-id path is empty, retry the user's actual title.
     identity = base_identity
@@ -1037,16 +1317,7 @@ def search(
     if identity.year:
         params["year"] = identity.year
     results, total, truncated = _search_pages(api_key, params, language)
-    for item in results:
-        identity_key = _title_year_identity_key(item, identity)
-        if identity_key:
-            item.identity_verified = True
-            item.identity_key = identity_key
-        else:
-            item.identity_key = f"opensubtitles-file:{item.file_id}"
-        item.recommendation = "待内容验证"
-        item.match_reason = "标题搜索候选；最终以下载后的正文验证为准"
-    return identity, results, SearchMeta(
+    meta = SearchMeta(
         total_count=total,
         loaded_count=len(results),
         query_mode="title-year",
@@ -1057,6 +1328,12 @@ def search(
         feature_lookup_attempts=tuple(lookup.attempts),
         fallback_reason=fallback_reason,
     )
+    if feature_identity is None:
+        recovered = _recover_work_identity(api_key, identity, results, meta, lookup)
+        if recovered is not None:
+            return recovered
+    _apply_identity_admission(results, identity, lookup.status)
+    return identity, results, meta
 
 
 def _extract_download(data: bytes, file_name: str, destination: Path) -> Path:

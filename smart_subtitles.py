@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from collections import Counter
 from contextlib import contextmanager
 import concurrent.futures
 import socket
 import hashlib
+import json
 from pathlib import Path
 import re
 import threading
@@ -17,14 +18,21 @@ import online_subtitles
 import pro_core
 import subdl_subtitles
 import subtitle_tool_core as core
+import subtitle_roles
+import subtitle_audit
+from subtitle_candidate_priority import prioritize_candidates, author_display
 from continuous_vad import adopted_alignment_report
+from work_identity_resolver import Resolution, validate_resolution
 from subtitle_identity_guard import (
     edition_conflict,
     filename_container_identity_conflict,
+    release_metadata,
     release_year_conflict,
     source_conflict,
+    media_signature,
     subtitle_language_label_conflict,
     verification_seal,
+    controlled_film_title_alias,
 )
 
 
@@ -45,7 +53,8 @@ def _search_result_summary(search_meta, loaded_count, queue_count, filtered_coun
     total_label = (
         str(total) if isinstance(total, int) and total >= loaded_count else "未提供"
     )
-    filtered = sum(filtered_counts.values())
+    pending = filtered_counts.get("identity_pending", 0)
+    filtered = sum(filtered_counts.values()) - pending
     details = "、".join(
         f"{label} {filtered_counts.get(key, 0)}"
         for key, label in (
@@ -58,6 +67,7 @@ def _search_result_summary(search_meta, loaded_count, queue_count, filtered_coun
     return (
         f"站点总计 {total_label} 条；本轮加载 {loaded_count} 条，"
         f"过滤 {filtered} 条" + (f"（{details}）" if details else "")
+        + (f"，影片身份待确认 {pending} 条" if pending else "")
         + f"，待核验 {queue_count} 条{suffix}。"
     )
 
@@ -214,9 +224,13 @@ def _download_wave(executor, wave, cancel_event):
 
 def candidate_key(provider: str, candidate: object) -> str:
     """Return a stable-enough key for skipping a candidate already rejected in this run."""
+    file_id = str(getattr(candidate, "file_id", "") or "").strip()
+    download_url = str(getattr(candidate, "download_url", "") or "").strip()
+    if download_url:
+        # URL paths and query tokens are case-sensitive, unlike release labels.
+        return f"{provider.strip().lower()}|{file_id}|{download_url}"
     identity = (
-        str(getattr(candidate, "file_id", "") or "").strip()
-        or str(getattr(candidate, "download_url", "") or "").strip()
+        file_id
         or "|".join(
             (
                 str(getattr(candidate, "release", "") or "").strip(),
@@ -265,6 +279,12 @@ def subtitle_content_fingerprint(path: str | Path) -> str:
     else:
         payload = subtitle.read_bytes().replace(b"\r\n", b"\n")
     return hashlib.sha256(payload).hexdigest()
+
+
+def subtitle_timeline_fingerprint(path):
+    events = core.parse_subtitle(Path(path))
+    payload = "\n".join(f"{event.start}|{event.end}" for event in events)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def subtitle_content_conflict(path: str | Path, requested: str = "en") -> str:
@@ -333,6 +353,124 @@ class SmartSubtitleResult:
     identity_key: str = ""
     release: str = ""
     verification_seal: str = ""
+    validation_audio_id: int | None = None
+    shared_audio: object | None = None
+
+
+@dataclass(frozen=True)
+class PendingSubtitleCandidate:
+    """An original downloaded subtitle, never a shifted alignment output."""
+    subtitle_path: str
+    language: str
+    provider: str
+    release: str
+    identity_key: str
+    raw_sha256: str
+    media_size: int
+    media_mtime_ns: int
+    preflight_directory: str
+    reference_paths: tuple[str, ...]
+    reference_sha256: tuple[str, ...]
+    reference_sidecar_sha256: tuple[str, ...]
+    evidence_json: str
+
+
+class PendingSubtitleReviewError(RuntimeError):
+    """Every automatic candidate finished; saved originals need human review."""
+    def __init__(self, candidates, context, manifest_path=""):
+        self.candidates = tuple(candidates)
+        self.context = dict(context)
+        self.manifest_path = str(manifest_path)
+        super().__init__(
+            ("参照音轨或字幕版本待确认，" if self.context.get('reason_code')=='reference_audio_unconfirmed' else "自动未确认时间轴，")
+            + f"已保留 {len(self.candidates)} 份原始字幕供核听；"
+            "可直接核听第一份，也可在线选择或导入其他字幕。"
+        )
+
+
+def validate_pending_candidate(video_path, candidate: PendingSubtitleCandidate) -> None:
+    """Recheck the original and its film before handing it to manual review."""
+    if media_signature(video_path) != {
+            "size": candidate.media_size, "mtime_ns": candidate.media_mtime_ns}:
+        raise RuntimeError("影片在自动核验后发生变化，不能沿用保存的字幕。")
+    source = Path(candidate.subtitle_path)
+    if (not source.is_file()
+            or hashlib.sha256(source.read_bytes()).hexdigest() != candidate.raw_sha256):
+        raise RuntimeError("保存的原始字幕已变化或丢失，请重新选择字幕。")
+
+
+def _pending_candidate(video_path, movie_signature, item, rejection, shared, *, reference_audio_unconfirmed=False):
+    """Save raw inputs for human review; neither reason grants automatic trust."""
+    if reference_audio_unconfirmed:
+        import continuous_vad
+        if (not isinstance(shared, continuous_vad.ReferenceAudioSession) or not shared.unconfirmed
+                or not shared.fallback_used or shared.confirmed or not continuous_vad._timing_failure(rejection)):
+            raise RuntimeError('缺少已完成备用音轨复核且仍未确认的记录。')
+        evidence=dict(sufficient=False,reasons=['reference_audio_unconfirmed'],
+                      original_rejection=shared.failure_reasons.get(str(item['subtitle']),str(rejection)),
+                      validation_audio_id=shared.validation_audio_id)
+        reference=shared.vad_reference
+    else:
+        evidence = rejection.evidence
+        reference=rejection.reference
+    if not reference_audio_unconfirmed and (evidence.get("sufficient") is not False
+            or evidence.get("reasons") != ["insufficient_independent_regional_support"]
+            or any(evidence.get(key, False) for key in (
+                "range_limited", "outside_range_peak", "regional_offset_conflict",
+                "tool_coordinate_invalid", "cue_coordinate_invalid", "reference_invalid"))):
+        raise RuntimeError("保存的字幕缺少符合独立区域支持不足条件的核验记录。")
+    if media_signature(video_path) != movie_signature:
+        raise RuntimeError("影片在候选核验期间发生变化，不能保留本次候选。")
+    source = Path(item["subtitle"])
+    original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    if original_hash != item["raw_sha256"]:
+        raise RuntimeError("下载的原始字幕在核验期间发生变化，不能保存为当前字幕核听来源。")
+    references = []
+    state = getattr(shared, "vad_preparation_state", None) or {}
+    for path in [*state.get("references", {}).values(), reference,
+                 *(getattr(shared,'checked_references',[]) if reference_audio_unconfirmed else [])]:
+        value = str(Path(path).resolve())
+        if value not in references:
+            references.append(value)
+    hashes, sidecar_hashes = [], []
+    for value in references:
+        path = Path(value)
+        hashes.append(hashlib.sha256(path.read_bytes()).hexdigest())
+        sidecar = path.with_suffix(".json")
+        sidecar_hashes.append(hashlib.sha256(sidecar.read_bytes()).hexdigest()
+                              if sidecar.is_file() else "")
+    original = item["candidate"]
+    candidate = PendingSubtitleCandidate(
+        subtitle_path=str(source.resolve()),
+        language=getattr(original, "language", "") or "en",
+        provider=str(item["provider"]), release=str(item["release"]),
+        identity_key=str(getattr(original, "identity_key", "") or ""),
+        raw_sha256=original_hash,
+        media_size=movie_signature["size"], media_mtime_ns=movie_signature["mtime_ns"],
+        preflight_directory=str((Path(item["directory"]) / "preflight").resolve()),
+        reference_paths=tuple(references), reference_sha256=tuple(hashes),
+        reference_sidecar_sha256=tuple(sidecar_hashes),
+        evidence_json=json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+    )
+    validate_pending_candidate(video_path, candidate)
+    return candidate
+
+
+def _pending_review_context(shared, candidates):
+    state = getattr(shared, "vad_preparation_state", None) or {}
+    return dict(
+        duration_seconds=shared.duration_seconds,
+        validation_audio_id=shared.validation_audio_id,
+        audio_stream_index=getattr(shared, "audio_stream_index", 0),
+        audio_language=shared.audio_language,
+        vad_reference=str(shared.vad_reference),
+        reference_paths=list(dict.fromkeys(path for candidate in candidates
+                                          for path in candidate.reference_paths)),
+        preparation_limit_seconds=state.get("limit"),
+        preparation_spent_seconds=state.get("spent"),
+        reason_code=('reference_audio_unconfirmed' if getattr(shared,'unconfirmed',False)
+                     else 'insufficient_independent_regional_support'),
+    )
 
 
 def verify_before_processing(
@@ -350,7 +488,21 @@ def verify_before_processing(
         raise RuntimeError(content_conflict)
     actual = verification_seal(video_path, subtitle_path, provider, release, identity_key)
     if actual != expected_seal:
-        raise RuntimeError("字幕或纠偏规则在预检后发生变化，请重新核验后再进入翻译和封装。")
+        raise RuntimeError("影片、字幕或纠偏规则在预检后发生变化，请重新核验后再进入翻译和封装。")
+
+
+def _validated_audio_checkpoint(movie, selected_audio_id, checkpoint):
+    if (checkpoint.get('rule') != 'audio-stage-main-purpose-v1'
+            or checkpoint.get('selected_audio_id') != selected_audio_id
+            or checkpoint.get('movie_signature') != media_signature(movie)
+            or not pro_core._timeline_report_verified(str(checkpoint.get('report', '')))):
+        raise RuntimeError('来源的影片、音轨或音频通过记录不一致')
+    source = Path(checkpoint['path'])
+    if subtitle_audit.file_hash(source) != checkpoint['sha256']:
+        raise RuntimeError('已通过音频核验的文本发生变化')
+    verify_before_processing(movie,str(source),checkpoint['provider'],checkpoint['release'],
+                             checkpoint['identity_key'],checkpoint['seal'])
+    return source
 
 
 def _downloaded_candidate_structure_conflict(
@@ -392,23 +544,9 @@ def _downloaded_candidate_structure_conflict(
 
 
 def _candidate_role_conflict(candidate: object, identity: object | None = None) -> str:
-    text = " ".join(
-        str(getattr(candidate, name, "") or "")
-        for name in ("release", "file_name")
-    )
-    if re.search(r"\bcommentar(?:y|ies)\b", text, flags=re.I):
-        return "候选明确标记为评论音轨字幕，不是影片正片字幕"
-    if re.search(r"\b(?:official\s+)?(?:main\s+)?trailer\b|\bteaser\b|\bsample\b", text, flags=re.I):
-        return "候选明确标记为预告片或样片字幕，不是影片正片字幕"
-    if re.search(
-        r"\bforced(?:\s+only)?\b|\bforeign\s+(?:parts?\s+)?only\b|\baliens?[ ._-]+only\b|\bsigns?\s*(?:&|and|/)\s*songs?\b",
-        text,
-        flags=re.I,
-    ):
-        return "候选明确标记为片段或强制字幕，不是完整字幕"
-    if re.search(r"(?<![A-Za-z0-9])(?:cd|disc|disk)[ ._-]?[1-9](?![A-Za-z0-9])", text, flags=re.I):
-        return "候选明确标记为 CD/Disc 分卷字幕；单卷不覆盖整片，当前不拼接多卷字幕"
-
+    role = subtitle_roles.candidate_role(candidate, identity)
+    if not role.main_dialogue:
+        return "候选明确标记为" + role.reason
     expected_year = str(getattr(identity, "year", "") or "").strip()
     candidate_year = str(getattr(candidate, "feature_year", "") or "").strip()
     expected_match = re.search(r"(?:19|20)\d{2}", expected_year)
@@ -470,9 +608,11 @@ def _candidate_recut_conflict(
 
 
 def _candidate_identity_conflict(candidate: object, identity: object | None) -> str:
-    """Reject only a corroborated, explicit different-film title before download."""
+    """Require useful identity evidence before downloading anonymous site rows."""
+    admission = str(getattr(candidate, "identity_admission_state", "") or "")
+    admission_reason = str(getattr(candidate, "identity_admission_reason", "") or "")
     if identity is None:
-        return ""
+        return (admission_reason or "影片身份待确认，暂不自动下载") if admission in {"pending", "filtered"} else ""
     expected_title = str(
         getattr(identity, "original_title", "") or getattr(identity, "title", "") or ""
     )
@@ -495,9 +635,44 @@ def _candidate_identity_conflict(candidate: object, identity: object | None) -> 
     release_episode = episode_number(release)
     if expected_episode is not None and release_episode is not None and expected_episode != release_episode:
         return f"候选标记为第 {release_episode} 部，本片为第 {expected_episode} 部"
+    if conflict := online_subtitles._candidate_identity_metadata_conflict(candidate, identity):
+        return conflict
+    # Search keeps uncertain rows visible for manual selection. Only the
+    # automatic download path consumes this positive identity admission.
+    # A state never overrides explicit ID/episode conflicts above.
+    if admission in {"pending", "filtered"}:
+        return admission_reason or (
+            "影片身份待确认，暂不自动下载" if admission == "pending" else "候选影片身份不符"
+        )
+    # An undated filename is only a search proposal. A provider-confirmed hash
+    # may contradict that spelling, but never a known ID or installment above.
+    # This admits a candidate to the existing content/timing checks, not output.
+    if (getattr(candidate, "moviehash_match", False) is True
+            and (online_subtitles._candidate_matches_strong_identity(candidate, identity)
+                 or not any(getattr(identity, name, "") for name in
+                            ("year", "imdb_id", "tmdb_id", "feature_id")))):
+        return ""
+    if (getattr(identity, 'year', '') == getattr(candidate, 'feature_year', '')
+            and online_subtitles._candidate_matches_strong_identity(candidate, identity)
+            and controlled_film_title_alias(expected_title, feature_title, getattr(identity, 'year', ''))):
+        return ""
     expected = set(online_subtitles._identity_title_tokens(expected_title))
     feature = set(online_subtitles._identity_title_tokens(feature_title))
     release_tokens = set(online_subtitles._identity_title_tokens(release))
+    if (feature and feature < expected
+            and not expected.issubset(release_tokens)
+            and not online_subtitles._titles_safe_alias(expected_title, feature_title)
+            and not getattr(candidate, "moviehash_match", False)
+            and not online_subtitles._candidate_matches_strong_identity(candidate, identity)):
+        return f"候选仅匹配本片片名的局部词语，缺少同片证据：{feature_title}"
+    if (online_subtitles._candidate_matches_strong_identity(candidate, identity)
+            and str(getattr(identity, "year", "") or "")
+            == str(getattr(candidate, "feature_year", "") or "")
+            and getattr(identity, "year", "")
+            and online_subtitles.controlled_connector_alias(
+                " ".join(online_subtitles._identity_title_tokens(expected_title)),
+                " ".join(online_subtitles._identity_title_tokens(feature_title)))):
+        return ""
     if expected and feature and expected.isdisjoint(feature) and feature.issubset(release_tokens):
         return f"候选明确属于另一影片：{feature_title}；本片为 {expected_title}"
     # A short title may also be a word inside a different film's full title.
@@ -536,7 +711,28 @@ def _provider_limit_reason(provider_name: str, exc: Exception) -> str:
     return ""
 
 
-def find_verified_english(
+def find_verified_english(*args, **kwargs):
+    movie = args[0] if args else kwargs["video_path"]
+    log = args[2] if len(args) > 2 else kwargs["log"]
+    if subtitle_audit.current() is not None:
+        return _find_verified_english_impl(*args, **kwargs)
+    directory = Path(movie).with_suffix("").with_name(Path(movie).stem + "_pro_work") / "smart-subtitles"
+    audit = subtitle_audit.FilmAudit(movie, directory)
+    outcome, reason = "completed", "找到通过全部现有验收的字幕"
+    with subtitle_audit.scope(audit):
+        try:
+            return _find_verified_english_impl(*args, **kwargs)
+        except core.CancelledError:
+            outcome, reason = "stopped", "用户停止搜索"
+            raise
+        except Exception as error:
+            outcome, reason = "failed", str(error)
+            raise
+        finally:
+            audit.write(outcome, reason, log)
+
+
+def _find_verified_english_impl(
     video_path: str,
     selected_audio_id: int | None,
     log: Callable[[str], None],
@@ -548,6 +744,7 @@ def find_verified_english(
     verification_permission: threading.Event | None = None,
     candidate_acceptance: Callable[[Path, object], None] | None = None,
     candidate_preparation: Callable[[object], None] | None = None,
+    audio_checkpoint: dict | None = None,
 ) -> SmartSubtitleResult:
     """Find the first content-verified subtitle without candidate scoring.
 
@@ -556,10 +753,37 @@ def find_verified_english(
     own equal allowance. Download/refill attempts are also bounded.
     """
     log = pro_core.persistent_subtitle_logger(video_path, log)
+    audit = subtitle_audit.current()
     if conflict := filename_container_identity_conflict(video_path):
         log(f"智能字幕：{conflict}。")
         raise RuntimeError(conflict)
+    if audio_checkpoint:
+        try:
+            aligned = _validated_audio_checkpoint(video_path, selected_audio_id, audio_checkpoint)
+        except (OSError, ValueError, RuntimeError, KeyError) as error:
+            log(f"已保存音频核验来源不能复用，重新检查候选：{error}")
+        else:
+            core.check_cancel(cancel_event)
+            row = audit.add(f"已保存来源 · {audio_checkpoint['release']}", kind='source')
+            audit.update(row, 'audio_timing', 'audio_verified', audio_checkpoint['report'],
+                         aligned_path=str(aligned), aligned_sha256=audio_checkpoint['sha256'], cache_reused=True)
+            log('复用与本片、音轨及规则绑定的音频核验来源；仍须单独完成保留轨验收。')
+            try:
+                if candidate_acceptance is not None:
+                    candidate_acceptance(aligned, cancel_event)
+            except pro_core.RetainedSubtitleVerificationError as error:
+                error.audio_checkpoint = dict(audio_checkpoint)
+                audit.update(row, 'retained_tracks', 'retained_track_unverified', str(error), results=error.results)
+                raise
+            core.check_cancel(cancel_event)
+            report = adopted_alignment_report(audio_checkpoint['report']) or audio_checkpoint['report']
+            audit.update(row, 'acceptance', 'verified', report)
+            return SmartSubtitleResult(str(aligned), 'en', report, audio_checkpoint['provider'], None,
+                audio_checkpoint['identity_key'], audio_checkpoint['release'], audio_checkpoint['seal'])
     failures: list[str] = []
+    pending_candidates: list[PendingSubtitleCandidate] = []
+    retained_failures = []
+    unsupported_clocks = set()
     search_details: list[str] = []
     returned_candidates = 0
     downloadable_candidates = 0
@@ -582,6 +806,7 @@ def find_verified_english(
                 configured_providers.append((provider_name, service, key_name, key))
     if not configured_providers:
         raise RuntimeError("未配置 OpenSubtitles 或 SubDL API Key，请先使用“手动字幕”完成设置。")
+    movie_signature = media_signature(video_path)
     search_stages = []
     for provider in configured_providers:
         search_stages.append((*provider, False))
@@ -612,6 +837,8 @@ def find_verified_english(
     shared_content_resolved = False
     attempts = 0
     timed_out_attempts = 0
+    reference_revision = 0
+    checked_reference_items = []
     serial = 0
     provider_usage: dict[str, list[int]] = {}
     download_executor = concurrent.futures.ThreadPoolExecutor(
@@ -620,6 +847,7 @@ def find_verified_english(
     )
     try:
         hash_fallback_ready = False
+        confirmed_work = None
         for provider_name, service, _key_name, key, title_fallback in search_stages:
             if title_fallback and not hash_fallback_ready:
                 continue
@@ -636,19 +864,33 @@ def find_verified_english(
                 log(f"智能字幕：正在通过 {provider_name} 搜索英文字幕。")
             try:
                 with _online_service_phase(cancel_event):
-                    if title_fallback:
-                        identity, candidates, search_meta = service.search(
-                            key, video_path, "en", skip_hash=True,
-                        )
-                    else:
-                        identity, candidates, search_meta = service.search(key, video_path, "en")
+                    search_options = {"skip_hash": True} if title_fallback else {}
+                    if service is online_subtitles and cancel_event is not None:
+                        search_options["cancel_event"] = cancel_event
+                    if service is subdl_subtitles and confirmed_work is not None:
+                        search_options["confirmed_work_identity"] = confirmed_work
+                        log("智能字幕：SubDL 复用本片已确认的作品身份与完整别名证据；仍核对本站双ID和年份后取字幕。")
+                    identity, candidates, search_meta = service.search(key, video_path, "en", **search_options)
             except core.CancelledError:
                 raise
             except Exception as exc:
                 reason = f"{provider_name} 搜索失败：{exc}"
+                search_row = audit.add(provider_name + ' 搜索', kind='service')
+                audit.update(search_row, 'selection', 'infrastructure', reason)
                 failures.append(reason)
                 log(f"智能字幕：{reason}")
                 continue
+            if service is online_subtitles and getattr(search_meta, "identity_resolution_status", "") == "confirmed":
+                proposed_work = Resolution(
+                    'confirmed', getattr(search_meta, 'identity_resolution_reason', ''),
+                    identity.original_title or identity.title, str(identity.year or ''),
+                    online_subtitles._provider_id_key(identity.imdb_id, imdb=True),
+                    online_subtitles._provider_id_key(identity.tmdb_id),
+                    tuple(getattr(search_meta, 'identity_resolution_evidence', ()) or ()))
+                # Validate against the original local identity, before passing
+                # proof across provider stages. No model title is a proof.
+                if validate_resolution(online_subtitles.identify_media(video_path), proposed_work):
+                    confirmed_work = proposed_work
             if not title_fallback and provider_name == "OpenSubtitles":
                 hash_fallback_ready = getattr(search_meta, "query_mode", "") == "hash"
             log(
@@ -668,22 +910,51 @@ def find_verified_english(
                     f"智能字幕：{provider_name} 影片身份查询结果："
                     f"{search_meta.feature_lookup_reason}。"
                 )
+            resolution_status = getattr(search_meta, "identity_resolution_status", "")
+            if resolution_status:
+                resolution_label = {"confirmed": "已确认", "pending": "待确认",
+                                    "identity-conflict": "身份冲突"}.get(resolution_status, resolution_status)
+                log(
+                    f"智能字幕：{provider_name} 自动作品确认={resolution_label}；"
+                    f"{getattr(search_meta, 'identity_resolution_reason', '')}；"
+                    f"补证请求 {getattr(search_meta, 'identity_resolution_requests', 0)} 次，"
+                    f"耗时 {getattr(search_meta, 'identity_resolution_seconds', 0.0):.2f} 秒；"
+                    f"证据缓存={'命中' if getattr(search_meta, 'identity_resolution_cache_hit', False) else '未命中'}。"
+                )
             lookup_reason = fallback_reason or getattr(search_meta, "feature_lookup_reason", "")
             if lookup_reason:
                 search_details.append(f"{provider_name}：{lookup_reason}")
             returned_candidates += len(candidates)
+            audit.searches.append(dict(provider=provider_name, loaded=len(candidates),
+                total=getattr(search_meta, "total_count", None),
+                truncated=bool(getattr(search_meta, "truncated", False)),
+                identity_result=getattr(search_meta, "feature_lookup_reason", ""),
+                identity_resolution_status=resolution_status,
+                identity_resolution_reason=getattr(search_meta, "identity_resolution_reason", ""),
+                identity_resolution_requests=getattr(search_meta, "identity_resolution_requests", 0),
+                identity_resolution_seconds=getattr(search_meta, "identity_resolution_seconds", 0.0),
+                identity_resolution_cache_hit=getattr(search_meta, "identity_resolution_cache_hit", False),
+                identity_resolution_evidence=getattr(search_meta, "identity_resolution_evidence", ())))
             queue: list[object] = []
             filtered_counts = Counter()
             stage_candidate_keys: set[str] = set()
+            audit_rows = {}
+            identity_titles = tuple(str(getattr(identity, name, "") or "") for name in ("title", "original_title"))
             for candidate in candidates:
                 key_value = candidate_key(provider_name, candidate)
+                row = audit.add(f"{provider_name} · {getattr(candidate, 'release', '') or getattr(candidate, 'file_name', '')}",
+                                provider=provider_name, candidate_key=key_value, kind="source",
+                                author=author_display(candidate), author_role=getattr(candidate, 'author_role', ''))
                 if (key_value in excluded or key_value in seen_candidate_keys
                         or key_value in stage_candidate_keys):
                     filtered_counts["duplicate"] += 1
+                    audit.update(row, "selection", "duplicate", "重复候选或本轮已检查")
                     continue
                 stage_candidate_keys.add(key_value)
                 role_conflict = _candidate_role_conflict(candidate, identity)
                 if role_conflict:
+                    audit.update(row, "purpose", "filtered", role_conflict,
+                                 role=subtitle_roles.candidate_role(candidate, identity).code)
                     filtered_counts["role"] += 1
                     failures.append(f"{provider_name} · {role_conflict}")
                     log(
@@ -694,7 +965,11 @@ def find_verified_english(
                     continue
                 identity_conflict = _candidate_identity_conflict(candidate, identity)
                 if identity_conflict:
-                    filtered_counts["identity"] += 1
+                    identity_pending = getattr(candidate, "identity_admission_state", "") == "pending"
+                    audit.update(row, "identity", "identity_pending" if identity_pending else "filtered", identity_conflict,
+                                 identity_admission_state=getattr(candidate, "identity_admission_state", ""),
+                                 identity_evidence=getattr(candidate, "identity_admission_evidence", ()))
+                    filtered_counts["identity_pending" if identity_pending else "identity"] += 1
                     failures.append(f"{provider_name} · {identity_conflict}")
                     log(
                         f"智能字幕：{provider_name} 候选 "
@@ -702,30 +977,39 @@ def find_verified_english(
                         f"未进入正文核验：{identity_conflict}。"
                     )
                     continue
-                release_text = " ".join(
+                if (getattr(candidate, "moviehash_match", False) is True
+                        and not getattr(identity, "year", "")
+                        and not online_subtitles._candidate_matches_identity(candidate, identity)):
+                    log(f"智能字幕：站点明确标记影片 Hash 命中；未确认文件名片名“{getattr(identity, 'title', '')}”"
+                        f"不否决候选“{getattr(candidate, 'feature_title', '')}”；仍须字幕正文和时间轴核验。")
+                release_parts = tuple(
                     str(getattr(candidate, name, "") or "")
                     for name in ("release", "file_name")
                 )
+                release_text = " ".join(release_parts)
                 explicit_conflict = next((
                     reason for reason in (
-                        source_conflict(video_path, release_text),
+                        *(source_conflict(video_path, part, titles=identity_titles) for part in release_parts),
                         edition_conflict(video_path, release_text),
                         _candidate_recut_conflict(video_path, candidate, identity),
-                        release_year_conflict(
+                        *(release_year_conflict(
                             video_path,
-                            release_text,
+                            part,
                             str(getattr(candidate, "feature_year", "") or ""),
                             exact_hash=bool(getattr(candidate, "moviehash_match", False)),
-                        ),
+                        ) for part in release_parts),
                         subtitle_language_label_conflict(release_text, "en"),
                     ) if reason
                 ), "")
                 if explicit_conflict:
+                    audit.update(row, "release", "filtered", explicit_conflict)
                     filtered_counts["release"] += 1
                     failures.append(f"{provider_name} · {explicit_conflict}")
                     log(f"智能字幕：候选 {release_text} 未进入下载：{explicit_conflict}。")
                     continue
                 queue.append(candidate)
+                audit_rows[id(candidate)] = row
+                audit.update(row, "selection", "queued", "等待下载与核验")
             downloadable_candidates += len(queue)
             log(
                 f"智能字幕：{provider_name} "
@@ -734,10 +1018,13 @@ def find_verified_english(
             if not queue:
                 log(f"智能字幕：{provider_name} 没有返回可下载的英文候选。")
                 continue
-            log(
-                f"智能字幕：{provider_name} 筛选后 {len(queue)} 条候选；"
-                f"不按相关度、下载量或可信标记评分，按站点顺序分批检查。"
-            )
+            queue = prioritize_candidates(video_path, queue, identity)
+            log(f"智能字幕：{provider_name} 筛选后 {len(queue)} 条候选；按 Hash、发行文件名、剪辑版本、片源及发布组线索优先；同等条件交错作者来源。")
+            for rank, candidate in enumerate(queue, 1):
+                row = audit_rows[id(candidate)]
+                row.update(priority_rank=rank, priority_reason=candidate.priority_reason)
+                if rank <= batch_size:
+                    log(f"智能字幕：候选顺序 {rank}/{len(queue)} · {getattr(candidate, 'release', '') or getattr(candidate, 'file_name', '')} · 作者/上传者={author_display(candidate)} · {candidate.priority_reason}；仍须正文和时间轴核验。")
 
             cursor = 0
             provider_attempts_before = attempts
@@ -795,6 +1082,7 @@ def find_verified_english(
                             "candidate": candidate,
                             "release": str(release),
                             "directory": candidate_dir,
+                            "audit_record": audit_rows[id(candidate)],
                         })
                     outcomes = _download_wave(download_executor, wave, cancel_event)
 
@@ -802,6 +1090,7 @@ def find_verified_english(
                         downloaded, download_error = outcomes[id(item)]
                         release = str(item["release"])
                         try:
+                            row = item["audit_record"]
                             if download_error is not None:
                                 raise download_error
                             assert downloaded is not None
@@ -813,6 +1102,7 @@ def find_verified_english(
                                 raise RuntimeError(structure_conflict)
                             fingerprint = subtitle_content_fingerprint(downloaded)
                             if fingerprint in seen_fingerprints:
+                                audit.update(row, "structure", "duplicate", "正文和时间轴与已检查字幕完全相同")
                                 log(
                                     f"智能字幕：{release} 与已有字幕正文和时间轴完全相同，"
                                     "不占正式候选名额。"
@@ -826,14 +1116,19 @@ def find_verified_english(
                                 "directory": item["directory"],
                                 "subtitle": downloaded,
                                 "fingerprint": fingerprint,
+                                "raw_sha256": hashlib.sha256(downloaded.read_bytes()).hexdigest(),
+                                "audit_record": row,
                             }
                             # Identical dialogue can belong to different cuts or
                             # carry different fixed offsets. Only the fingerprint
                             # above (dialogue *and* timeline) is a duplicate.
                             prepared.append(prepared_item)
+                            audit.update(row, "structure", "downloaded", "正文筛选通过", original_path=str(downloaded),
+                                         sha256=prepared_item["raw_sha256"])
                         except core.CancelledError:
                             raise
                         except Exception as exc:
+                            audit.update(item["audit_record"], "download_structure", "rejected", str(exc))
                             reason = f"{provider_name} · {release} 下载后筛选未通过：{exc}"
                             failures.append(reason)
                             limit_detail = _provider_limit_reason(provider_name, exc)
@@ -894,11 +1189,20 @@ def find_verified_english(
                     f"每条独立最多 {candidate_budget_seconds:.0f} 秒。"
                 )
                 for item in prepared:
-                    if provider_attempts >= stage_attempt_limit:
+                    if provider_attempts >= stage_attempt_limit and not item.get('_audio_reference_retry'):
                         break
                     core.check_cancel(cancel_event)
+                    row = item["audit_record"]
+                    clock = subtitle_timeline_fingerprint(item["subtitle"])
+                    if clock in unsupported_clocks:
+                        audit.update(row, "audio_timing", "not_examined", "与已完成证据不足核验的字幕时间点完全相同；不重复匹配")
+                        log("智能字幕：同一完整时间轴已确认缺少独立证据，保留已检查原候选，不重复匹配。")
+                        continue
                     attempts += 1
-                    provider_attempts += 1
+                    row["attempted"] = True
+                    audit.active_record = row
+                    if not item.get('_audio_reference_retry'):
+                        provider_attempts += 1
                     usage[0] = provider_attempts
                     candidate = item["candidate"]
                     release = str(item["release"])
@@ -923,6 +1227,10 @@ def find_verified_english(
                             candidate_label=f"{provider_name}候选",
                             time_budget_seconds=candidate_budget_seconds,
                         )
+                        audit.update(row, "audio_timing", "audio_verified", report,
+                                     aligned_path=str(aligned), aligned_sha256=subtitle_audit.file_hash(aligned),
+                                     validation_audio_id=getattr(shared_content, "validation_audio_id", selected_audio_id))
+                        candidate_cancel.validation_audio_id = getattr(shared_content, 'validation_audio_id', selected_audio_id)
                         if candidate_acceptance is not None:
                             try:
                                 candidate_acceptance(Path(aligned), candidate_cancel)
@@ -958,6 +1266,7 @@ def find_verified_english(
                         adopted_report = adopted_alignment_report(report)
                         if adopted_report:
                             log(f"{provider_name}候选：{adopted_report}")
+                        audit.update(row, "acceptance", "verified", adopted_report or report)
                         return SmartSubtitleResult(
                             subtitle_path=str(aligned),
                             language=getattr(candidate, "language", "") or "en",
@@ -967,14 +1276,21 @@ def find_verified_english(
                             identity_key=identity_key,
                             release=release,
                             verification_seal=seal,
+                            validation_audio_id=getattr(shared_content, 'validation_audio_id', selected_audio_id),
+                            shared_audio=shared_content,
                         )
                     except pro_core.SharedImageTimingPreparationError:
                         # Shared movie IO is not a failed subtitle candidate.
+                        raise
+                    except pro_core.SubtitleVerificationToolError as exc:
+                        audit.update(row, 'audio_timing', 'infrastructure', str(exc))
+                        log('智能字幕：核验工具或程序发生异常，停止本片；不将候选判为错字幕，不继续下载重试。')
                         raise
                     except core.CancelledError:
                         if cancel_event is not None and cancel_event.is_set():
                             raise
                         if candidate_cancel.timed_out:
+                            audit.update(row, "audio_timing", "timeout", "本条候选独立核验达到时间上限")
                             timed_out_attempts += 1
                             reason = (
                                 f"{provider_name} · {release}：本条候选独立核验达到 "
@@ -986,14 +1302,68 @@ def find_verified_english(
                         core.check_cancel(cancel_event)
                         raise
                     except pro_core.SubtitlePreflightTimeoutError as exc:
+                        audit.update(row, "audio_timing", "timeout", str(exc))
                         timed_out_attempts += 1
                         reason = f"{provider_name} · {release}：{exc}"
                         failures.append(reason)
                         log(f"智能字幕：候选核验超时，进入下一条。{reason}")
+                    except pro_core.SubtitleInsufficientRegionalSupportError as exc:
+                        core.check_cancel(cancel_event)
+                        if candidate_cancel.timed_out:
+                            timed_out_attempts += 1
+                            reason = f"{provider_name} · {release}：本条候选核验达到时间上限"
+                            failures.append(reason)
+                            log(f"智能字幕：候选核验超时，进入下一条。{reason}")
+                            continue
+                        pending = _pending_candidate(
+                            video_path, movie_signature, item, exc, shared_content)
+                        pending_candidates.append(pending)
+                        unsupported_clocks.add(clock)
+                        audit.update(row, "audio_timing", "insufficient_evidence", str(exc),
+                                     original_path=pending.subtitle_path, sha256=pending.raw_sha256,
+                                     evidence=exc.evidence)
+                        reason = f"{provider_name} · {release}：自动未确认时间轴，原始字幕已保留供核听"
+                        failures.append(reason)
+                        log(f"智能字幕：{reason}；继续核验后续候选。")
+                    except pro_core.RetainedSubtitleVerificationError as exc:
+                        identity_key = str(getattr(candidate, 'identity_key', '') or '') or candidate_key(provider_name, candidate)
+                        exc.audio_checkpoint = dict(rule='audio-stage-main-purpose-v1',
+                            path=str(Path(aligned).resolve()), sha256=subtitle_audit.file_hash(aligned),
+                            movie_signature=movie_signature, selected_audio_id=selected_audio_id,
+                            validation_audio_id=getattr(shared_content, 'validation_audio_id', selected_audio_id),
+                            provider=provider_name, release=release, identity_key=identity_key, report=report,
+                            seal=verification_seal(video_path,str(aligned),provider_name,release,identity_key))
+                        retained_failures.append(exc)
+                        audit.update(row, "retained_tracks", "retained_track_unverified", str(exc), results=exc.results,
+                                     audio_checkpoint=exc.audio_checkpoint)
+                        failures.append(f"{provider_name} · {release}：{exc}")
+                        log(f"智能字幕：文本音频核验已通过并保存，保留轨另行未通过：{exc}")
                     except Exception as exc:
+                        audit.update(row, "audio_timing", subtitle_audit.failure_kind(exc), str(exc))
+                        import continuous_vad
+                        if getattr(shared_content, 'unconfirmed', False) and continuous_vad._timing_failure(exc):
+                            for review_item in [*checked_reference_items, item]:
+                                if any(Path(value[0])==Path(review_item['subtitle'])
+                                       for value in shared_content.failures.values()):
+                                    review_candidate=_pending_candidate(video_path,movie_signature,review_item,exc,
+                                        shared_content,reference_audio_unconfirmed=True)
+                                    if not any(old.raw_sha256==review_candidate.raw_sha256 for old in pending_candidates):
+                                        pending_candidates.append(review_candidate)
+                            log('参照音轨或字幕版本待确认：原始候选及已检查音轨指纹已保留；可在核听窗口切换参照音轨，未采用自动偏移。')
                         reason = f"{provider_name} · {release}：{exc}"
                         failures.append(reason)
                         log(f"智能字幕：候选未通过，进入下一条。{reason}")
+                    finally:
+                        revision = getattr(shared_content, 'revision', 0)
+                        if revision != reference_revision:
+                            reference_revision = revision
+                            unsupported_clocks.clear()
+                            pending_candidates.clear()
+                            prepared.extend(dict(old, _audio_reference_retry=True)
+                                            for old in checked_reference_items)
+                            log('智能字幕：参照音轨已切换，复用先前下载的原候选重验，不增加下载额度。')
+                        if not item.get('_audio_reference_retry'):
+                            checked_reference_items.append(item)
                 if provider_halted:
                     break
                 if provider_attempts >= stage_attempt_limit:
@@ -1034,9 +1404,28 @@ def find_verified_english(
         content_stop.set()
         download_executor.shutdown(wait=True, cancel_futures=True)
 
+    core.check_cancel(cancel_event)
+    if retained_failures:
+        # A passed text already exists. Do not hide this behind a new source
+        # search/listening suggestion, or re-label the retained track as valid.
+        raise retained_failures[0]
+    if pending_candidates:
+        for candidate in pending_candidates:
+            validate_pending_candidate(video_path, candidate)
+        context = _pending_review_context(shared_content, pending_candidates)
+        manifest = destination_root / "pending-review.json"
+        manifest.write_text(json.dumps(dict(
+            status="awaiting-manual-review", movie=str(Path(video_path).resolve()),
+            media_signature=movie_signature,
+            candidates=[asdict(candidate) for candidate in pending_candidates],
+            context=context,
+        ), ensure_ascii=False, indent=2), encoding="utf-8")
+        raise PendingSubtitleReviewError(pending_candidates, context, manifest)
     if attempts == 0:
         if downloadable_candidates:
             outcome = "候选下载或预检未通过，没有字幕进入时间轴核验。"
+        elif any(row.get('state') == 'identity_pending' for row in audit.records):
+            outcome = "候选影片身份尚待确认，没有字幕进入下载或时间轴核验；不代表字幕错误。"
         elif returned_candidates:
             outcome = "站点返回的候选均在下载前被排除，没有字幕进入时间轴核验。"
         else:

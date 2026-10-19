@@ -23,7 +23,7 @@ if "--pgs-ocr-worker" in sys.argv:
 
     raise SystemExit(worker_core.pgs_ocr_worker_main(sys.argv[1:]))
 
-from PySide6.QtCore import QEvent, QItemSelection, QItemSelectionModel, QObject, QPoint, QSize, Qt, QThreadPool, QUrl, Signal
+from PySide6.QtCore import QEvent, QItemSelection, QItemSelectionModel, QObject, QPoint, QSize, Qt, QThreadPool, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QIcon, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -67,15 +67,18 @@ from PySide6.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 import batch_core
 import burned_subtitle_detector
 import license_manager
 import manual_review_prepare
+import manual_review_state
 from manual_review_dialog import ManualSubtitleReviewDialog
 import pro_core
 import smart_subtitles
+from subtitle_identity_guard import media_signature
 import subtitle_tool_core as core
 import system_resources
 from profile_model import (
@@ -93,6 +96,96 @@ from qt_workers import FunctionWorker, WorkerSignals
 
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".mov", ".avi", ".m4v"}
+
+
+def _begin_subtitle_request(path: str, plan: BatchPlan):
+    request = (plan, object(), media_signature(path))
+    plan._subtitle_request_token = request[1]
+    return request
+
+
+def _stamp_subtitle_result(result):
+    aligned, report = result
+    return aligned, report, hashlib.sha256(Path(aligned).read_bytes()).hexdigest()
+
+
+def _subtitle_request_current(window, path: str, request) -> bool:
+    plan, token, signature = request
+    if window.batch_plans.get(path) is not plan or getattr(plan, "_subtitle_request_token", None) is not token:
+        return False
+    try:
+        unchanged = media_signature(path) == signature
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        manual_review_state.clear_trust(plan)
+        plan.status = "review"
+        plan.status_label = "需要确认"
+        plan.summary = "核验期间影片文件已变化，请重新分析并选择字幕。"
+        window._render_batch_table()
+        window._batch_log_line(f"{Path(path).name}：{plan.summary}")
+    return unchanged
+
+
+def _deliver_subtitle_result(window, path: str, request, callback, *args) -> None:
+    if _subtitle_request_current(window, path, request):
+        callback(*args)
+
+
+def _deliver_smart_subtitle_result(window, path: str, request, callback, *args) -> None:
+    try:
+        current = _subtitle_request_current(window, path, request)
+    except OSError:
+        current = False
+    if current:
+        # The callback can start analysis; release only this search's ownership
+        # before invoking it, never after it has handed over to a new task.
+        if getattr(window, "_smart_subtitle_request", None) is request:
+            window._smart_subtitle_request = None
+        callback(*args)
+    elif getattr(window, "_smart_subtitle_request", None) is request:
+        window._smart_subtitle_request = None
+        window._batch_idle()
+
+
+def _paired_menu_actions(menu, labels, enabled, selection, object_names):
+    """One visible row, two independently enabled native menu controls."""
+    row = QWidget(menu)
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(12, 2, 12, 2)
+    layout.setSpacing(6)
+    actions = []
+    for index, (label, available, object_name) in enumerate(zip(labels, enabled, object_names)):
+        if index:
+            divider = QLabel("／", row)
+            divider.setStyleSheet("color: #84938f; background: transparent;")
+            layout.addWidget(divider)
+        action = QAction(label, menu)
+        action.setObjectName(object_name)
+        action.setEnabled(available)
+        button = QToolButton(row)
+        button.setObjectName(object_name + "Button")
+        button.setDefaultAction(action)
+        button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        button.setStyleSheet(
+            "QToolButton { border: 0; background: transparent; padding: 8px 3px; "
+            "text-align: left; color: #183432; } "
+            "QToolButton:disabled { color: #89938f; } "
+            "QToolButton:hover:enabled { background: #f0f4f2; }"
+        )
+        def choose(_checked=False, chosen=action):
+            selection[0] = chosen
+            menu.close()
+        action.triggered.connect(choose)
+        layout.addWidget(button)
+        actions.append(action)
+    container = QWidgetAction(menu)
+    container.setObjectName(object_names[0] + "Row")
+    container.setDefaultWidget(row)
+    menu.addAction(container)
+    return tuple(actions)
+
+
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
 
 class _CombinedCancelEvent:
@@ -102,6 +195,45 @@ class _CombinedCancelEvent:
 
     def is_set(self) -> bool:
         return self.global_event.is_set() or self.item_event.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait for either cancellation without changing either source event.
+
+        The item event wakes its own task immediately; bounded waits also poll
+        the batch event so stopping the batch cannot wait out a long backoff.
+        """
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self.item_event.wait(0.05 if remaining is None else min(0.05, remaining))
+        return True
+
+
+class _BatchResourceNotice:
+    """Report resource state changes without logging every scheduler poll."""
+
+    def __init__(self) -> None:
+        self._waiting_category = ""
+        self._last_notice_at = 0.0
+
+    def update(self, allowed: bool, reason: str, now: float) -> str | None:
+        if allowed:
+            if not self._waiting_category:
+                return None
+            self._waiting_category = ""
+            return "资源负载已恢复，继续启动排队中的影片。"
+
+        # RuntimeGuard includes changing percentages in its human-readable
+        # reason. Compare the resource category, not that changing measurement.
+        category = next((kind for kind in ("内存", "磁盘") if reason.startswith(kind)), reason)
+        category = category or "资源"
+        if category == self._waiting_category and now - self._last_notice_at < 30.0:
+            return None
+        self._waiting_category = category
+        self._last_notice_at = now
+        return f"{reason} 正在等待资源恢复（每 30 秒提示一次，可随时停止）。"
 
 
 def resource_path(*parts: str) -> Path:
@@ -314,6 +446,7 @@ class ProMaxQt(QMainWindow):
         self.batch_cancel_event = threading.Event()
         self.batch_item_cancel_events: dict[str, threading.Event] = {}
         self.batch_running = False
+        self.batch_output_format = "MKV"
         self.batch_paths: list[str] = []
         self.batch_plans: dict[str, BatchPlan] = {}
         self.batch_hardware: system_resources.HardwareProfile | None = None
@@ -413,6 +546,11 @@ class ProMaxQt(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(2, 4, 2, 2)
         toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("输出格式"))
+        self.batch_output_combo = QComboBox()
+        self.batch_output_combo.addItems(list(batch_core.OUTPUT_FORMATS))
+        self.batch_output_combo.currentTextChanged.connect(self._batch_set_output_format)
+        toolbar.addWidget(self.batch_output_combo)
         add_files = QPushButton("添加影片")
         add_files.clicked.connect(self._batch_add_files)
         add_folder = QPushButton("添加文件夹")
@@ -704,13 +842,39 @@ class ProMaxQt(QMainWindow):
                 continue
             if batch_core.is_output_path(path):
                 continue
-            plan = BatchPlan(path=path, profile_slot=slot, output_path=str(Path(path).with_suffix("")) + batch_core.OUTPUT_SUFFIX)
+            plan = BatchPlan(path=path, profile_slot=slot,
+                             output_path=batch_core.batch_output_path(path, output_format=getattr(self, "batch_output_format", "MKV")))
             self.batch_paths.append(path)
             self.batch_plans[path] = plan
             existing.add(normalized)
             added += 1
+        for path in self.batch_paths:
+            plan = self.batch_plans[path]
+            if plan.task_state != "processing" and plan.status != "processing":
+                plan.output_path = batch_core.batch_output_path(path, self.batch_paths, getattr(self, "batch_output_format", "MKV"))
         self._render_batch_table()
         self._batch_log_line(f"已添加 {added} 部影片，共 {len(self.batch_paths)} 部。")
+
+    def _batch_output_format_editable(self) -> bool:
+        return not self.batch_running and all(plan.status == "pending" for plan in self.batch_plans.values())
+
+    def _batch_set_output_format(self, value: str) -> bool:
+        value = batch_core.normalize_output_format(value)
+        if not self._batch_output_format_editable():
+            if hasattr(self, "batch_output_combo"):
+                self.batch_output_combo.blockSignals(True)
+                self.batch_output_combo.setCurrentText(self.batch_output_format)
+                self.batch_output_combo.blockSignals(False)
+            return False
+        self.batch_output_format = value
+        for path, plan in self.batch_plans.items():
+            plan.output_path = batch_core.batch_output_path(path, self.batch_paths, value)
+        if hasattr(self, "batch_output_combo") and self.batch_output_combo.currentText() != value:
+            self.batch_output_combo.blockSignals(True)
+            self.batch_output_combo.setCurrentText(value)
+            self.batch_output_combo.blockSignals(False)
+        self._render_batch_table()
+        return True
 
     def _batch_remove(self) -> None:
         rows = sorted({index.row() for index in self.batch_table.selectionModel().selectedRows()}, reverse=True)
@@ -737,16 +901,25 @@ class ProMaxQt(QMainWindow):
             self.batch_table.verticalScrollBar().setValue(scroll_value)
 
     def _batch_clear(self) -> None:
-        if self.batch_running:
+        if self.batch_running or any(
+            plan.status == "processing" or plan.task_state == "processing"
+            for plan in self.batch_plans.values()
+        ):
             return
         self.batch_paths.clear()
         self.batch_plans.clear()
+        if hasattr(self, "batch_output_combo"):
+            self.batch_output_combo.setEnabled(True)
         self.batch_table.setRowCount(0)
         self.batch_log.clear()
         self.batch_progress.setValue(0)
         self.batch_progress.setFormat("%p% · 等待分析")
+        if hasattr(self, 'mux_progress'):
+            self.mux_progress.reset()
 
     def _render_batch_table(self) -> None:
+        if hasattr(self, "batch_output_combo"):
+            self.batch_output_combo.setEnabled(self._batch_output_format_editable())
         selected_paths = {
             item.data(Qt.ItemDataRole.UserRole)
             for index in self.batch_table.selectionModel().selectedRows()
@@ -801,10 +974,18 @@ class ProMaxQt(QMainWindow):
     def _batch_task_label(plan: BatchPlan) -> str:
         if plan.status == "burned" or plan.burned_subtitle:
             return "不可操作"
+        if plan.status == "processing":
+            return plan.status_label or "正在处理"
+        if plan.task_state in {"failed", "review_pending"}:
+            return "处理失败"
+        if plan.manual_review_required and plan.external_subtitle and plan.task_state != "processing":
+            return "需要确认" if plan.status_label != "需换字幕" else "需换字幕"
         if plan.task_state == "waiting" and plan.audio_passthrough_warning:
             return "音频原样"
         if plan.task_state == "waiting" and plan.external_subtitle_verified:
             return "字幕匹配成功"
+        if plan.task_state == "completed" and getattr(plan, "translation_review_pending", 0):
+            return "译文待检查"
         return {
             "processing": "正在处理",
             "completed": "已经处理",
@@ -818,11 +999,13 @@ class ProMaxQt(QMainWindow):
     def _batch_row_color(plan: BatchPlan) -> QColor:
         if plan.status == "burned" or plan.burned_subtitle:
             return QColor("#173f7a")
-        if plan.task_state == "processing":
+        if plan.task_state == "processing" or plan.status == "processing":
             return QColor("#fff0cf")
         if plan.task_state == "completed":
             return QColor("#e2f4ed")
-        if plan.task_state in {"failed", "blocked"}:
+        if plan.task_state in {"failed", "review_pending"}:
+            return QColor("#fff3da")
+        if plan.task_state == "blocked":
             return QColor("#fde9e7")
         if plan.task_state in {"stopped", "skipped"}:
             return QColor("#fff3da")
@@ -873,12 +1056,20 @@ class ProMaxQt(QMainWindow):
         plan.profile_slot = slot
 
     def _batch_analyze(self) -> None:
+        if self.batch_running:
+            return
+        if any(plan.status == "processing" for plan in self.batch_plans.values()):
+            QMessageBox.information(self, "字幕正在核验", "请完成当前字幕预检或人工核听后再分析影片。")
+            return
+        self._batch_log_line(f'分析启动请求：分析全部按钮；{time.strftime("%H:%M:%S")}。')
         self._analyze_paths(list(self.batch_paths))
 
     def _analyze_paths(self, paths: list[str]) -> None:
         if self.batch_running or not paths:
             return
         self.batch_running = True
+        if hasattr(self, "batch_output_combo"):
+            self.batch_output_combo.setEnabled(False)
         self.batch_cancel_event.clear()
         self.batch_start.setEnabled(False)
         self.batch_stop.setEnabled(True)
@@ -911,13 +1102,17 @@ class ProMaxQt(QMainWindow):
                         log=signals.message.emit,
                         external_subtitle_origin=old.external_subtitle_origin,
                         manual_confirmation_hash=old.manual_confirmation_hash,
+                        external_subtitle_media_signature=old.external_subtitle_media_signature,
+                        external_subtitle_content_hash=old.external_subtitle_content_hash,
                         cancel_event=self.batch_cancel_event,
+                        output_format=Path(old.output_path).suffix.lstrip(".").upper() or "MKV",
                     )
                 except core.CancelledError:
                     return index, old
                 except Exception as exc:
                     plan = BatchPlan(path=path, profile_slot=profile.slot, status="blocked", status_label="分析失败",
                                      summary=f"分析失败：{exc}", detail=str(exc), output_path=old.output_path)
+                manual_review_state.preserve_origin(old, plan)
                 return index, plan
 
             completed = 0
@@ -962,7 +1157,10 @@ class ProMaxQt(QMainWindow):
     def _batch_double_click(self, row: int, _column: int) -> None:
         path = self.batch_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
         plan = self.batch_plans.get(path)
-        if not plan or plan.status != "review" or "字幕" not in (plan.summary + plan.detail):
+        if manual_review_state.review_action_states(self, plan)["pending"]:
+            self._listen_current_subtitle(path)
+            return
+        if not manual_review_state.subtitle_editable(self, plan) or plan.status != "review" or "字幕" not in (plan.summary + plan.detail):
             return
         dialog = OnlineSubtitleDialog(
             self,
@@ -1006,56 +1204,65 @@ class ProMaxQt(QMainWindow):
         plan = self.batch_plans.get(path)
         if not plan:
             return
-        menu = QMenu(self.batch_table)
-        play_action = menu.addAction("播放视频")
-        remove_action = menu.addAction("移除选中")
-        menu.addSeparator()
-        process_action = menu.addAction("处理选中")
-        stop_action = menu.addAction("停止选中")
-        menu.addSeparator()
-        smart_action = menu.addAction("智能字幕")
-        manual_action = menu.addAction("在线手动字幕")
-        import_action = menu.addAction("导入本地字幕")
-        menu.addSeparator()
-        detail_action = menu.addAction("查看详情")
-        if plan.status == "burned" or plan.burned_subtitle or plan.task_state == "processing":
-            smart_action.setEnabled(False)
-            manual_action.setEnabled(False)
-            import_action.setEnabled(False)
-        remove_action.setEnabled(
-            bool(selected_paths) and not self.batch_running
-            and all(
-                self.batch_plans[selected_path].task_state != "processing"
-                and self.batch_plans[selected_path].status != "processing"
-                for selected_path in selected_paths
-            )
-        )
         process_paths = [
             selected_path for selected_path in selected_paths
             if self.batch_plans[selected_path].status in {"ready", "review"}
             and not self.batch_plans[selected_path].burned_subtitle
+            and not self.batch_plans[selected_path].manual_review_required
             and self.batch_plans[selected_path].task_state not in {"processing", "completed"}
         ]
-        process_action.setEnabled(not self.batch_running and bool(process_paths))
-        stop_action.setEnabled(any(
+        can_stop = any(
             selected_path in self.batch_item_cancel_events
             and self.batch_plans[selected_path].task_state in {"waiting", "processing"}
             and not self.batch_item_cancel_events[selected_path].is_set()
             for selected_path in selected_paths
-        ))
-        chosen = menu.exec(self.batch_table.viewport().mapToGlobal(position))
+        )
+        menu = QMenu(self.batch_table)
+        paired_selection = [None]
+        play_action = menu.addAction("播放")
+        process_action, stop_action = _paired_menu_actions(
+            menu, ("处理", "停止"), (not self.batch_running and not can_stop and bool(process_paths), can_stop),
+            paired_selection, ("contextProcessSelected", "contextStopSelected"),
+        )
+        remove_action = menu.addAction("移除")
+        remove_action.setEnabled(
+            bool(selected_paths) and not self.batch_running
+            and all(self.batch_plans[selected_path].task_state != "processing"
+                    and self.batch_plans[selected_path].status != "processing"
+                    for selected_path in selected_paths)
+        )
+        menu.addSeparator()
+        review_states = manual_review_state.review_action_states(self, plan)
+        listen_action = menu.addAction("核听当前字幕")
+        listen_action.setObjectName("contextAlignSubtitle")
+        listen_action.setEnabled(review_states["pending"] or review_states["active"])
+        subtitle_menu = menu.addMenu("字幕选择")
+        manual_action = subtitle_menu.addAction("在线选择")
+        import_action = subtitle_menu.addAction("本地导入")
+        editable = manual_review_state.subtitle_editable(self, plan)
+        manual_action.setEnabled(editable)
+        import_action.setEnabled(editable)
+        subtitle_menu.setEnabled(editable)
+        translation_action = menu.addAction("译文修改")
+        translation_action.setEnabled(self._batch_translation_editable(path))
+        menu.addSeparator()
+        detail_action = menu.addAction("查看详情")
+        chosen = menu.exec(self.batch_table.viewport().mapToGlobal(position)) or paired_selection[0]
         if chosen is play_action:
             if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
                 QMessageBox.warning(self, "无法播放", "未找到可用于播放该影片的系统播放器。")
-        elif chosen is smart_action and smart_action.isEnabled():
-            self._start_batch_smart_subtitle(path)
         elif chosen is manual_action and manual_action.isEnabled():
             self._open_batch_online_search(path)
         elif chosen is import_action and import_action.isEnabled():
             self._import_batch_subtitle(path)
+        elif chosen is listen_action and listen_action.isEnabled():
+            self._listen_current_subtitle(path)
+        elif chosen is translation_action and translation_action.isEnabled():
+            self._batch_edit_translation(path)
         elif chosen is remove_action and remove_action.isEnabled():
             self._batch_remove()
         elif chosen is process_action and process_action.isEnabled():
+            self._batch_log_line(f'处理启动请求：右键“处理”；{len(process_paths)} 部；{time.strftime("%H:%M:%S")}。')
             self._batch_start_paths(process_paths)
         elif chosen is stop_action and stop_action.isEnabled():
             for selected_path in selected_paths:
@@ -1065,12 +1272,12 @@ class ProMaxQt(QMainWindow):
             QMessageBox.information(
                 self,
                 f"{Path(path).name} · 处理详情",
-                plan.detail or plan.summary or "尚未分析该影片。",
+                batch_core.movie_detail_text(plan, self._batch_task_label(plan)),
             )
 
     def _start_batch_smart_subtitle(self, path: str) -> None:
         plan = self.batch_plans.get(path)
-        if not plan or plan.status == "burned" or plan.burned_subtitle or plan.task_state == "processing":
+        if not manual_review_state.subtitle_editable(self, plan):
             return
         if plan.has_complete_text:
             self._batch_log_line(f"{Path(path).name}：已有可用内嵌文本，处理时将优先纠偏该文本，无需下载英文字幕。")
@@ -1078,6 +1285,10 @@ class ProMaxQt(QMainWindow):
         if self.batch_running:
             self._batch_log_line(f"{Path(path).name}：当前有批量任务正在运行，请稍后再试。")
             return
+        request = _begin_subtitle_request(path, plan)
+        self._smart_subtitle_request = request
+        # A failed replacement search must not erase an unfinished human review.
+        manual_review_state.clear_trust(plan, required=bool(getattr(plan, "manual_review_required", False)))
         self.batch_running = True
         self.batch_start.setEnabled(False)
         plan.status = "processing"
@@ -1099,8 +1310,8 @@ class ProMaxQt(QMainWindow):
 
         self._run_worker(
             task,
-            result=lambda result: self._batch_smart_subtitle_verified(path, result),
-            error=lambda message: self._batch_smart_subtitle_failed(path, message),
+            result=lambda result: _deliver_smart_subtitle_result(self, path, request, self._batch_smart_subtitle_verified, path, result),
+            error=lambda message: _deliver_smart_subtitle_result(self, path, request, self._batch_smart_subtitle_failed, path, message),
             message=self._batch_log_line,
         )
 
@@ -1116,6 +1327,9 @@ class ProMaxQt(QMainWindow):
         plan.external_subtitle_seal = result.verification_seal
         plan.external_subtitle_origin = "download"
         plan.manual_confirmation_hash = ""
+        plan.manual_review_required = False
+        plan.manual_review_resume_processing = False
+        plan.manual_review_origin = {}
         self.batch_running = False
         self.batch_start.setEnabled(True)
         self._batch_log_line(
@@ -1141,7 +1355,7 @@ class ProMaxQt(QMainWindow):
 
     def _open_batch_online_search(self, path: str) -> None:
         plan = self.batch_plans.get(path)
-        if not plan or plan.status == "burned" or plan.burned_subtitle or plan.task_state == "processing":
+        if not manual_review_state.subtitle_editable(self, plan):
             return
         dialog = OnlineSubtitleDialog(
             self,
@@ -1157,12 +1371,7 @@ class ProMaxQt(QMainWindow):
 
     def _import_batch_subtitle(self, path: str, selected_path: str | None = None) -> None:
         plan = self.batch_plans.get(path)
-        if (
-            not plan
-            or plan.status == "burned"
-            or plan.burned_subtitle
-            or plan.task_state == "processing"
-        ):
+        if not manual_review_state.subtitle_editable(self, plan):
             return
         selected = [selected_path] if selected_path else self._qt_open_dialog(
             "导入本地字幕",
@@ -1217,15 +1426,29 @@ class ProMaxQt(QMainWindow):
         candidate,
         source_label: str,
     ) -> None:
-        plan = self.batch_plans[path]
+        plan = self.batch_plans.get(path)
+        if not manual_review_state.subtitle_editable(self, plan):
+            return
+        try:
+            request = _begin_subtitle_request(path, plan)
+            subtitle = str(manual_review_state.capture_origin(plan, subtitle, candidate.language))
+        except (OSError, ValueError) as exc:
+            self._batch_manual_review_failed(path, f"无法读取影片文件，请重新添加影片：{exc}")
+            return
         plan.external_subtitle = subtitle
         plan.external_language = candidate.language
         plan.external_subtitle_origin = (
             "download" if source_label == "手动下载字幕" else "local"
         )
         plan.manual_confirmation_hash = ""
+        plan.pending_review_audio_id = None
+        plan.manual_review_resume_processing = False
+        getattr(self, "_pending_review_continuations", {}).pop(path, None)
         plan.external_subtitle_verified = False
         plan.external_subtitle_verification = ""
+        plan.external_subtitle_media_signature = {}
+        plan.external_subtitle_content_hash = ""
+        manual_review_state.clear_trust(plan, required=False)
         plan.status = "processing"
         plan.status_label = "字幕预检中"
         plan.summary = "正在检查字幕完整性及与音轨的时间轴匹配"
@@ -1248,7 +1471,7 @@ class ProMaxQt(QMainWindow):
                     report,
                     source_language="en",
                 )
-                return pro_core.preflight_online_subtitle(
+                return _stamp_subtitle_result(pro_core.preflight_online_subtitle(
                     path,
                     subtitle,
                     str(verify_dir),
@@ -1257,8 +1480,8 @@ class ProMaxQt(QMainWindow):
                     report,
                     source_language="en",
                     candidate_label=f"{source_label} {candidate.release}",
-                )
-            return pro_core.preflight_external_subtitle(
+                ))
+            return _stamp_subtitle_result(pro_core.preflight_external_subtitle(
                 path,
                 subtitle,
                 str(verify_dir),
@@ -1272,34 +1495,65 @@ class ProMaxQt(QMainWindow):
                     Path(path).stem + "_pro_work"
                 ) / "timeline-health"),
                 manual_reference_first=True,
-            )
+            ))
 
         self._run_worker(
             task,
-            result=lambda result: self._batch_online_verified(path, candidate, result),
-            error=lambda message: self._batch_online_verify_failed(path, subtitle, candidate, message),
+            result=lambda result: _deliver_subtitle_result(
+                self, path, request, self._batch_online_verified, path, candidate, result),
+            error=lambda message: _deliver_subtitle_result(
+                self, path, request, self._batch_online_verify_failed, path, subtitle, candidate, message),
             message=self._batch_log_line,
         )
 
     def _batch_online_verified(
         self, path: str, candidate, result, manual_hash: str = "",
     ) -> None:
-        aligned, report = result
-        plan = self.batch_plans[path]
+        aligned, report = result[:2]
+        plan = self.batch_plans.get(path)
+        if plan is None:
+            return
+        confirmed_hash = manual_hash or (result[2] if len(result) == 3 else "")
+        try:
+            unchanged = confirmed_hash and confirmed_hash == hashlib.sha256(Path(aligned).read_bytes()).hexdigest()
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            self._batch_manual_review_failed(path, "已核验字幕文件发生变化，请重新选择并核验。")
+            return
         plan.external_subtitle = str(aligned)
         plan.external_language = candidate.language
         plan.external_subtitle_verified = True
+        plan.manual_review_required = False
+        plan.manual_review_resume_processing = False
         plan.external_subtitle_verification = report
         plan.manual_confirmation_hash = manual_hash
         plan.external_subtitle_provider = ""
         plan.external_subtitle_release = ""
         plan.external_subtitle_identity_key = ""
         plan.external_subtitle_seal = ""
+        plan.external_subtitle_media_signature = media_signature(path)
+        plan.external_subtitle_content_hash = confirmed_hash
+        continuations = getattr(self, "_pending_review_continuations", {})
+        if manual_hash and path in continuations:
+            continuations[path] = {
+                "confirmed_hash": confirmed_hash,
+                "subtitle": str(aligned),
+                "media_signature": media_signature(path),
+            }
         self._batch_log_line(f"{Path(path).name}：{report}。")
         self._analyze_paths([path])
 
     def _batch_online_verify_failed(self, path: str, subtitle: str, candidate, message: str) -> None:
-        plan = self.batch_plans[path]
+        plan = self.batch_plans.get(path)
+        if plan is None:
+            return
+        manual_review_state.clear_trust(plan)
+        try:
+            request = _begin_subtitle_request(path, plan)
+        except OSError as exc:
+            self._batch_manual_review_failed(path, f"无法读取影片文件，请重新添加影片：{exc}")
+            return
         pro_core.append_subtitle_diagnostic_log(path, f"手动字幕预检未通过：{message}")
         dialog = QMessageBox(self)
         dialog.setWindowTitle("字幕需要人工对齐")
@@ -1313,6 +1567,8 @@ class ProMaxQt(QMainWindow):
         )
         dialog.addButton("换字幕", QMessageBox.ButtonRole.RejectRole)
         dialog.exec()
+        if not _subtitle_request_current(self, path, request):
+            return
         if dialog.clickedButton() is inspect_button:
             self._start_batch_manual_review(path, subtitle, candidate)
             return
@@ -1326,8 +1582,47 @@ class ProMaxQt(QMainWindow):
         self._batch_log_line(f"{Path(path).name}：字幕预检未通过：{message}")
         QMessageBox.warning(self, "字幕预检未通过", f"{Path(path).name}\n\n{message}\n\n请换一个字幕版本。")
 
-    def _start_batch_manual_review(self, path: str, subtitle: str, candidate) -> None:
-        plan = self.batch_plans[path]
+    def _force_batch_manual_review(self, path: str) -> None:
+        plan = self.batch_plans.get(path)
+        if not manual_review_state.subtitle_editable(self, plan) or not plan.external_subtitle:
+            return
+        candidate = SimpleNamespace(language=plan.external_language or "en")
+        self._start_batch_manual_review(path, plan.external_subtitle, candidate)
+
+    def _open_batch_pending_review(self, path: str) -> None:
+        plan = self.batch_plans.get(path)
+        if not manual_review_state.review_action_states(self, plan)["pending"]:
+            return
+        if not hasattr(self, "_pending_review_continuations"):
+            self._pending_review_continuations = {}
+        if plan.manual_review_resume_processing:
+            self._pending_review_continuations[path] = None
+        else:
+            self._pending_review_continuations.pop(path, None)
+        candidate = SimpleNamespace(language=plan.external_language or "en")
+        self._start_batch_manual_review(path, plan.external_subtitle, candidate, reuse_audio=True)
+
+    def _listen_current_subtitle(self, path: str) -> None:
+        plan = self.batch_plans.get(path)
+        states = manual_review_state.review_action_states(self, plan)
+        if states["pending"]:
+            self._open_batch_pending_review(path)
+        elif states["active"]:
+            getattr(self, "_pending_review_continuations", {}).pop(path, None)
+            self._force_batch_manual_review(path)
+
+    def _start_batch_manual_review(self, path: str, subtitle: str, candidate, *, reuse_audio=False, reference_audio_id=None) -> None:
+        plan = self.batch_plans.get(path)
+        if plan is None:
+            return
+        try:
+            request = _begin_subtitle_request(path, plan)
+            # Resolve before revoking hashes so a changed confirmed output is rejected.
+            subtitle = str(manual_review_state.resolve_origin(plan))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._batch_manual_review_failed(path, f"无法读取原字幕基线：{exc}")
+            return
+        manual_review_state.clear_trust(plan)
         plan.status = "processing"
         plan.status_label = "准备人工时间轴"
         plan.summary = "正在准备前、中、后三段短音频与局部声音标记"
@@ -1336,31 +1631,51 @@ class ProMaxQt(QMainWindow):
         # candidate (or a repeat of the same candidate) must not rewrite an
         # already open review page.
         source_hash = hashlib.sha256(Path(subtitle).read_bytes()).hexdigest()
-        work = Path(subtitle).parent / "manual-deep-review" / (
+        movie = Path(path)
+        work = movie.with_name(movie.stem + "_pro_work") / "manual-deep-review" / (
             f"{source_hash[:12]}-{time.time_ns()}"
         )
+        # A saved actual reference (automatic fallback or manual choice) is
+        # explicit: a cache miss must not send it through cheap-first selection.
+        if reference_audio_id is None:
+            reference_audio_id = plan.pending_review_audio_id
         audio_id = plan.audio_ids[0] if plan.audio_ids else None
 
+        if reference_audio_id is not None:
+            audio_id = reference_audio_id
+            plan.pending_review_audio_id = audio_id
         def task(signals: WorkerSignals):
+            if reuse_audio:
+                cached = manual_review_state.reuse_review_audio(plan, subtitle, work, audio_id)
+                if cached is not None:
+                    signals.message.emit(f"{Path(path).name}：复用已准备的三段核听音频，不重复解码。")
+                    return cached
             return manual_review_prepare.prepare_review(
                 path, subtitle, work, audio_id,
                 lambda message: signals.message.emit(
                     f"{Path(path).name}：{message}"
                 ),
                 source_language=candidate.language,
+                **({'reference_audio_id': reference_audio_id} if reference_audio_id is not None else {}),
             )
 
         self._run_worker(
             task,
-            result=lambda result: self._batch_manual_review_ready(
-                path, subtitle, candidate, result
-            ),
-            error=lambda message: self._batch_manual_review_failed(path, message),
+            result=lambda result: _deliver_subtitle_result(
+                self, path, request,
+                lambda: self._batch_manual_review_ready(path, subtitle, candidate, result, request=request)),
+            error=lambda message: _deliver_subtitle_result(
+                self, path, request, self._batch_manual_review_failed, path, message),
             message=self._batch_log_line,
         )
 
     def _batch_manual_review_failed(self, path: str, message: str) -> None:
-        plan = self.batch_plans[path]
+        getattr(self, "_pending_review_continuations", {}).pop(path, None)
+        plan = self.batch_plans.get(path)
+        if plan is None:
+            return
+        manual_review_state.clear_trust(plan)
+        plan._subtitle_request_token = object()
         outside_safe_range = "超出手动核听范围 ±20 秒" in message
         title = "所选字幕时间轴超出安全范围" if outside_safe_range else "人工时间轴准备失败"
         plan.status = "review"
@@ -1372,7 +1687,12 @@ class ProMaxQt(QMainWindow):
         QMessageBox.warning(self, title, message)
 
     def _batch_manual_review_cancelled(self, path: str) -> None:
-        plan = self.batch_plans[path]
+        getattr(self, "_pending_review_continuations", {}).pop(path, None)
+        plan = self.batch_plans.get(path)
+        if plan is None:
+            return
+        manual_review_state.clear_trust(plan)
+        plan._subtitle_request_token = object()
         plan.status = "review"
         plan.status_label = "需要确认"
         plan.summary = "人工核听未确认，未使用所选字幕"
@@ -1380,19 +1700,43 @@ class ProMaxQt(QMainWindow):
         self._batch_log_line(f"{Path(path).name}：用户取消人工核听裁决，未使用所选字幕。")
 
     def _batch_manual_review_ready(
-        self, path: str, subtitle: str, candidate, evidence: dict,
+        self, path: str, subtitle: str, candidate, evidence: dict, request=None,
     ) -> None:
-        plan = self.batch_plans[path]
-        if hashlib.sha256(Path(subtitle).read_bytes()).hexdigest() != evidence["source_sha256"]:
+        plan = self.batch_plans.get(path)
+        if plan is None or (request is not None and not _subtitle_request_current(self, path, request)):
+            return
+        if not manual_review_state.hash_matches(subtitle, evidence.get("source_sha256")):
             self._batch_manual_review_failed(path, "所选字幕在深入核验后发生变化，请重新选择。")
             return
+        requested_id = plan.audio_ids[0] if plan.audio_ids else None
+        actual_id = evidence.get("validation_audio_id", plan.pending_review_audio_id if plan.pending_review_audio_id is not None else requested_id)
+        if (path in getattr(self, "_pending_review_continuations", {})
+                and plan.pending_review_audio_id is not None and actual_id != plan.pending_review_audio_id):
+            self._batch_manual_review_failed(path, "核听音轨与已保存的自动取证音轨不一致，请重新准备。")
+            return
+        plan.pending_review_audio_id = actual_id
+        manual_review_state.cache_review_audio(plan, evidence, actual_id)
         self._batch_log_line(f"{Path(path).name}：已准备前、中、后三段人工核听；各处可独立调整。")
         try:
             dialog = ManualSubtitleReviewDialog(self, evidence)
         except Exception as exc:
             self._batch_manual_review_failed(path, f"无法准备软件内核听窗口：{exc}")
             return
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        dialog_result = dialog.exec()
+        if (dialog_result == 2 and getattr(dialog, 'requested_audio_id', None) is not None
+                and (request is None or _subtitle_request_current(self, path, request))):
+            chosen_id = dialog.requested_audio_id
+            self._batch_log_line(f'{Path(path).name}：用户将核听参照由轨{actual_id}改为轨{chosen_id}；三段偏移全部重新确认，原字幕不变。')
+            plan._manual_audio_cache = None
+            self._start_batch_manual_review(path, subtitle, candidate, reference_audio_id=chosen_id)
+            return
+        accepted = dialog_result == QDialog.DialogCode.Accepted
+        if request is not None and not _subtitle_request_current(self, path, request):
+            return
+        # Switching a region changes the live evidence and its preparation
+        # history. Preserve that selection even when the user cancels.
+        manual_review_state.cache_review_audio(plan, evidence, actual_id)
+        if not accepted:
             self._batch_manual_review_cancelled(path)
             return
         offsets = dialog.confirmed_offsets
@@ -1403,27 +1747,44 @@ class ProMaxQt(QMainWindow):
         if rejection:
             self._batch_manual_review_failed(path, rejection)
             return
-        if hashlib.sha256(Path(subtitle).read_bytes()).hexdigest() != evidence["source_sha256"]:
+        if not manual_review_state.hash_matches(subtitle, evidence.get("source_sha256")):
             self._batch_manual_review_failed(path, "核听期间所选字幕发生变化，请重新选择。")
             return
         work = Path(evidence["review_dir"])
         source = work / "manual-source.srt"
         confirmed = work / "manual-confirmed.srt"
-        if evidence.get("normalized_sha256") and hashlib.sha256(source.read_bytes()).hexdigest() != evidence["normalized_sha256"]:
+        if evidence.get("normalized_sha256") and not manual_review_state.hash_matches(source, evidence["normalized_sha256"]):
             self._batch_manual_review_failed(path, "核听来源发生变化，请重新选择。")
             return
         import manual_timeline
         points = manual_review_prepare.review_points(evidence)
         try:
+            observation = manual_timeline.observation_report(points, offsets)
+            (work / "manual-observations.json").write_text(json.dumps({
+                "original_sha256": evidence["source_sha256"], "observations": observation,
+                "media_signature": media_signature(path),
+                "validation_audio_id": actual_id,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            if observation["fixed_offset_warning"]:
+                pro_core.append_subtitle_diagnostic_log(path,
+                    f"核听三点偏移跨度 {observation['variation_seconds']:.2f} 秒；"
+                    + observation["note"] + " 漂移或跳变的具体类型仍需按对白判断。")
             manual_timeline.apply_to_srt(source, confirmed, points, offsets)
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
             self._batch_manual_review_failed(path, str(exc))
             return
-        confirmed_hash = hashlib.sha256(confirmed.read_bytes()).hexdigest()
-        (work / "manual-confirmation.json").write_text(json.dumps({
-            "rule": "manual-three-window-timeline-v3", "original_sha256": evidence["source_sha256"],
-            "points": points, "offsets": offsets, "output_sha256": confirmed_hash,
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            confirmed_hash = hashlib.sha256(confirmed.read_bytes()).hexdigest()
+            (work / "manual-confirmation.json").write_text(json.dumps({
+                "rule": "manual-three-window-timeline-v3", "original_sha256": evidence["source_sha256"],
+                "validation_audio_id": actual_id, "audio_codec": evidence.get('audio_codec',''),
+                "points": points, "offsets": offsets, "output_sha256": confirmed_hash,
+                "observations": observation,
+                "manual_review_origin": dict(getattr(plan, "manual_review_origin", {}) or {}),
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            self._batch_manual_review_failed(path, f"无法保存人工确认记录：{exc}")
+            return
         report_text = ("用户确认三点修正：" + "、".join(f"{x:+.2f}秒" for x in offsets)
             + "；相邻点渐变，首尾沿用端点偏移；不再自动重验；原字幕SHA-256 "
             + evidence["source_sha256"][:12])
@@ -1432,6 +1793,53 @@ class ProMaxQt(QMainWindow):
             path, candidate, (confirmed, report_text),
             manual_hash=confirmed_hash,
         )
+
+    def _batch_translation_editable(self, path: str) -> bool:
+        import translation_remux
+        plan = self.batch_plans.get(path)
+        return bool(plan and not self.batch_running
+                    and plan.task_state != "processing" and plan.status != "processing"
+                    and translation_remux.available(plan.output_path))
+
+    def _batch_edit_translation(self, path: str) -> None:
+        if not self._batch_translation_editable(path): return
+        self._edit_translation_output(self.batch_plans[path].output_path)
+
+    def _edit_translation_output(self, output: str) -> None:
+        if self.batch_running:
+            QMessageBox.information(self, '等待批次结束', '请在当前批次结束后检查或修改译文。')
+            return
+        import translation_remux
+        if not translation_remux.available(output):
+            QMessageBox.information(self,'无译文检查记录','没有找到这部成品可用的译文检查记录。')
+            return
+        from translation_review_dialog import TranslationReviewDialog
+        try:
+            dialog = TranslationReviewDialog(self, output)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法打开翻译修改", str(exc))
+            return
+        dialog.message.connect(lambda message:self._batch_log_line(f"{Path(output).name}：{message}"))
+        self.batch_running = True
+        self.batch_start.setEnabled(False)
+        try:
+            dialog.exec()
+        finally:
+            self.batch_running = False
+            self.batch_start.setEnabled(True)
+        if dialog.remuxed:
+            import translation_remux
+            try:
+                manifest, _reports = translation_remux.load_bound_reports(output)
+                pending = sum(binding.get('pending_count', 0)
+                    for binding in manifest['bindings'])
+                for plan in self.batch_plans.values():
+                    if translation_remux.current_output(plan.output_path)==translation_remux.current_output(output):
+                        plan.translation_review_pending=pending
+                        plan.task_status_label='译文已更新'
+            except (OSError, ValueError, KeyError):
+                pass
+            self._render_batch_table()
 
     def _batch_mode_changed(self, mode: str) -> None:
         self.batch_parallel.setVisible(mode == "自定义模式")
@@ -1442,12 +1850,17 @@ class ProMaxQt(QMainWindow):
         return 1
 
     def _batch_start(self) -> None:
+        if self.batch_running:
+            self._batch_log_line('忽略“开始处理”请求：当前分析或处理尚未结束；本次请求不排队。')
+            return
+        self._batch_log_line(f'处理启动请求：开始处理按钮；{time.strftime("%H:%M:%S")}。')
         self._batch_start_paths()
 
     def _batch_start_one(self, path: str) -> None:
         if self.batch_running:
             QMessageBox.information(self, "批量任务正在运行", "请先停止或等待当前批量任务完成。")
             return
+        self._batch_log_line(f'处理启动请求：单片处理入口；{Path(path).name}；{time.strftime("%H:%M:%S")}。')
         self._batch_start_paths([path])
 
     def _batch_stop_one(self, path: str) -> None:
@@ -1467,10 +1880,13 @@ class ProMaxQt(QMainWindow):
     def _batch_start_paths(self, requested_paths: list[str] | None = None) -> None:
         if self.batch_running:
             return
-        if any(plan.status == "processing" and "预检" in plan.status_label for plan in self.batch_plans.values()):
-            QMessageBox.information(self, "字幕正在预检", "请等待下载字幕完成音轨时间轴预检后再开始批量处理。")
+        if any(plan.status == "processing" for plan in self.batch_plans.values()):
+            QMessageBox.information(self, "字幕正在核验", "请完成字幕预检或人工核听后再开始批量处理。")
             return
         source_paths = requested_paths if requested_paths is not None else self.batch_paths
+        if any(getattr(self.batch_plans.get(path), "manual_review_required", False) for path in source_paths):
+            QMessageBox.information(self, "人工核听尚未确认", "请先完成前、中、后三段核听确认，或重新选择字幕。")
+            return
         ready_paths = [
             path for path in source_paths
             if path in self.batch_plans
@@ -1516,6 +1932,7 @@ class ProMaxQt(QMainWindow):
             return
         self.batch_cancel_event.clear()
         self.batch_item_cancel_events = {path: threading.Event() for path in ready_paths}
+        if hasattr(self,'mux_progress'): self.mux_progress.reset()
         self.batch_running = True
         self.batch_start.setEnabled(False)
         self.batch_stop.setEnabled(True)
@@ -1526,13 +1943,14 @@ class ProMaxQt(QMainWindow):
 
         def task(signals: WorkerSignals):
             total = len(ready_paths)
-            completed = failed = stopped = skipped = 0
+            completed = failed = stopped = skipped = pending_review = 0
             item_progress = {path: 0 for path in ready_paths}
             progress_lock = threading.Lock()
             parallel_targets = 2 if workers == 1 else 1
             ai_slots = max(1, min(workers, self.batch_hardware.ai_slots if self.batch_hardware else 1))
             ai_gate = threading.Semaphore(ai_slots)
             guard = system_resources.RuntimeGuard()
+            resource_notice = _BatchResourceNotice()
             pending = list(ready_paths)
             active: dict[concurrent.futures.Future, tuple[str, threading.Event]] = {}
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="qt-movie-batch") as executor:
@@ -1547,8 +1965,10 @@ class ProMaxQt(QMainWindow):
                         pending.clear()
                     while pending and len(active) < workers and not self.batch_cancel_event.is_set():
                         allowed, reason = guard.can_start_next()
+                        notice = resource_notice.update(allowed, reason, time.monotonic())
+                        if notice:
+                            signals.message.emit(notice)
                         if not allowed:
-                            signals.message.emit(reason)
                             break
                         path = pending.pop(0)
                         item_event = self.batch_item_cancel_events[path]
@@ -1617,6 +2037,22 @@ class ProMaxQt(QMainWindow):
                             signals.state.emit(path, "stopped", "已停止")
                             signals.message.emit(f"{Path(path).name}：已停止。")
                             stopped += 1
+                        except batch_core.PendingSubtitleReviewError as exc:
+                            advice = batch_core.failure_advice(exc).removeprefix("建议")
+                            message = f"处理失败：自动时间轴证据不足，候选与音频指纹已保留。建议：{advice}"
+                            batch_core.append_process_log(plan, message)
+                            plan.task_state, plan.task_status_label = "failed", "处理失败"
+                            plan.status, plan.status_label = "review", "处理失败"
+                            plan.summary = f"处理失败：时间轴证据不足；建议：{advice}"
+                            existing_detail = (plan.detail or "").strip()
+                            plan.detail = "\n\n".join(filter(None, (
+                                existing_detail, message,
+                                f"已保存候选记录：{exc.manifest_path}",
+                            )))
+                            signals.state.emit(path, "failed", "处理失败")
+                            signals.message.emit(f"{Path(path).name}：{message}")
+                            pending_review += 1
+                            failed += 1
                         except batch_core.OfflineSubtitleUnavailableError as exc:
                             skip_detail = str(exc).strip() or "无搜索处理没有可用的完整字幕来源。"
                             batch_core.append_process_log(plan, skip_detail)
@@ -1635,21 +2071,24 @@ class ProMaxQt(QMainWindow):
                             failure_detail = f"{type(exc).__name__}: {failure_detail}"
                             batch_core.append_process_log(plan, f"处理失败：{failure_detail}")
                             plan.task_state, plan.task_status_label = "failed", "处理失败"
+                            advice = batch_core.failure_advice(exc).removeprefix("建议")
                             existing_detail = (plan.detail or "").strip()
                             plan.detail = "\n\n".join(filter(None, (
                                 existing_detail,
                                 f"处理失败：{failure_detail}",
+                                f"处理建议：{advice}",
                             )))
-                            plan.summary = "处理失败（请查看详情）"
+                            plan.summary = f"处理失败；建议：{advice}"
                             signals.state.emit(path, "failed", "处理失败")
                             signals.message.emit(f"{Path(path).name}：处理失败：{failure_detail}")
+                            signals.message.emit(f"{Path(path).name}：处理建议：{advice}")
                             failed += 1
                         finished = completed + failed + stopped + skipped
                         with progress_lock:
                             item_progress[path] = 100
                             overall = int(sum(item_progress.values()) / total)
                         signals.progress.emit(overall, f"已处理 {finished}/{total}")
-            return completed, failed, stopped, skipped, self.batch_cancel_event.is_set(), mode
+            return completed, failed, stopped, skipped, self.batch_cancel_event.is_set(), mode, pending_review
 
         self._run_worker(
             task,
@@ -1669,10 +2108,17 @@ class ProMaxQt(QMainWindow):
         self._batch_log_line("正在停止当前外部工具；未开始的影片不会处理。")
 
     def _batch_process_done(self, payload) -> None:
-        completed, failed, stopped, skipped, cancelled, mode = payload
+        completed, failed, stopped, skipped, cancelled, mode = payload[:6]
+        pending_review = payload[6] if len(payload) > 6 else 0
         self._render_batch_table()
         prefix = "已停止" if cancelled else "批量完成"
         message = f"{prefix}：成功 {completed}，跳过 {skipped}，失败 {failed}，停止 {stopped}。"
+        if pending_review:
+            message += f" 其中 {pending_review} 部建议右键选择“核听当前字幕”。"
+        reports = [plan for plan in getattr(self, 'batch_plans', {}).values()
+                   if plan.task_state == "failed" and getattr(plan, "subtitle_report_path", "")]
+        if failed and reports:
+            message += " 失败影片的逐候选报告已保存，可右键影片查看详情。"
         self.batch_progress.setValue(100 if not cancelled else self.batch_progress.value())
         self.batch_progress.setFormat(f"%p% · {message}")
         self._batch_log_line(f"{mode} · {message}")
@@ -1682,15 +2128,50 @@ class ProMaxQt(QMainWindow):
 
     def _batch_idle(self) -> None:
         self.batch_running = False
+        if hasattr(self, "batch_output_combo"):
+            self.batch_output_combo.setEnabled(self._batch_output_format_editable())
+        if hasattr(self,'mux_progress'): self.mux_progress.finish_unpublished()
         self.batch_item_cancel_events.clear()
         self.batch_start.setEnabled(True)
         self.batch_stop.setEnabled(False)
+        for path, continuation in list(getattr(self, "_pending_review_continuations", {}).items()):
+            if continuation:
+                QTimer.singleShot(0, lambda path=path: self._continue_pending_review(path))
+
+    def _continue_pending_review(self, path: str) -> None:
+        """Resume only this checked confirmation, after analysis relinquishes the batch."""
+        continuations = getattr(self, "_pending_review_continuations", {})
+        continuation = continuations.get(path)
+        if not continuation or self.batch_running:
+            return
+        plan = self.batch_plans.get(path)
+        valid = bool(plan and not plan.manual_review_required
+                     and plan.external_subtitle_verified
+                     and plan.status in {"ready", "review"}
+                     and plan.manual_confirmation_hash == continuation["confirmed_hash"]
+                     and str(plan.external_subtitle) == continuation["subtitle"]
+                     and manual_review_state.hash_matches(plan.external_subtitle, continuation["confirmed_hash"]))
+        try:
+            valid = bool(valid and media_signature(path) == continuation["media_signature"])
+        except OSError:
+            valid = False
+        continuations.pop(path, None)
+        if not valid:
+            if plan is not None:
+                self._batch_log_line(f"{Path(path).name}：核听后的影片或字幕状态已变化，未自动继续处理。")
+            return
+        self._batch_log_line(f"{Path(path).name}：三点核听已确认，继续翻译和封装。")
+        self._batch_start_paths([path])
 
     def _batch_error(self, message: str) -> None:
         self._batch_log_line(f"失败：{message}")
         QMessageBox.critical(self, "批量任务失败", message)
 
     def _batch_log_line(self, message: str) -> None:
+        if not hasattr(self,'mux_progress'):
+            from qt_workers import MuxProgressTracker
+            self.mux_progress=MuxProgressTracker()
+        self.mux_progress.update(message)
         scrollbar = self.batch_log.verticalScrollBar()
         follow = scrollbar.value() >= scrollbar.maximum() - 2
         self.batch_log.appendPlainText(message)
@@ -1741,6 +2222,7 @@ class ProMaxQt(QMainWindow):
             replace_downloaded_subtitle=self.profile_replace_downloaded_subtitle.isChecked(),
             audio_policy=audio_policy,
             chinese_script_equivalent=self.profile_chinese_script_equivalent.isChecked(),
+            subtitle_styles=self.profiles[index].subtitle_styles,
         )
         self.profiles[index] = profile
         save_profiles(self.profiles)

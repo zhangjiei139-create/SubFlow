@@ -56,7 +56,16 @@ class QtFileDialogTest(unittest.TestCase):
         del app
 
     def test_english_manual_subtitle_uses_automatic_strict_verifier(self) -> None:
-        plan = BatchPlan("movie.mkv", 1)
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        movie = Path(folder.name) / "movie.mkv"
+        movie.write_bytes(b"movie")
+        picked = Path(folder.name) / "picked.srt"
+        picked.write_text(
+            "1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+            encoding="utf-8",
+        )
+        plan = BatchPlan(str(movie), 1)
         controller = SimpleNamespace(
             batch_plans={plan.path: plan},
             _render_batch_table=Mock(),
@@ -68,14 +77,19 @@ class QtFileDialogTest(unittest.TestCase):
             recommendation="用户指定", match_reason="手动字幕",
         )
         ProMaxQt._batch_subtitle_selected(
-            controller, plan.path, "picked.srt", candidate, "手动下载字幕"
+            controller, plan.path, str(picked), candidate, "手动下载字幕"
         )
         task = controller._run_worker.call_args.args[0]
+        verified = Path(folder.name) / "verified.srt"
+        verified.write_text("verified dialogue", encoding="utf-8")
         with patch("qt_app.pro_core.prepare_shared_subtitle_content_audio", return_value=object()), patch(
-            "qt_app.pro_core.preflight_online_subtitle", return_value=(Path("verified.srt"), "通过")
+            "qt_app.pro_core.preflight_online_subtitle", return_value=(verified, "通过")
         ) as strict, patch("qt_app.pro_core.preflight_external_subtitle") as old:
             task(SimpleNamespace(message=SimpleNamespace(emit=Mock())))
         strict.assert_called_once()
+        preserved_source = Path(strict.call_args.args[1])
+        self.assertNotEqual(preserved_source, picked)
+        self.assertEqual(preserved_source.read_bytes(), picked.read_bytes())
         old.assert_not_called()
 
     def test_open_dialog_is_an_instance_method(self) -> None:

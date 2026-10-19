@@ -92,6 +92,18 @@ class ManualTimelineDialogTest(unittest.TestCase):
                         region.spin.mapTo(viewport, region.spin.rect().topLeft()),region.spin.size())))
                 dialog.tabs.setCurrentIndex(0)
                 page = dialog.pages[0]
+                page.refresh()
+                self.app.processEvents()
+                with patch.object(page.timeline,'update',wraps=page.timeline.update) as repaint:
+                    QTest.qWait(260)
+                    self.assertEqual(repaint.call_count,0,'暂停时不应持续重绘时间轴')
+                stable_geometry=(dialog.geometry(),page.timeline.geometry(),page.play_button.geometry(),page.clock.geometry())
+                for position in (8900,10100,12500,25100):
+                    page.players[1.0].ms=position
+                    page.refresh()
+                    self.app.processEvents()
+                    self.assertEqual(stable_geometry,(dialog.geometry(),page.timeline.geometry(),page.play_button.geometry(),page.clock.geometry()))
+                page.seek(0)
                 self.assertTrue(page.cue_card.isVisible())
                 self.assertEqual((page.prev_page.text(), page.next_page.text()), ('上一页', '下一页'))
                 page.seek(12)
