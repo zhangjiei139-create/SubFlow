@@ -27,6 +27,7 @@ from typing import Callable
 import ai_runtime
 import chinese_script_converter
 import subtitle_languages
+import subtitle_text_formats
 import mkv_fast_mux
 
 
@@ -2376,6 +2377,12 @@ def call_ollama_retry(
 
 def make_prompt(lines: list[str], target_code: str, source_language: str, *, require_target_script: bool = False,
                 context_lines: tuple[str, str] | None = None, repair_feedback: str = "") -> str:
+    # Keep raw source text as the cache/review identity. Only the model's view
+    # excludes recognized display markup, including legacy MicroDVD styling.
+    lines = [subtitle_text_formats.translation_text(line) for line in lines]
+    if context_lines:
+        context_lines = tuple(subtitle_text_formats.translation_text(line) for line in context_lines)
+    repair_feedback = subtitle_text_formats.translation_text(repair_feedback)
     target_name = LANGUAGES[target_code][1]
     numbered = "\n".join(f"{idx}. {line}" for idx, line in enumerate(lines, start=1))
     feedback = ("\nThe previous attempt still failed this check: " + repair_feedback
@@ -2388,8 +2395,9 @@ def make_prompt(lines: list[str], target_code: str, source_language: str, *, req
         )
         return (
             f"请把下面的电影字幕翻译为{target_name}。此前的回答残留了英文，请重新翻译。\n"
-            "常用词即使单独出现或大小写混杂也必须翻译，不能当成人名照抄。\n"
-            "只输出中文译文，禁止夹带原文英文单词、解释和思考过程。\n"
+            "普通对白必须翻译；原文中确有的人名、机构名、品牌、作品名、缩写和代号可以原样保留。\n"
+            "按上下文区分名称和普通单词，不要强行翻译名称，也不要把普通对白当作名称照抄。\n"
+            "只输出译文，不要添加解释和思考过程；保留名称的原始拼写，不得新增或重复名称。\n"
             "结合上下文理解含义，不要把后句的意思补进本句。\n"
             f"严格输出{len(lines)}行，格式为：1. 中文译文{context}{feedback}\n字幕原文：\n{numbered}\n译文："
         )
@@ -2624,6 +2632,7 @@ _IDENTIFIER_MATH_OPERATOR = (
     r"multiplied\s+by|divided\s+by|times|plus|minus|equals|乘以|乘|加上|加|减去|减|除以|等于|[×*+÷/=]"
 )
 _IDENTIFIER_LABELS = {
+    "platform": ("站台", "月台"),
     "checkpoint": ("检查点", "检查站", "哨卡"),
     "point": ("点位", "位置", "地点", "点"),
     "plan": ("计划", "方案"), "option": ("选项",),
@@ -2693,10 +2702,13 @@ def _identifier_roles(text: str, *, translated: bool) -> list[tuple[tuple, tuple
             for key, spans in result]
 
 
-def _translation_identifier_spans(source: str, translation: str) -> set[int]:
+def _translation_identifier_spans(source: str, translation: str, *, excluded_source_intervals=()) -> set[int]:
     """Match source and translated identifier roles with occurrence budgets."""
     budgets: dict[tuple, int] = {}
-    for key, _ in _identifier_roles(source, translated=False):
+    for key, spans in _identifier_roles(source, translated=False):
+        if any(start < right and left < end for start, end in spans
+               for left, right in excluded_source_intervals):
+            continue
         budgets[key] = budgets.get(key, 0) + 1
     protected: set[int] = set()
     for key, spans in _identifier_roles(translation, translated=True):
@@ -2707,12 +2719,200 @@ def _translation_identifier_spans(source: str, translation: str) -> set[int]:
     return protected
 
 
+_ENTITY_LETTERS = r'A-Za-z\u00c0-\u024f\u1e00-\u1eff'
+_ENTITY_CAPITAL = r'A-Z\u00c0-\u00d6\u00d8-\u00de\u0100-\u024f\u1e00-\u1eff'
+_ENTITY_WORD = rf'[{_ENTITY_CAPITAL}][{_ENTITY_LETTERS}0-9]*(?:[\x27’.-][{_ENTITY_LETTERS}0-9]+)*\.?'
+_ENTITY_CONNECTORS = frozenset(('and', 'of', 'the', 'de', 'del', 'van', 'von', 'der', 'da', 'di'))
+_ENTITY_PHRASE = rf'{_ENTITY_WORD}(?:\s+(?:(?i:and|of|the|de|del|van|von|der|da|di)\s+)?{_ENTITY_WORD}){{0,5}}'
+_ENTITY_ROLES = (r'company|corporation|corp|inc|ltd|llc|agency|organization|organisation|bureau|'
+    r'department|division|foundation|association|institute|university|committee|council|'
+    r'band|brand|project|operation|program|programme|film|movie|book|novel|song|album|series|'
+    r'team|unit|club|business|group|office|officials|staff|agents|embassy|consulate|'
+    r'callsign|call[- ]sign|password')
+_ENTITY_HONORIFICS = (r'mr|mrs|ms|miss|dr|doctor|prof|professor|captain|agent|officer|'
+    r'detective|general|sergeant|sir|lady|father|sister')
+# Grammatical/imperative phrases must not become names just because subtitles
+# happen to use Title Case. These are language roles, never a list of names.
+_ENTITY_DIALOGUE = frozenset(('i you he she it we they me us my your his her our their '
+    'is are was were be been do does did not no yes this that these those what who '
+    'why how when where hello goodbye thanks thank please sorry okay ok sure '
+    'really wait help come go stop look listen somehow something nothing '
+    'take call give get put tell say said told ask asked want need bring let '
+    'leave run open close love like should could would must can will may '
+    'here there now then welcome').split())
+_ENTITY_PREDICATES = frozenset(('said says say told tells asked asks is are was were '
+    'has have had does did will would can could should must').split())
+_ENTITY_PATTERNS = (
+    re.compile(rf'(?<![{_ENTITY_LETTERS}])(?i:{_ENTITY_HONORIFICS})(?:\.\s*|\s+)["“\x27‘]?({_ENTITY_PHRASE})'),
+    re.compile(rf'(?<![{_ENTITY_LETTERS}])(?i:(?:name(?:\s+(?:is|was)|[\x27’]s)|named|called|titled|known\s+as|'
+               rf'goes\s+by|codenamed|code[- ]named|codename\s+(?:is|was)))\s+["“\x27‘]?({_ENTITY_PHRASE})'),
+    re.compile(rf'(?<![{_ENTITY_LETTERS}])(?i:{_ENTITY_ROLES})\.?\s+(?:(?i:called|named|is|was)\s+)?'
+               rf'["“\x27‘]?({_ENTITY_PHRASE})'),
+    re.compile(rf'(?<![{_ENTITY_LETTERS}])({_ENTITY_PHRASE})\s+(?i:{_ENTITY_ROLES})(?![{_ENTITY_LETTERS}])'),
+)
+_ENTITY_GENERIC = re.compile(rf'(?<![{_ENTITY_LETTERS}0-9])({_ENTITY_PHRASE})(?![{_ENTITY_LETTERS}0-9])')
+_ENTITY_TOKEN = re.compile(rf'[{_ENTITY_LETTERS}]+(?:[\x27’][{_ENTITY_LETTERS}]+)?')
+
+
+def _translation_name_evidence(source: str, translation: str, *, include_noncolliding=False):
+    """Protect exact source name occurrences, not every use of their words.
+
+    Explicit titles/naming/entity roles support ambiguous words. A conservative
+    multiword fallback preserves existing mixed-case proper names. Case alone
+    does not grant an all-caps sentence name status. Unclear cases retain the
+    normal warning, and raw source/cache/review identities are never rewritten.
+    """
+    if max(len(source), len(translation)) > 16384:
+        return set(), []  # Damaged, enormous cues get no speculative name exemption.
+    if not any(character.isupper() for character in translation):
+        return set(), []
+    from bisect import bisect_left, insort
+    from collections import deque
+    entities: dict[str, set[tuple[int, int]]] = {}
+
+    def add(value: str, start: int, end: int):
+        if value.endswith('.') and '.' not in value[:-1]:
+            value, end = value[:-1], end - 1
+        if not value or len(value) > 512:
+            return
+        # The existing identifier matcher already owns dotted initials/formulas;
+        # a second matcher must not spend the same source occurrence twice.
+        identifier_roles = _identifier_roles(value, translated=False)
+        identifier_positions = {position for _, spans in identifier_roles
+                                for left, right in spans for position in range(left, right)}
+        word_positions = {position for match in _ENTITY_TOKEN.finditer(value)
+                          for position in range(*match.span())}
+        if word_positions and word_positions <= identifier_positions:
+            return
+        if (not include_noncolliding
+                and not ({word.casefold() for word in _ENTITY_TOKEN.findall(value)} & _DIALOGUE_WORDS)):
+            return  # No common-word collision needs a name exemption.
+        entities.setdefault(value, set()).add((start, end))
+        if value.startswith('The ') and len(value) > 4:
+            entities.setdefault(value[4:], set()).add((start, end))
+        # A translated leading component can leave an intact multiword suffix
+        # (for example a brand/model). Its source occurrence is still spent once.
+        for suffix in re.finditer(r'(?<=\s)(?=[A-Z])', value):
+            alias = value[suffix.start():]
+            words = _ENTITY_TOKEN.findall(alias)
+            if len([word for word in words if word.casefold() not in _ENTITY_CONNECTORS]) >= 2:
+                entities.setdefault(alias, set()).add((start, end))
+
+    for pattern_index, pattern in enumerate(_ENTITY_PATTERNS):
+        position = 0
+        while (match := pattern.search(source, position)) is not None:
+            value, start, end = match[1], *match.span(1)
+            if (pattern_index == 2 and source[start-1:start] not in '"“\x27‘'
+                    and _ENTITY_TOKEN.findall(value)[0].casefold() in _ENTITY_PREDICATES):
+                position = match.start() + 1
+                continue
+            if start == 0 or source[start-1] not in '"“\x27‘':
+                tokens = list(_ENTITY_TOKEN.finditer(value))
+                for token in tokens[1:]:
+                    if (token[0].casefold() in _ENTITY_PREDICATES
+                            or token[0].casefold() in _ENTITY_HONORIFICS.split('|')):
+                        value = value[:token.start()].rstrip()
+                        # Separate people joined by "and Mr..." are not one name.
+                        value = re.sub(r'\s+(?i:and)$', '', value)
+                        end = start + len(value)
+                        break
+            add(value, start, end)
+            position = match.start() + 1
+    # Initials plus a surname are a name pattern, not a list of approved people.
+    for match in re.finditer(rf'(?<![{_ENTITY_LETTERS}])((?:[A-Z]\.\s*){{1,4}}'
+                             rf'[{_ENTITY_CAPITAL}][{_ENTITY_LETTERS}]{{1,80}})(?![{_ENTITY_LETTERS}])', source):
+        add(match[1], *match.span(1))
+    # Bare Title Case is an existing narrow common-word name heuristic. The
+    # recovery branch formerly allowed no Latin at all; its new exceptions
+    # require positive role evidence rather than extending this heuristic to
+    # unknown ordinary words such as title-cased verbs/adjectives.
+    for match in (() if include_noncolliding else _ENTITY_GENERIC.finditer(source)):
+        value = match[1]
+        words = _ENTITY_TOKEN.findall(value)
+        substantive = [word for word in words if word.casefold() not in _ENTITY_CONNECTORS]
+        if (len(substantive) < 2
+                or any(word.casefold() in _ENTITY_DIALOGUE for word in substantive)
+                or substantive[0].casefold() in _IDENTIFIER_LABELS
+                or not any(any(character.islower() for character in word) for word in substantive)
+                or ('and' in {word.casefold() for word in words} and not value.startswith('The '))):
+            continue
+        add(value, *match.span(1))
+
+    if include_noncolliding:
+        # This stricter evidence view is used by the bounded dialogue-recovery
+        # branch. Normal mixed-case prose can identify embedded proper tokens,
+        # acronyms and digit/camel-case codes; all-caps ordinary cues cannot.
+        normal_prose = any(character.islower() for character in source)
+        for match in re.finditer(rf'(?<![{_ENTITY_LETTERS}0-9])'
+                                 rf'[{_ENTITY_LETTERS}0-9]+(?:[\x27’.-][{_ENTITY_LETTERS}0-9]+)*'
+                                 rf'(?![{_ENTITY_LETTERS}0-9])', source):
+            value = match[0]
+            if value.casefold() in _ENTITY_DIALOGUE | _DIALOGUE_WORDS:
+                continue
+            letters = [character for character in value if character.isalpha()]
+            code = any(character.isdigit() for character in value) and any(character.isupper() for character in value)
+            camel = any(character.isupper() for character in value[1:]) and any(character.islower() for character in value)
+            action_subject = re.match(
+                r'\s+(?i:arrived|called|said|asked|replied|smiled|left|came|went|sent|'
+                r'announced|reported|issued|approved|confirmed|responded)\b', source[match.end():]) is not None
+            communication_object = re.search(
+                r'(?i:\b(?:contact|notify|call|ask|tell|inform|email|write\s+to)\s+(?:the\s+)?)$',
+                source[:match.start()]) is not None
+            acronym = (len(letters) >= 2 and all(character.isupper() for character in letters)
+                       and normal_prose and (action_subject or communication_object))
+            person_subject = (value[0].isupper() and any(character.islower() for character in value)
+                              and action_subject)
+            if code or camel or acronym or person_subject:
+                add(value, *match.span())
+
+    candidates = []
+    pools = {}
+    for value, anchors in entities.items():
+        pools[value] = deque(sorted(anchors))
+        pattern = rf'(?<![{_ENTITY_LETTERS}0-9]){re.escape(value)}(?![{_ENTITY_LETTERS}0-9])'
+        for match in re.finditer(pattern, translation):
+            candidates.append((match.start(), match.end(), value))
+    protected: set[int] = set()
+    spent: list[tuple[int, int]] = []
+
+    def overlaps(anchor):
+        position = bisect_left(spent, (anchor[0],))
+        return ((position > 0 and spent[position-1][1] > anchor[0])
+                or (position < len(spent) and spent[position][0] < anchor[1]))
+
+    # Prefer the longest name at a position; aliases share overlapping anchors.
+    for start, end, value in sorted(candidates, key=lambda row: (row[0], row[0] - row[1])):
+        if any(position in protected for position in range(start, end)):
+            continue
+        pool = pools[value]
+        while pool and overlaps(pool[0]):
+            pool.popleft()
+        if not pool:
+            continue
+        insort(spent, pool.popleft())
+        protected.update(range(start, end))
+    return protected, spent
+
+
+def _translation_name_spans(source: str, translation: str, *, include_noncolliding=False) -> set[int]:
+    return _translation_name_evidence(source, translation, include_noncolliding=include_noncolliding)[0]
+
+
+def _translation_preserved_spans(source: str, translation: str, *, include_noncolliding=False) -> set[int]:
+    """Share source occurrence ownership between names and identifier roles."""
+    names, spent = _translation_name_evidence(source, translation,
+                                              include_noncolliding=include_noncolliding)
+    return names | _translation_identifier_spans(source, translation, excluded_source_intervals=spent)
+
+
 def translation_quality_issue(source: str, translation: str, target_code: str) -> str:
     """Catch empty translations and narrow script leaks while preserving source names.
 
     Retained CJK source text may be a name or quote; only newly introduced CJK
     spans are rejected for supported non-CJK targets. This does not verify meaning.
     """
+    source = subtitle_text_formats.translation_text(source)
+    translation = subtitle_text_formats.translation_text(translation)
     if not source.strip():
         return ""
     if not translation.strip():
@@ -2724,28 +2924,27 @@ def translation_quality_issue(source: str, translation: str, target_code: str) -
     if not target_code.startswith("zh"):
         return ""
     source_words = {word.casefold() for word in re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", source)}
-    identifier_spans = _translation_identifier_spans(source, translation)
-    translated_words = {match.group(0).casefold()
-                        for match in re.finditer(r"[A-Za-z]+(?:['’][A-Za-z]+)?", translation)
-                        if not all(position in identifier_spans for position in range(*match.span()))}
-    preserved_name_words: set[str] = set()
-    for match in re.finditer(r"(?<![A-Za-z])[A-Z][A-Za-z]*(?:[ -]+(?:and|of|the|[A-Z][A-Za-z]*)){1,5}(?![A-Za-z])", translation):
-        phrase = match.group(0)
-        words = re.findall(r"[A-Za-z]+", phrase)
-        if (any(word[0].isupper() and word.casefold() not in _DIALOGUE_WORDS for word in words)
-                and re.search(r"(?<![A-Za-z])" + re.escape(phrase) + r"(?![A-Za-z])", source)):
-            preserved_name_words.update(word.casefold() for word in words)
-    if (source_words & translated_words & _DIALOGUE_WORDS) - preserved_name_words:
+    translated_tokens = list(re.finditer(r"[A-Za-z]+(?:['’][A-Za-z]+)?", translation))
+    collisions = [match for match in translated_tokens if match[0].casefold() in source_words & _DIALOGUE_WORDS]
+    protected_spans = (_translation_preserved_spans(source, translation) if collisions
+                       else _translation_identifier_spans(source, translation))
+    if any(not all(position in protected_spans for position in range(*match.span())) for match in collisions):
         return "中文译文残留原文常用词，疑似漏译"
     if re.search(r"[\u3400-\u9fff]", translation):
         return ""
-    plain = re.sub(r"<[^>]*>|\{[^}]*\}", "", source).strip()
+    # The view has removed recognized display syntax already. Unknown braces
+    # and angle-bracket text remain dialogue and must still be checked.
+    plain = source.strip()
     words = re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", plain)
     if not words:
         if not re.search(r"[^\W\d_]", plain):
             return ""  # Music marks, punctuation and numbers have no words to translate.
         return "中文译文仍为外文，疑似漏译"
     same = re.sub(r"\W", "", plain).casefold() == re.sub(r"\W", "", translation).casefold()
+    if same and translated_tokens and all(all(position in protected_spans
+                                             for position in range(*match.span()))
+                                         for match in translated_tokens):
+        return ""  # A whole, unchanged name/initialism also need not become Chinese.
     if same and not any(word.casefold() in _DIALOGUE_WORDS for word in words):
         if len(words) <= 3 and all(word[0].isupper() for word in words):
             return ""  # Standalone names (Chloe, Darth Vader) and identifiers (R2).
@@ -2870,7 +3069,7 @@ def rewrite_cache(
 
 
 def _rechecked_identifier_reviews(review_rows: dict[int, dict], target_code: str) -> dict[int, str]:
-    """Recheck only the former common-word warning, without changing user text."""
+    """Recheck former label/format false positives without changing user text."""
     if not target_code.startswith("zh"):
         return {}
     import translation_review
@@ -2886,7 +3085,11 @@ def _rechecked_identifier_reviews(review_rows: dict[int, dict], target_code: str
             translation_review.validate_text(translation)
         except (ValueError, TypeError):
             continue
-        if (_translation_identifier_spans(source, translation)
+        plain_source = subtitle_text_formats.translation_text(source)
+        plain_translation = subtitle_text_formats.translation_text(translation)
+        if ((_translation_identifier_spans(plain_source, plain_translation)
+                or _translation_name_spans(plain_source, plain_translation)
+                or plain_source != source or plain_translation != translation)
                 and not translation_quality_issue(source, translation, target_code)):
             result[index] = translation
     return result
@@ -2963,10 +3166,17 @@ def translate_events(
             item.update(translation=cache[index], reason='', status='resolved')
         elif index in rechecked and index in cache and cache[index] == item['translation']:
             item.setdefault('original_reason', item['reason'])
-            item.update(reason='', status='resolved', resolution='identifier-context-rechecked-v1')
+            format_changed = any(subtitle_text_formats.translation_text(item[key]) != item[key]
+                                 for key in ('source', 'translation'))
+            name_rechecked = bool(_translation_name_spans(
+                subtitle_text_formats.translation_text(item['source']),
+                subtitle_text_formats.translation_text(item['translation'])))
+            item.update(reason='', status='resolved', resolution=(
+                'display-format-rechecked-v1' if format_changed else
+                'source-name-context-rechecked-v1' if name_rechecked else 'identifier-context-rechecked-v1'))
             rechecked_count += 1
     if rechecked_count:
-        log(f"旧翻译提醒复核：{rechecked_count}条已确认保留变量、编号或缩写；复用原译文，不重新请求模型。")
+        log(f"旧翻译提醒复核：{rechecked_count}条已确认显示格式标记或保留名称、变量、编号、缩写；复用原译文，不重新请求模型。")
     log(
         f"字幕行数：{len(events)}，缓存匹配：{len(cache)}，"
         f"缓存失效：{stale_count}，待翻译：{len(pending)}"
@@ -3094,7 +3304,7 @@ def translate_events(
                                 response_schema=schema, max_tokens=1536,
                             )
                         segments = translation_recovery.recover(
-                            [cleaned[i] for i in indices], LANGUAGES[target_code][2],
+                            [subtitle_text_formats.translation_text(cleaned[i]) for i in indices], LANGUAGES[target_code][2],
                             recovery_request, recovery_diagnostics, log)
                         check_cancel(cancel_event)
                         for i, segment in zip(indices, segments):

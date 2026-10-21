@@ -97,6 +97,41 @@ def _identity_words(value: str) -> tuple[str, ...]:
     return tuple(re.findall(r"[^\W_]+", unicodedata.normalize('NFKC', value).casefold()))
 
 
+def numeric_title_alias_proposals(value: str) -> tuple[str, ...]:
+    """Bounded English search hints, never evidence that two titles are aliases.
+
+    Keep the numeric original unchanged. A caller must independently confirm an
+    exact original-title alias, release year and IDs before using any result.
+    Leading zeros and titles containing other characters are not rewritten.
+    """
+    text = unicodedata.normalize('NFKC', str(value or '')).strip()
+    if not re.fullmatch(r'(?:0|[1-9][0-9]{0,3})', text):
+        return ()
+    small = ('zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven',
+             'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen',
+             'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen')
+    tens = ('', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty',
+            'seventy', 'eighty', 'ninety')
+
+    def cardinal(number):
+        if number < 20:
+            return small[number]
+        if number < 100:
+            return tens[number // 10] + (' ' + small[number % 10] if number % 10 else '')
+        scale = 1000 if number >= 1000 else 100
+        return (cardinal(number // scale) + (' thousand' if scale == 1000 else ' hundred')
+                + (' ' + cardinal(number % scale) if number % scale else ''))
+
+    number = int(text)
+    proposals = []
+    if len(text) == 4 and (1100 <= number <= 1999 or 2010 <= number <= 2099):
+        prefix, suffix = divmod(number, 100)
+        tail = ('hundred' if suffix == 0 else 'oh ' + small[suffix] if suffix < 10 else cardinal(suffix))
+        proposals.append(cardinal(prefix) + ' ' + tail)
+    proposals.append(cardinal(number))
+    return tuple(dict.fromkeys(proposals))[:2]
+
+
 def parse_media_identity(value: str, *, kind: str = 'auto', known_titles=(),
                          declared_year: str = '') -> ParsedMediaIdentity:
     """Split title and release metadata without turning title digits into years.
@@ -188,6 +223,31 @@ def clean_video_title(path: str) -> tuple[str, str]:
     """Compatibility tuple for both providers; unknown is not an invented year."""
     parsed = parse_media_identity(path)
     return parsed.title, parsed.year
+
+
+def trailing_filename_year_proposal(path: str) -> ParsedMediaIdentity | None:
+    """Propose one space-tail year; keep the original complete title unchanged.
+
+    Only independent complete-title/year/ID evidence may adopt this proposal.
+    A catalogue/container title or bare numeric name is never split here.
+    """
+    value = unicodedata.normalize('NFKC', str(path or '')).strip()
+    suffix = Path(value).suffix.lower()
+    if suffix not in _IDENTITY_SUFFIXES:
+        return None
+    original = parse_media_identity(value, kind='filename')
+    if original.year:
+        return None
+    stem = Path(value).name[:-len(suffix)]
+    match = re.fullmatch(r'(.+?)[ \t]+(19\d{2}|20\d{2})[ \t]*', stem)
+    if not match or int(match.group(2)) > date.today().year + 1:
+        return None
+    title = _identity_title(match.group(1))
+    if not _identity_words(title):
+        return None
+    return ParsedMediaIdentity(title, match.group(2), 'inferred',
+                               'filename-space-tail-proposal', False,
+                               original.raw_title, (match.group(2),))
 
 
 def parse_filename_and_container(video_path: str, embedded_title: str):
@@ -337,9 +397,18 @@ def release_year_conflict(
     feature_year: str = "",
     *,
     exact_hash: bool = False,
+    confirmed_work=None,
 ) -> str:
     """Reject a different movie year before any expensive subtitle validation."""
     local = parse_media_identity(video_path, kind='filename')
+    if not local.year and confirmed_work is not None:
+        from types import SimpleNamespace
+        from work_identity_resolver import validate_filename_resolution
+
+        base = SimpleNamespace(title=local.title, original_title=local.title, year='')
+        if validate_filename_resolution(video_path, base, confirmed_work):
+            local = ParsedMediaIdentity(confirmed_work.title, confirmed_work.year,
+                                        'explicit', 'confirmed-filename-proposal')
     if not local.year:
         return ""
     expected = int(local.year)

@@ -37,6 +37,7 @@ class RetainedReplacementTests(unittest.TestCase):
     def context(self):
         stack=ExitStack()
         stack.enter_context(patch.object(core,'inspect_tracks',side_effect=lambda *_:self.tracks))
+        stack.enter_context(patch.object(core,'tracks_from_media',side_effect=lambda *_:self.tracks))
         stack.enter_context(patch.object(core,'inspect_media',return_value={}))
         stack.enter_context(patch.object(core,'video_track_duration_ns',return_value=400*10**9))
         return stack

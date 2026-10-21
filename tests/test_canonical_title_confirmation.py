@@ -44,6 +44,11 @@ SD_SUBTITLES = {"subtitles": [{"id": "s1", "name": "film.srt",
 
 class CanonicalTitleConfirmationTests(unittest.TestCase):
     def setUp(self):
+        # The separate bounded identity backend is outside these canonical-
+        # title fixtures. Explicitly model an empty independent catalogue.
+        evidence = patch.object(online.work_identity, 'fetch_secondary_catalogue', return_value={'results': []})
+        evidence.start()
+        self.addCleanup(evidence.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.config = Path(self.temp.name) / "settings.json"

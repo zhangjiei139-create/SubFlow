@@ -248,10 +248,12 @@ Style: Default,{family},{size},&H00{bgr},&H00{bgr},&H00000000,&H00000000,{-1 if 
 def ass_text(value):
     """Convert safe SRT markup without allowing text to inject ASS commands."""
     from html.parser import HTMLParser
+    from subtitle_text_formats import normalize_srt_markup
     class Markup(HTMLParser):
         def __init__(self):
             super().__init__(convert_charrefs=True)
             self.output=[]; self.font_stack=[]; self.appearance={'face':'','color':''}
+            self.style_depth={tag:0 for tag in 'bius'}
         def handle_data(self,data):
             # ASS has no generic backslash escape. Guard its three text escape
             # sequences with a zero-width word joiner, preserving visible text.
@@ -262,7 +264,9 @@ def ass_text(value):
             color=('&H'+rgb[5:7]+rgb[3:5]+rgb[1:3]+'&') if rgb else ''
             self.output.append('{\\fn'+self.appearance['face']+'\\1c'+color+'\\2c'+color+'}')
         def handle_starttag(self,tag,attrs):
-            if tag in {'b','i','u'}: self.output.append('{\\'+tag+'1}')
+            if tag in self.style_depth:
+                if not self.style_depth[tag]: self.output.append('{\\'+tag+'1}')
+                self.style_depth[tag]+=1
             elif tag=='br': self.output.append(r'\N')
             elif tag=='font':
                 self.font_stack.append(dict(self.appearance))
@@ -275,10 +279,12 @@ def ass_text(value):
                         if color.isValid(): self.appearance['color']=color.name().upper()
                 self.font_commands()
         def handle_endtag(self,tag):
-            if tag in {'b','i','u'}: self.output.append('{\\'+tag+'0}')
+            if tag in self.style_depth:
+                self.style_depth[tag]=max(0,self.style_depth[tag]-1)
+                if not self.style_depth[tag]: self.output.append('{\\'+tag+'0}')
             elif tag=='font' and self.font_stack:
                 self.appearance=self.font_stack.pop();self.font_commands()
-    parser=Markup();parser.feed(value.replace('\r',''));parser.close()
+    parser=Markup();parser.feed(normalize_srt_markup(value).replace('\r',''));parser.close()
     return ''.join(parser.output).replace('\n',r'\N')
 
 def write_subtitle_mkv(path,events,style,language='und',private=None,packets=False,uid=None):

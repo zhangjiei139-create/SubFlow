@@ -21,7 +21,9 @@ def classify(value, *, titles=(), forced=False, hearing_impaired=False):
         ("commentary", r"\bcommentar(?:y|ies)\b|评论|評論|讲评|講評", "评论音轨字幕，不是正片对白"),
         ("extra", r"\b(?:featurettes?|bonus|special features|behind the scenes|making of|deleted scenes|development and production|building the predator homeworld)\b|花絮|制作特辑|製作特輯|幕后|幕後|删减片段|刪減片段", "花絮或制作特辑字幕，不是正片对白"),
         ("trailer", r"\b(?:trailer|teaser|sample)\b|预告片|預告片", "预告片或样片字幕，不是正片字幕"),
-        ("partial", r"\bforced(?:\s+only)?\b|\bforeign\s+(?:parts?\s+)?only\b|\baliens?\s+only\b|\bsigns?\s*(?:&|and|/)\s*songs?\b|强制|強制|片段字幕", "片段或强制字幕，不是完整字幕"),
+        # Require an explicit restricted-dialogue label, not merely a film
+        # title containing "Parts", an "APE" tag, or full SDH with such lines.
+        ("partial", r"\bforced(?:\s+only)?\b|\b(?:apes?|aliens?|foreign(?:\s+language)?|non\s+english|sign(?:ed)?\s+language|signing)\s+(?:(?:parts?|dialogue|lines?|scenes?|sections?)\s+)?only\b|\bsigns?\s*(?:&|and|/)\s*songs?\b|强制|強制|片段字幕", "片段或强制字幕，不是完整字幕"),
         ("volume", r"(?<![A-Za-z0-9])(?:cd|disc|disk)\s*[1-9](?![A-Za-z0-9])", "CD/Disc 分卷字幕；单卷不覆盖整片"),
     )
     for code, pattern, reason in rules:

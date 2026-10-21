@@ -58,6 +58,7 @@ class MediaIdentity:
     provider_id: str = ""
     edition: str = ""
     specification: str = ""
+    raw_title: str = ""
 
 
 @dataclass
@@ -107,6 +108,7 @@ class _MovieLookupDiagnostics:
     status: str = ""
     reason: str = ""
     attempts: list[str] = field(default_factory=list)
+    profiles: list[work_identity.WorkProfile] = field(default_factory=list)
 
 
 _MOVIE_LOOKUP_DIAGNOSTICS: ContextVar[_MovieLookupDiagnostics | None] = ContextVar(
@@ -622,6 +624,14 @@ def _resolve_movie(api_key: str, identity: MediaIdentity) -> dict | None:
         for item in response.get("results") or []:
             if not isinstance(item, dict):
                 continue
+            if diagnostics is not None:
+                names = tuple(dict.fromkeys(str(item.get(name) or '')
+                              for name in ('name', 'original_name') if item.get(name)))
+                diagnostics.profiles.append(work_identity.WorkProfile(
+                    str(item.get('original_name') or item.get('name') or ''),
+                    str(item.get('year') or ''), str(item.get('imdb_id') or ''),
+                    str(item.get('tmdb_id') or ''), 'subdl-v2',
+                    str(item.get('type') or 'movie'), names))
             key = str(item.get("sd_id") or item.get("imdb_id") or item.get("tmdb_id") or "")
             if key:
                 profile = tuple(str(item.get(name) or "") for name in (
@@ -678,15 +688,18 @@ def _confirmed_work_movie(response: dict, confirmed) -> tuple[dict | None, str]:
         tmdb = work_identity.id_key(row.get("tmdb_id"))
         year = str(row.get("year") or "")
         names = {work_identity.title_key(row.get(name)) for name in ("name", "original_name") if row.get(name)}
+        combined_name = any(work_identity.confirmed_combined_title_alias(
+            confirmed, row.get(name), year, imdb, tmdb)
+            for name in ('name', 'original_name') if row.get(name))
         related_id = imdb == expected_imdb or tmdb == expected_tmdb
-        same_title_year = expected_title in names and year == expected_year
+        same_title_year = (expected_title in names or combined_name) and year == expected_year
         if not related_id and not same_title_year:
             continue
         if imdb != expected_imdb or tmdb != expected_tmdb:
             return None, "SubDL同片条目的IMDb/TMDB映射存在冲突或缺失，未回退宽搜"
         if str(row.get("type") or "").casefold() != "movie":
             return None, "SubDL已确认作品ID返回非电影条目，未回退宽搜"
-        if year != expected_year or expected_title not in names:
+        if year != expected_year or (expected_title not in names and not combined_name):
             return None, "SubDL已确认作品ID的完整片名或年份冲突，未回退宽搜"
         sd_id = str(row.get("sd_id") or "")
         if not _subdl_id_key(sd_id):
@@ -700,7 +713,8 @@ def _confirmed_work_movie(response: dict, confirmed) -> tuple[dict | None, str]:
     return matches[0], ""
 
 
-def _search_confirmed_work(api_key: str, base: MediaIdentity, language: str, confirmed):
+def _search_confirmed_work(api_key: str, base: MediaIdentity, language: str, confirmed,
+                           *, video_path=None):
     """Reuse an acquired proof; do not acquire another alias or accept a guess."""
     def rejected(reason):
         return base, [], SearchMeta(
@@ -710,7 +724,10 @@ def _search_confirmed_work(api_key: str, base: MediaIdentity, language: str, con
         )
 
     if not work_identity.validate_resolution(base, confirmed):
-        return rejected("跨字幕站作品证据与完整本地片名、年份或双ID不符，未回退宽搜")
+        if video_path is None or not work_identity.validate_filename_resolution(video_path, base, confirmed):
+            return rejected("跨字幕站作品证据与完整本地片名、年份或双ID不符，未回退宽搜")
+        base = replace(base, title=confirmed.title, original_title=confirmed.title,
+                       year=confirmed.year, raw_title=base.title)
     response = _request_v2(api_key, "/movies/search", params={
         "q": "tt" + work_identity.id_key(confirmed.imdb_id, imdb=True).zfill(7),
         "type": "movie", "limit": 30,
@@ -723,6 +740,7 @@ def _search_confirmed_work(api_key: str, base: MediaIdentity, language: str, con
         imdb_id=work_identity.id_key(confirmed.imdb_id, imdb=True),
         tmdb_id=work_identity.id_key(confirmed.tmdb_id), provider_id=str(movie["sd_id"]),
         edition=base.edition, specification=base.specification,
+        raw_title=base.raw_title,
     )
     response = _request_v2(api_key, "/subtitles/search", params={
         "sd_id": movie["sd_id"], "languages": LANGUAGE_CODES.get(language, "ZH"),
@@ -763,12 +781,23 @@ def _search_confirmed_work(api_key: str, base: MediaIdentity, language: str, con
     )
 
 
-def search(api_key: str, video_path: str, language: str, *, confirmed_work_identity=None) -> tuple[MediaIdentity, list[SubtitleCandidate], SearchMeta]:
+def search(api_key: str, video_path: str, language: str, *, confirmed_work_identity=None,
+           identity_recovery_session=None, cancel_event=None) -> tuple[MediaIdentity, list[SubtitleCandidate], SearchMeta]:
     if conflict := filename_container_identity_conflict(video_path):
         raise RuntimeError(conflict)
     base_identity = identify_media(video_path)
+    recovery = identity_recovery_session or work_identity.RecoverySession(cancel_event=cancel_event)
+    revoked = recovery.revoked_resolution(base_identity)
+    if revoked is not None:
+        return base_identity, [], SearchMeta(query_mode='identity-conflict',
+            feature_lookup_status='identity-conflict', feature_lookup_reason=revoked.reason,
+            fallback_reason=revoked.reason, identity_resolution_status='pending',
+            identity_resolution_reason=revoked.reason,
+            identity_resolution_requests=revoked.request_count,
+            identity_resolution_seconds=revoked.elapsed_seconds)
     if confirmed_work_identity is not None:
-        return _search_confirmed_work(api_key, base_identity, language, confirmed_work_identity)
+        return _search_confirmed_work(api_key, base_identity, language, confirmed_work_identity,
+                                      video_path=video_path)
     identity = base_identity
     localized = needs_canonical_title(identity.title)
     config = settings_path() if localized else None
@@ -811,6 +840,7 @@ def search(api_key: str, video_path: str, language: str, *, confirmed_work_ident
         if not lookup.status:
             lookup.status = "resolved" if movie else "unresolved"
             lookup.reason = "已确认站点影片身份" if movie else "未确认站点影片身份"
+        recovery.protect_full_title(base_identity, lookup.profiles)
         attempts.extend(lookup.attempts or [f"{proposal.original_title}：{lookup.reason}"])
         if movie and movie.get("sd_id"):
             break
@@ -824,7 +854,57 @@ def search(api_key: str, video_path: str, language: str, *, confirmed_work_ident
             recover_after(index)
     language_code = LANGUAGE_CODES.get(language, "ZH")
     if not movie:
+        if (base_identity.year and not localized
+                and lookup.status not in {'ambiguous', 'identity-conflict'}):
+            attempts.append(f'完整片名“{base_identity.title}”的年份{base_identity.year}已识别；补查正式别名及唯一双ID，保持原题与年份')
+            resolution = work_identity.recover_known_year_alias(base_identity, recovery, lookup.profiles)
+            if resolution is not None:
+                if (resolution.state == 'confirmed'
+                        and work_identity.validate_resolution(base_identity, resolution, lookup.profiles)):
+                    resolved, rows, meta = _search_confirmed_work(
+                        api_key, base_identity, language, resolution, video_path=video_path)
+                    meta.identity_resolution_requests = resolution.request_count
+                    meta.identity_resolution_seconds = resolution.elapsed_seconds
+                    meta.feature_lookup_attempts = (*attempts, *resolution.attempts, *meta.feature_lookup_attempts)
+                    return resolved, rows, meta
+                return base_identity, [], SearchMeta(
+                    query_mode='title-year', feature_lookup_status=lookup.status,
+                    feature_lookup_reason=lookup.reason, feature_lookup_attempts=(*attempts, *resolution.attempts),
+                    fallback_reason=resolution.reason, identity_resolution_status=resolution.state,
+                    identity_resolution_reason=resolution.reason,
+                    identity_resolution_requests=resolution.request_count,
+                    identity_resolution_seconds=resolution.elapsed_seconds,
+                    identity_resolution_cache_hit=resolution.cache_hit,
+                    identity_resolution_evidence=resolution.evidence)
         if not base_identity.year and not localized:
+            proposal = work_identity.filename_proposal_identity(video_path, base_identity)
+            if proposal is not None:
+                attempts.append(f'保留完整原题“{base_identity.title}”；仅提出尾年候选“{proposal.title}”（{proposal.year}），等待完整片名及唯一双ID补证')
+                resolution = None
+                if lookup.status not in {'ambiguous', 'identity-conflict', 'missing-id'}:
+                    resolution = work_identity.recover_filename_year(video_path, base_identity, recovery, lookup.profiles)
+                if (resolution is not None and resolution.state == 'confirmed'
+                        and work_identity.validate_filename_resolution(video_path, base_identity, resolution, lookup.profiles)):
+                    resolved, rows, meta = _search_confirmed_work(
+                        api_key, base_identity, language, resolution, video_path=video_path)
+                    meta.identity_resolution_requests = resolution.request_count
+                    meta.identity_resolution_seconds = resolution.elapsed_seconds
+                    meta.feature_lookup_attempts = (*attempts, *resolution.attempts, *meta.feature_lookup_attempts)
+                    return resolved, rows, meta
+                fallback_reason = ('文件名含末尾四位数字，但发行年份及对应作品尚未确认；保留完整原题，未自动按拆分候选下载字幕。'
+                                   '请补充可靠影片身份，或使用字幕选择。')
+                meta = SearchMeta(query_mode='unresolved-title', feature_lookup_status=lookup.status,
+                    feature_lookup_reason=lookup.reason, feature_lookup_attempts=tuple(attempts),
+                    fallback_reason=fallback_reason)
+                if resolution is not None:
+                    meta.identity_resolution_status = resolution.state
+                    meta.identity_resolution_reason = resolution.reason
+                    meta.identity_resolution_requests = resolution.request_count
+                    meta.identity_resolution_seconds = resolution.elapsed_seconds
+                    meta.identity_resolution_cache_hit = resolution.cache_hit
+                    meta.identity_resolution_evidence = resolution.evidence
+                    meta.feature_lookup_attempts += resolution.attempts
+                return base_identity, [], meta
             fallback_reason = ("完整片名未确认唯一影片身份，文件名也没有年份；停止缩短片名或按缩写宽搜。"
                                "请补全正确片名和年份，或使用字幕选择。")
         return base_identity, [], SearchMeta(

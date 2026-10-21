@@ -18,6 +18,9 @@ import smart_subtitles as smart
 
 class PreciseRetryTest(unittest.TestCase):
     def setUp(self):
+        evidence = patch.object(online.work_identity, 'fetch_secondary_catalogue', return_value={'results': []})
+        evidence.start()
+        self.addCleanup(evidence.stop)
         self.identity = online.MediaIdentity(
             "Star Wars: Episode IV - A New Hope", "Star Wars: Episode IV - A New Hope", "1977",
         )

@@ -25,6 +25,7 @@ import uuid
 import wave
 import weakref
 from bisect import bisect_left
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -90,6 +91,19 @@ class SubtitlePreflightTimeoutError(SubtitlePreflightError):
 
 class SharedImageTimingPreparationError(SubtitleVerificationToolError):
     """Film-level image IO failed; changing text candidates cannot fix it."""
+
+
+class RetainedSubtitleStageTimeoutError(SharedImageTimingPreparationError):
+    """The retained-image stage expired during preparation or acceptance."""
+    reason_code = 'retained_image_stage_timeout'
+
+    def __init__(self, budget_seconds, spent_seconds):
+        self.budget_seconds = float(budget_seconds)
+        self.spent_seconds = float(spent_seconds)
+        self.remaining_seconds = max(0.0, self.budget_seconds - self.spent_seconds)
+        super().__init__(
+            f'保留图片字幕验收达到影片共用{self.budget_seconds:g}秒上限；'
+            '保留图片字幕验收未完成，停止本片，不重新搜索或轮换字幕候选。')
 
 
 class SharedImageTimingPreparationRequired(RuntimeError):
@@ -584,11 +598,24 @@ def _has_current_full_image_cache(input_path, cache_dir) -> bool:
 
 def complete_shared_image_timing(request: SharedImageTimingPreparationRequired, log, cancel=None):
     """Read the old fallback once, using its existing film-level IO budget."""
+    retained_stage = getattr(request, 'retained_stage', None)
+    if retained_stage is not None:
+        retained_stage.validate(request.input_path)
+        with retained_stage.scope(log) as stage_cancel:
+            return _complete_shared_image_timing_impl(request, log, stage_cancel)
+    return _complete_shared_image_timing_impl(request, log, cancel)
+
+
+def _complete_shared_image_timing_impl(request, log, cancel=None):
     import continuous_vad
     legacy.check_cancel(cancel)
     limit = continuous_vad.image_preparation_budget_seconds(request.duration)
-    deadline = _DeadlineCancel(cancel, time.monotonic() + limit)
     started = time.monotonic()
+    expires = started + limit
+    parent_deadline = getattr(cancel, 'deadline', None)
+    if isinstance(parent_deadline, (int, float)) and math.isfinite(parent_deadline):
+        expires = min(expires, parent_deadline)
+    deadline = _DeadlineCancel(cancel, expires)
     log(f"局部图片时间点证据不足，开始一次影片共用的全片后备读取（最多{limit:g}秒）；"
         "本步骤不占候选匹配额度，后续候选复用。")
     try:
@@ -2726,6 +2753,114 @@ class _DeadlineCancel:
         return self.deadline is not None and time.monotonic() >= self.deadline
 
 
+class SharedRetainedImageStage:
+    """One film's retained-image verification clock and immutable metadata.
+
+    The old candidate clock is for matching text against audio. This separate
+    cumulative clock covers metadata, local/full packet reads, comparison and
+    issuance of the same-run handoff. Re-entering it never renews the budget.
+    Packet caches retain their existing movie/ordinal signatures; acceptance
+    results remain bound to the exact adopted text SHA in PreparedImageTiming.
+    """
+    def __init__(self, input_path, track_ids, duration, cancel=None):
+        import continuous_vad
+
+        self.input_path = str(Path(input_path).resolve())
+        self.track_ids = tuple(sorted(set(track_ids)))
+        self.cancel = cancel
+        self.limit_seconds = continuous_vad.image_preparation_budget_seconds(duration)
+        self.spent_seconds = 0.0
+        self._signature = _image_cache_signature(self.input_path, _prepared_image_rule_version())
+        self._media = None
+        self._tracks = None
+        self._active_cancel = None
+        self._active_started = None
+        self._lock = threading.RLock()
+
+    @property
+    def remaining_seconds(self):
+        active = (time.monotonic() - self._active_started
+                  if self._active_started is not None else 0.0)
+        return max(0.0, self.limit_seconds - self.spent_seconds - active)
+
+    def snapshot(self):
+        return dict(budget_seconds=self.limit_seconds,
+                    spent_seconds=round(self.spent_seconds, 6),
+                    remaining_seconds=round(self.remaining_seconds, 6),
+                    metadata_reused=self._media is not None,
+                    track_ids=list(self.track_ids))
+
+    def validate(self, input_path, track_ids=None):
+        legacy.check_cancel(self.cancel)
+        current = _image_cache_signature(input_path, _prepared_image_rule_version())
+        if current != self._signature:
+            raise SharedImageTimingPreparationError(
+                '影片或图片字幕规则在共享验收期间已变化，停止本片；不能复用旧轨道映射。')
+        if track_ids is not None and tuple(sorted(set(track_ids))) != self.track_ids:
+            raise SharedImageTimingPreparationError(
+                '需保留的图片字幕轨在共享验收期间已变化，停止本片。')
+
+    def metadata(self, input_path):
+        self.validate(input_path)
+        if self._active_cancel is None:
+            raise SharedImageTimingPreparationError('图片字幕共享验收尚未启动。')
+        legacy.check_cancel(self._active_cancel)
+        if self._media is None:
+            try:
+                media = legacy.inspect_media(self.input_path, cancel_event=self._active_cancel)
+            except legacy.CancelledError:
+                raise
+            except Exception as exc:
+                raise SharedImageTimingPreparationError(
+                    f'保留图片字幕验收的容器信息读取失败，停止本片：{exc}') from exc
+            legacy.check_cancel(self._active_cancel)
+            self.validate(input_path)
+            tracks = legacy.tracks_from_media(media)
+            available = {track.id for track in tracks if track.type == 'subtitles'
+                         and (track.pgs_subtitle or track.vobsub_subtitle)}
+            if not set(self.track_ids).issubset(available):
+                raise SharedImageTimingPreparationError('找不到需保留的图片字幕轨。')
+            self._media, self._tracks = copy.deepcopy(media), copy.deepcopy(tracks)
+        # Callers may sort or annotate tracks; never let that mutate the shared
+        # ordinal map used by later candidates or the final handoff.
+        return copy.deepcopy(self._media), copy.deepcopy(self._tracks)
+
+    def prepare_metadata(self, log):
+        """Warm the same bounded metadata before the text matching clock."""
+        with self.scope(log):
+            return self.metadata(self.input_path)
+
+    @contextmanager
+    def scope(self, log):
+        with self._lock:
+            if self._active_started is not None:
+                raise SharedImageTimingPreparationError('图片字幕共享验收不能并发或嵌套启动。')
+            self.validate(self.input_path)
+            remaining = self.remaining_seconds
+            if remaining <= 0:
+                raise RetainedSubtitleStageTimeoutError(self.limit_seconds, self.spent_seconds)
+            started = time.monotonic()
+            deadline = _DeadlineCancel(self.cancel, started + remaining)
+            self._active_started, self._active_cancel = started, deadline
+            log(f'保留图片字幕独立验收：影片共用最多{self.limit_seconds:g}秒，'
+                f'剩余{remaining:.2f}秒；不占用音频匹配20秒额度。')
+            try:
+                legacy.check_cancel(deadline)
+                yield deadline
+                legacy.check_cancel(deadline)
+                self.validate(self.input_path)
+            except legacy.CancelledError as exc:
+                legacy.check_cancel(self.cancel)
+                if deadline.timed_out:
+                    raise RetainedSubtitleStageTimeoutError(
+                        self.limit_seconds,
+                        self.spent_seconds + max(0.0, time.monotonic() - started)) from exc
+                raise
+            finally:
+                self.spent_seconds += max(0.0, time.monotonic() - started)
+                self._active_started = self._active_cancel = None
+
+
 def _preflight_external_subtitle_impl(
     input_path: str,
     subtitle_path: str,
@@ -4177,7 +4312,7 @@ def _alass_fixed_fallback(
     alass = _tool(ALASS_CANDIDATES, "字幕固定偏移兜底 alass")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.unlink(missing_ok=True)
-    ffmpeg = Path(legacy.resolve_config_path(r"toolsfmpeginfmpeg.exe"))
+    ffmpeg = Path(legacy.resolve_config_path(r"tools\ffmpeg\bin\ffmpeg.exe"))
     ffprobe = ffmpeg.with_name("ffprobe.exe")
     env = os.environ.copy()
     env["ALASS_FFMPEG_PATH"] = str(ffmpeg)
@@ -4510,9 +4645,10 @@ def prepared_image_timing_matches_subtitle(prepared, aligned) -> bool:
         return False
 
 
-def _prepared_image_context(input_path, track_ids, selected_audio_id, shared_content_audio, aligned):
+def _prepared_image_context(input_path, track_ids, selected_audio_id, shared_content_audio, aligned,
+        tracks=None):
     ids = tuple(sorted(set(track_ids)))
-    tracks = legacy.inspect_tracks(input_path)
+    tracks = legacy.inspect_tracks(input_path) if tracks is None else tracks
     available = {track.id for track in tracks if track.type == "subtitles"
                  and (track.pgs_subtitle or track.vobsub_subtitle)}
     if not ids or not set(ids).issubset(available):
@@ -4527,14 +4663,14 @@ def _prepared_image_context(input_path, track_ids, selected_audio_id, shared_con
 
 
 def _make_prepared_image_timing(input_path, track_ids, selected_audio_id,
-        shared_content_audio, aligned, results, initial_context):
+        shared_content_audio, aligned, results, initial_context, tracks=None):
     try:
         ids = tuple(sorted(set(track_ids)))
         if (initial_context is None or not ids
                 or any(not results.get(track_id, {}).get("accepted") for track_id in ids)):
             return None
         current_context = _prepared_image_context(
-            input_path, track_ids, selected_audio_id, shared_content_audio, aligned,
+            input_path, track_ids, selected_audio_id, shared_content_audio, aligned, tracks,
         )
         if current_context != initial_context:
             return None
@@ -4711,19 +4847,27 @@ def prepare_embedded_text_corrections(
     prepared_image_timing: PreparedImageTiming | None = None,
     prepared_text_extraction: PreparedEmbeddedTextExtraction | None = None,
     prefetch_text_subtitle_ids: list[int] | None = None,
+    retained_stage: SharedRetainedImageStage | None = None,
 ) -> tuple[dict[int, int], dict[int, Path], int | None]:
     legacy.check_cancel(cancel)
-    tracks = legacy.inspect_tracks(input_path)
+    media = None
+    if retained_stage is None:
+        tracks = legacy.inspect_tracks(input_path)
+    else:
+        media, tracks = retained_stage.metadata(input_path)
     if verification_status is not None:
         verification_status.clear()
         verification_status["verified_anchor"] = False
-    media = None
     duration = 0.0
+    if media is not None:
+        duration_ns = legacy.video_track_duration_ns(media) or legacy.media_duration_ns(media)
+        duration = duration_ns / 1_000_000_000 if duration_ns > 0 else 0.0
     prepared = None
     external_reference = Path(verified_external_subtitle or "")
     if prepared_embedded_anchor is not None and not external_reference.is_file():
         try:
-            media = legacy.inspect_media(input_path)
+            if media is None:
+                media = legacy.inspect_media(input_path)
             duration_ns = legacy.video_track_duration_ns(media) or legacy.media_duration_ns(media)
             duration = duration_ns / 1_000_000_000 if duration_ns > 0 else 0.0
             prepared = _validated_prepared_embedded_anchor(
@@ -5196,6 +5340,7 @@ def prepare_embedded_text_corrections(
             image_results[track.id]['reason'] = f'时间点读取失败：{exc}'
             offsets[track.id] = 0
             continue
+        legacy.check_cancel(cancel)
         if len(intervals) < 20:
             image_results[track.id]['reason'] = f'有效显示区间不足：{len(intervals)}'
             log(
@@ -5207,6 +5352,7 @@ def prepare_embedded_text_corrections(
         offset: int | None = None
         if len(verified_reference_events) >= 20:
             score, offset_seconds = _interval_alignment(reference_intervals, intervals)
+            legacy.check_cancel(cancel)
             image_results[track.id].update(score=score, proposed_offset_seconds=offset_seconds,
                 reason=f'相关度{score:.1%}，相对偏移{offset_seconds:+.2f}秒，不满足现有图片字幕核验条件')
             if score >= 0.55 and abs(offset_seconds) > MAX_AUTOMATIC_OFFSET_SECONDS:
@@ -5335,30 +5481,64 @@ def _replacement_targets(tracks, kept_ids, preferences, source_code, script_equi
 
 def require_image_timeline_anchor(input_path, track_ids, audio_id, work_dir, aligned, log,
         cancel=None, prepared_image_status: dict[str, object] | None = None,
-        replace_unalignable: bool = False):
+        replace_unalignable: bool = False,
+        retained_stage: SharedRetainedImageStage | None = None):
+    """Validate retained images under their own optional cumulative film clock."""
+    if retained_stage is not None:
+        try:
+            if prepared_image_status is not None:
+                prepared_image_status.clear()
+            retained_stage.validate(input_path, track_ids)
+            with retained_stage.scope(log) as stage_cancel:
+                return _require_image_timeline_anchor_impl(
+                    input_path, track_ids, audio_id, work_dir, aligned, log, stage_cancel,
+                    prepared_image_status, replace_unalignable, retained_stage)
+        except SharedImageTimingPreparationRequired as request:
+            request.retained_stage = retained_stage
+            if prepared_image_status is not None:
+                prepared_image_status.clear()
+            raise
+        except BaseException:
+            if prepared_image_status is not None:
+                prepared_image_status.clear()
+            raise
+    return _require_image_timeline_anchor_impl(
+        input_path, track_ids, audio_id, work_dir, aligned, log, cancel,
+        prepared_image_status, replace_unalignable)
+
+
+def _require_image_timeline_anchor_impl(input_path, track_ids, audio_id, work_dir, aligned, log,
+        cancel=None, prepared_image_status: dict[str, object] | None = None,
+        replace_unalignable: bool = False,
+        retained_stage: SharedRetainedImageStage | None = None):
     """Check task suitability after audio alignment; PGS never proves absolute sync."""
     if prepared_image_status is not None:
         prepared_image_status.clear()
     legacy.check_cancel(cancel)
     if not track_ids:
         return {}
+    stage_tracks = (retained_stage.metadata(input_path)[1]
+                    if retained_stage is not None else None)
     initial_context = None
     if prepared_image_status is not None:
         try:
-            initial_context = _prepared_image_context(input_path, track_ids, audio_id, None, aligned)
+            initial_context = _prepared_image_context(
+                input_path, track_ids, audio_id, None, aligned, stage_tracks)
         except (OSError, StopIteration, TypeError, ValueError, RuntimeError):
             pass
     status = {}
     prepare_embedded_text_corrections(
         input_path, track_ids, None, audio_id, str(work_dir), log, cancel,
-        verified_external_subtitle=str(aligned), verification_status=status)
+        verified_external_subtitle=str(aligned), verification_status=status,
+        **({'retained_stage': retained_stage} if retained_stage is not None else {}))
     results = status.get('image_results', {})
     replacements = unalignable_retained_tracks(results) if replace_unalignable else {}
     if replacements:
         # Only a same-run decision bound to the unchanged movie, actual audio,
         # retained tracks and verified text may authorize omitting a track.
         try:
-            current_context = _prepared_image_context(input_path, track_ids, audio_id, None, aligned)
+            current_context = _prepared_image_context(
+                input_path, track_ids, audio_id, None, aligned, stage_tracks)
         except (OSError, StopIteration, TypeError, ValueError, RuntimeError):
             current_context = None
         if initial_context is None or current_context != initial_context:
@@ -5380,7 +5560,7 @@ def require_image_timeline_anchor(input_path, track_ids, audio_id, work_dir, ali
             # never issued as a timing pass or reused to bless another track.
             passed_context = (*initial_context[:6], tuple(sorted(passed_ids)), initial_context[7])
         prepared = _make_prepared_image_timing(
-            input_path, passed_ids, audio_id, None, aligned, results, passed_context,
+            input_path, passed_ids, audio_id, None, aligned, results, passed_context, stage_tracks,
         )
         legacy.check_cancel(cancel)
         if prepared is not None:

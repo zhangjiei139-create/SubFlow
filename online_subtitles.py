@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from subtitle_candidate_priority import author_name
+import work_identity_resolver as work_identity
 from work_identity_resolver import WorkProfile, read_cached_resolution, resolve as resolve_work_identity
 
 from media_title_resolver import (
@@ -122,6 +123,7 @@ class MediaIdentity:
     tmdb_id: str = ""
     edition: str = ""
     specification: str = ""
+    raw_title: str = ""
 
 
 @dataclass
@@ -547,6 +549,15 @@ def _feature_identity_from_response(
         return None
     for item in entries:
         attrs = item.get("attributes") or {}
+        if diagnostics is not None:
+            # Preserve the complete response for the separate filename proof.
+            # The normal selector below still rejects non-movie entries, but
+            # shared IDs with conflicting type/year cannot disappear first.
+            profiles = work_identity._primary_profiles({'data': [
+                {'attributes': attrs, 'type': item.get('type', '')}]})
+            if not work_identity.primary_response_complete(response):
+                profiles = [replace(p, source='opensubtitles-features-incomplete') for p in profiles]
+            diagnostics.profiles.extend(profiles)
         feature_type = str(
             attrs.get("feature_type") or attrs.get("type") or item.get("type") or ""
         ).lower()
@@ -563,13 +574,6 @@ def _feature_identity_from_response(
         imdb_id = re.sub(r"^tt", "", str(attrs.get("imdb_id") or "").strip(), flags=re.I)
         tmdb_id = str(attrs.get("tmdb_id") or "").strip()
         year = str(attrs.get("year") or "").strip()
-        if diagnostics is not None:
-            aliases = attrs.get('title_aka') or []
-            aliases = [aliases] if isinstance(aliases, str) else aliases
-            aliases = tuple(value for value in aliases if isinstance(value, str)) if isinstance(aliases, (list, tuple)) else ()
-            diagnostics.profiles.append(WorkProfile(
-                original_title or title, year, imdb_id, tmdb_id, 'opensubtitles-features',
-                feature_type, tuple(dict.fromkeys((title, original_title, *aliases)))))
         id_keys = set()
         if imdb_key := _provider_id_key(imdb_id, imdb=True):
             id_keys.add(("imdb", imdb_key))
@@ -1121,14 +1125,41 @@ def _resolution_meta(meta, resolution):
 
 def _recover_work_identity(api_key, identity, candidates, meta, lookup=None):
     context = _WORK_IDENTITY_CONTEXT.get()
+    if context is not None and context.get('defer_candidate_recovery'):
+        # Smart's candidate-scoped recovery shares this very session. Avoid
+        # spending its clock on the unchanged miss before a mechanical proposal
+        # or an independent homonym/runtime observation can be tried.
+        from subtitle_source_recovery import camel_boundary_proposal, runtime_applicable
+        if (camel_boundary_proposal(identity.original_title or identity.title) or
+                runtime_applicable(identity, candidates, meta)):
+            meta.identity_resolution_status = 'pending'
+            meta.identity_resolution_reason = '普通来源未准入；交由同预算候选级恢复，未确认作品ID'
+            return None
+    known_year_mode = bool(identity.year and lookup is not None
+                           and not needs_canonical_title(identity.title))
     if context is not None and context['attempted']:
-        return None
+        previous = context.get('resolution')
+        if not (known_year_mode and context.get('recovery_mode') == 'generic'
+                and previous is not None and previous.state == 'pending'
+                and previous.request_count == 0):
+            return None
     if context is not None:
         context['attempted'] = True
+        context['recovery_mode'] = 'known-year' if known_year_mode else 'generic'
     profiles = tuple(getattr(lookup, 'profiles', ()) or ()) + tuple(_candidate_work_profiles(candidates))
-    resolution = resolve_work_identity(identity, profiles,
-                                       cancel_event=context.get('cancel_event') if context else None,
-                                       time_budget_seconds=min(15.0, max(0.0, context.get('metadata_budget_seconds', 15.0))) if context else 15.0)
+    recovery = context['recovery'] if context is not None else work_identity.RecoverySession()
+    if known_year_mode:
+        if lookup.status in {'ambiguous', 'identity-conflict'} or lookup.proposal_conflict:
+            resolution = work_identity.Resolution('pending', lookup.reason or '现有目录身份冲突，未启动别名补证')
+        else:
+            resolution = work_identity.recover_known_year_alias(identity, recovery, profiles)
+    else:
+        resolution = resolve_work_identity(identity, profiles,
+                                           cancel_event=context.get('cancel_event') if context else None,
+                                           time_budget_seconds=min(15.0, max(0.0, context.get('metadata_budget_seconds', 15.0))) if context else 15.0,
+                                           budget=recovery.evidence_budget())
+    if resolution is None:
+        return None
     if context is not None:
         context['resolution'] = resolution
     _resolution_meta(meta, resolution)
@@ -1154,6 +1185,32 @@ def _search_confirmed_work_identity(api_key, identity, candidates, meta, resolut
     # nonmatching rows remain filtered and cannot consume download attempts.
     combined = {item.file_id: item for item in (*candidates, *fresh)}
     results = list(combined.values())
+    # The ID-scoped response is new evidence, not just a bag of subtitle
+    # files. Contradictory metadata must revoke the whole reusable proof.
+    bound = work_identity.resolution_input_identity(identity, resolution)
+    observed = tuple(getattr(lookup, 'profiles', ()) or ()) + tuple(_candidate_work_profiles(results))
+    if not work_identity.validate_resolution(bound, resolution, observed):
+        reason = '已确认ID补查的新字幕条目与作品ID、年份或用途矛盾；撤销本片自动身份确认，未跨站复用'
+        recovery = context['recovery'] if context is not None else work_identity.RecoverySession()
+        pending = recovery.revoke_resolution(bound, resolution, reason)
+        if context is not None:
+            context['resolution'] = pending
+            context['identity_revoked'] = True
+        _apply_identity_admission(results, resolved, 'identity-conflict')
+        for item in results:
+            if item.identity_admission_state == 'auto':
+                item.identity_admission_state = 'pending'
+                item.identity_admission_reason = reason
+                item.identity_admission_evidence = ()
+                item.identity_verified = False
+                item.identity_key = f'opensubtitles-file:{item.file_id}'
+                item.recommendation = '身份待确认'
+        _resolution_meta(meta, pending)
+        meta.total_count, meta.loaded_count, meta.truncated = total, len(results), truncated
+        meta.query_mode = 'identity-conflict'
+        meta.feature_lookup_status = 'identity-conflict'
+        meta.feature_lookup_reason = meta.fallback_reason = reason
+        return identity, results, meta
     _apply_identity_admission(results, resolved, 'resolved', resolution.evidence)
     meta.total_count = total
     meta.loaded_count = len(results)
@@ -1167,16 +1224,24 @@ def _search_confirmed_work_identity(api_key, identity, candidates, meta, resolut
 
 
 def search(api_key: str, video_path: str, language: str, *, skip_hash: bool = False,
-           cancel_event=None, identity_time_budget_seconds: float = 15.0) -> tuple[MediaIdentity, list[SubtitleCandidate], SearchMeta]:
+           cancel_event=None, identity_time_budget_seconds: float = 15.0,
+           identity_recovery_session=None, defer_candidate_recovery: bool = False) -> tuple[MediaIdentity, list[SubtitleCandidate], SearchMeta]:
+    recovery = identity_recovery_session or work_identity.RecoverySession(
+        cancel_event=cancel_event, time_budget_seconds=identity_time_budget_seconds)
+    if recovery.primary_lookup is None:
+        recovery.primary_lookup = lambda title, year, budget: work_identity.fetch_primary_catalogue(
+            title, year, budget, api_key=api_key)
     context = {'cancel_event': cancel_event, 'attempted': False, 'resolution': None, 'language': language,
-               'metadata_budget_seconds': identity_time_budget_seconds}
+               'metadata_budget_seconds': identity_time_budget_seconds, 'recovery': recovery,
+               'defer_candidate_recovery': defer_candidate_recovery}
     token = _WORK_IDENTITY_CONTEXT.set(context)
     try:
         identity, candidates, meta = _search_impl(api_key, video_path, language, skip_hash=skip_hash)
         if context['resolution'] is not None and not meta.identity_resolution_status:
             _resolution_meta(meta, context['resolution'])
-        _apply_identity_admission(candidates, identity, meta.feature_lookup_status,
-                                  meta.identity_resolution_evidence)
+        if not context.get('identity_revoked'):
+            _apply_identity_admission(candidates, identity, meta.feature_lookup_status,
+                                      meta.identity_resolution_evidence)
         return identity, candidates, meta
     finally:
         _WORK_IDENTITY_CONTEXT.reset(token)
@@ -1191,6 +1256,12 @@ def _search_impl(
         raise RuntimeError(conflict)
     base_identity = identify_media(video_path)
     identity = base_identity
+    context = _WORK_IDENTITY_CONTEXT.get()
+    revoked = context['recovery'].revoked_resolution(base_identity) if context is not None else None
+    if revoked is not None:
+        return base_identity, [], _resolution_meta(SearchMeta(query_mode='identity-conflict',
+            feature_lookup_status='identity-conflict', feature_lookup_reason=revoked.reason,
+            fallback_reason=revoked.reason), revoked)
     common: dict[str, str | int] = {"languages": language}
 
     moviehash = ""
@@ -1254,6 +1325,9 @@ def _search_impl(
         lookup.status = "resolved" if feature_identity is not None else "unresolved"
         lookup.reason = "已解析站点影片身份" if feature_identity is not None else "未取得可锁定的站点影片身份"
     fallback_reason = lookup.reason if feature_identity is None else ""
+    context = _WORK_IDENTITY_CONTEXT.get()
+    recovery = context['recovery'] if context is not None else work_identity.RecoverySession()
+    recovery.protect_full_title(base_identity, lookup.profiles)
     if feature_identity is not None:
         feature_params = dict(common)
         if feature_identity.imdb_id:
@@ -1300,13 +1374,40 @@ def _search_impl(
             return _search_confirmed_work_identity(api_key, base_identity, [], meta, cached, lookup)
 
     if not base_identity.year:
-        reason = ("未取得可用的已确认影片身份，文件名也没有年份；停止按未确认片名宽搜。"
-                  "请补全正确片名和年份，或使用字幕选择。")
-        return feature_identity or base_identity, [], SearchMeta(
+        meta = SearchMeta(
             query_mode="unresolved-title", moviehash=moviehash,
             feature_lookup_status=lookup.status, feature_lookup_reason=lookup.reason,
-            feature_lookup_attempts=tuple(lookup.attempts), fallback_reason=reason,
+            feature_lookup_attempts=tuple(lookup.attempts),
         )
+        if feature_identity is not None:
+            meta.query_mode = 'feature'
+            meta.fallback_reason = '完整原题已有目录匹配记录，但未返回可用字幕；保留原题数字，不另按尾年拆分搜索。'
+            return feature_identity, [], meta
+        proposal = work_identity.filename_proposal_identity(video_path, base_identity)
+        if proposal is not None:
+            lookup.attempts.append(
+                f'保留完整原题“{base_identity.title}”；仅提出尾年候选“{proposal.title}”（{proposal.year}），等待完整片名及唯一双ID补证')
+            if feature_identity is None and lookup.status not in {'ambiguous', 'identity-conflict', 'missing-id'}:
+                resolution = work_identity.recover_filename_year(video_path, base_identity, recovery, lookup.profiles)
+                if resolution is not None:
+                    _resolution_meta(meta, resolution)
+                    lookup.attempts.extend(resolution.attempts)
+                    if (resolution.state == 'confirmed'
+                            and work_identity.validate_filename_resolution(video_path, base_identity, resolution, lookup.profiles)):
+                        if context is not None:
+                            context['resolution'] = resolution
+                        resolved = replace(base_identity, title=resolution.title,
+                                           original_title=resolution.title, year=resolution.year,
+                                           raw_title=base_identity.title)
+                        return _search_confirmed_work_identity(api_key, resolved, [], meta, resolution, lookup)
+            reason = ('文件名含末尾四位数字，但发行年份及对应作品尚未确认；保留完整原题，未自动按拆分候选下载字幕。'
+                      '请补充可靠影片身份，或使用字幕选择。')
+        else:
+            reason = ("未取得可用的已确认影片身份，文件名也没有年份；停止按未确认片名宽搜。"
+                      "请补全正确片名和年份，或使用字幕选择。")
+        meta.feature_lookup_attempts = tuple(lookup.attempts)
+        meta.fallback_reason = reason
+        return feature_identity or base_identity, [], meta
 
     # A tentative provider feature must never replace the original filename
     # identity. If the provider-id path is empty, retry the user's actual title.
@@ -1329,9 +1430,11 @@ def _search_impl(
         fallback_reason=fallback_reason,
     )
     if feature_identity is None:
-        recovered = _recover_work_identity(api_key, identity, results, meta, lookup)
-        if recovered is not None:
-            return recovered
+        _apply_identity_admission(results, identity, lookup.status)
+        if not any(item.identity_admission_state == 'auto' for item in results):
+            recovered = _recover_work_identity(api_key, identity, results, meta, lookup)
+            if recovered is not None:
+                return recovered
     _apply_identity_admission(results, identity, lookup.status)
     return identity, results, meta
 

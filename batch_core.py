@@ -146,6 +146,12 @@ def failure_advice(error) -> str:
                    or (None if getattr(current, "__suppress_context__", False)
                        else getattr(current, "__context__", None)))
     text = "\n".join(str(item) for item in chain).casefold()
+    if any(isinstance(item, pro_core.RetainedSubtitleStageTimeoutError) for item in chain):
+        if any(isinstance(getattr(item, "audio_checkpoint", None), dict)
+               and getattr(item, "audio_checkpoint", None) for item in chain):
+            return ("保留图片字幕核验未完成；已通过音频核验的来源已保存，重新处理会复用该来源，"
+                    "无需重新搜索或下载，仍须完成保留字幕轨核验。")
+        return "保留图片字幕准备未完成；建议空闲后重新处理，并检查影片读取情况。"
     if any(isinstance(item, pro_core.RetainedSubtitleVerificationError) for item in chain):
         return "建议查看详情中的保留字幕轨核验结果；已通过音频核验的文本已保存，需单独核验保留轨或调整字幕选择。"
     if '参照音轨或字幕版本待确认' in text:
@@ -1954,10 +1960,13 @@ def _process_plan_impl(
         candidate_image_replacements = {}
         candidate_image_context = None
         image_failures_by_clock = {}
+        retained_image_stage = (pro_core.SharedRetainedImageStage(
+            plan.path, required_image_ids, runtime_duration, cancel=cancel_event)
+            if required_image_ids else None)
 
         def prepare_candidate_images(preparation_cancel):
-            pro_core.prepare_shared_image_timing(
-                plan.path, required_image_ids, str(work), log, preparation_cancel)
+            core.check_cancel(preparation_cancel)
+            retained_image_stage.prepare_metadata(log)
 
         def check_candidate_images(aligned, candidate_cancel):
             nonlocal candidate_image_timing, candidate_image_replacements, candidate_image_context
@@ -1979,7 +1988,7 @@ def _process_plan_impl(
                     plan.path, required_image_ids,
                     getattr(candidate_cancel, 'validation_audio_id', main_track.id), str(work), aligned,
                     log, candidate_cancel, prepared_image_status=image_status,
-                    replace_unalignable=True)
+                    replace_unalignable=True, retained_stage=retained_image_stage)
             except pro_core.RetainedSubtitleVerificationError as error:
                 image_failures_by_clock[clock] = error
                 raise
@@ -2007,9 +2016,11 @@ def _process_plan_impl(
             log(str(pending))
             raise pending from exc
         except (pro_core.SubtitlePreflightTimeoutError, pro_core.SharedImageTimingPreparationError,
-                pro_core.SubtitleVerificationToolError):
+                pro_core.SubtitleVerificationToolError) as error:
             # The film's audio preparation failed, not its downloaded subtitles.
             # Do not retry every subtitle or misreport this as a missing source.
+            if getattr(error, 'audio_checkpoint', None):
+                plan.audio_verified_source = dict(error.audio_checkpoint)
             raise
         except pro_core.RetainedSubtitleVerificationError as error:
             # The passed text and per-track evidence remain in the report/work.
@@ -2049,10 +2060,12 @@ def _process_plan_impl(
             plan.external_subtitle_origin = "download"
             plan.manual_confirmation_hash = ""
             if candidate_image_replacements:
-                current_context = pro_core._prepared_image_context(
-                    plan.path, required_image_ids,
-                    (smart_result.validation_audio_id if getattr(smart_result, 'validation_audio_id', None) is not None
-                     else main_track.id), None, smart_result.subtitle_path)
+                with retained_image_stage.scope(log):
+                    _, stage_tracks = retained_image_stage.metadata(plan.path)
+                    current_context = pro_core._prepared_image_context(
+                        plan.path, required_image_ids,
+                        (smart_result.validation_audio_id if getattr(smart_result, 'validation_audio_id', None) is not None
+                         else main_track.id), None, smart_result.subtitle_path, tracks=stage_tracks)
                 if current_context != candidate_image_context:
                     raise pro_core.SubtitleVerificationToolError(
                         '影片、音轨或已验证字幕在原轨替换决定后发生变化，请重新处理。')

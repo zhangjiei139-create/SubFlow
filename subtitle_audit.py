@@ -5,7 +5,9 @@ from collections import Counter
 import hashlib
 import json
 from pathlib import Path
+import re
 import time
+from urllib.parse import unquote
 
 
 _current = ContextVar("subtitle_film_audit", default=None)
@@ -18,6 +20,96 @@ STATES = dict(not_examined='未核验', eligible='用途可用', filtered='排�
               unverified='尚未核验', timing_conflict='时间轴冲突', rejected='拒绝', timeout='超时',
               infrastructure='工具或准备异常', identity_pending='影片身份待确认',
               replacement_planned='已排除，待补齐', replaced='已用可靠来源补齐')
+
+
+_REDACTED = '[REDACTED]'
+_SECRET_NAMES = frozenset(('apikey', 'token', 'accesstoken', 'authtoken', 'bearertoken',
+    'refreshtoken', 'authorization', 'password', 'passwd', 'clientsecret',
+    'secret', 'privatekey', 'signature'))
+# Match raw and percent-encoded delimiters without decoding or rewriting a
+# candidate URL. The report is only a display projection of internal state.
+_ENCODED_DELIMITER = r'%(?:25){0,2}'
+_QUERY_DELIMITER = rf'(?:&amp;|[?&;]|{_ENCODED_DELIMITER}(?:3[fFbB]|26))'
+_QUERY_VALUE = re.compile(
+    rf'(?P<prefix>{_QUERY_DELIMITER})(?P<key>(?:(?!=|{_ENCODED_DELIMITER}3[dD]|{_QUERY_DELIMITER})'
+    rf'(?:[A-Za-z0-9_.-]|%[A-Fa-f0-9]{{2}})){{1,120}})'
+    rf'(?P<equals>=|{_ENCODED_DELIMITER}3[dD])'
+    rf'(?P<value>(?:(?!{_QUERY_DELIMITER}|{_ENCODED_DELIMITER}23|[\s\"\'<>|]).)*)')
+_NAMED_SECRET = re.compile(
+    r'''(?i)(?<![A-Za-z0-9_.-])["']?(?:--?)?(?P<name>[A-Za-z][A-Za-z0-9_.-]{0,119})["']?\s*[:=]\s*''')
+_SECRET_VALUE = re.compile(r'''"[^"\r\n]*(?:"|(?=[\r\n])|$)|'[^'\r\n]*(?:'|(?=[\r\n])|$)|[^\s"',;&<>|]+''')
+
+
+def _secret_name(value, *, query=False):
+    name = str(value)
+    for _ in range(3):
+        decoded = unquote(name)
+        if decoded == name:
+            break
+        name = decoded
+    name = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', name)
+    parts = tuple(part for part in re.split(r'[^a-z0-9]+', name.casefold()) if part)
+    compact = ''.join(parts)
+    # A prefixed token/password is still a credential. A media/source signature
+    # is verification metadata; only a standalone or query signature is secret.
+    return (compact in _SECRET_NAMES or compact.endswith(('apikey', 'accesstoken',
+            'authtoken', 'bearertoken', 'refreshtoken', 'clientsecret', 'privatekey'))
+            or bool(parts and parts[-1] in _SECRET_NAMES - {'signature'})
+            or bool(query and parts and parts[-1] in {'key', 'signature'}))
+
+
+def _redact_named_values(text):
+    # Scan bounded labels once. Consuming only secret values lets an unrelated
+    # "reason: api_key=..." retain its reason while still finding the inner key.
+    # A leading CLI -- is part of the same label; hyphenated garbage is not
+    # retried at every component boundary.
+    result, position = [], 0
+    for match in _NAMED_SECRET.finditer(text):
+        if match.start() < position or not _secret_name(match['name']):
+            continue
+        value = _SECRET_VALUE.match(text, match.end())
+        if value is None:
+            continue
+        result.append(text[position:value.start()])
+        raw = value.group(0)
+        quote = raw[0] if raw[0] in '\"\'' else ''
+        result.append(quote + _REDACTED + (quote if quote and raw.endswith(quote) else ''))
+        position = value.end()
+    result.append(text[position:])
+    return ''.join(result)
+
+
+def redacted_text(value):
+    """Remove labelled credentials only at a human-readable output boundary."""
+    text = str(value)
+    text = _QUERY_VALUE.sub(lambda match: (
+        match['prefix'] + match['key'] + match['equals'] + _REDACTED
+        if _secret_name(match['key'], query=True) else match.group(0)), text)
+    text = re.sub(r'(?i)(https?://)[^\s/@]+(?::[^\s/@]*)?@',
+                  lambda match: match.group(1) + _REDACTED + '@', text)
+    text = re.sub(r'''(?i)(\bauthorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)[A-Za-z0-9._~+/-]+=*''',
+                  lambda match: match.group(1) + _REDACTED, text)
+    text = re.sub(r'(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+=*',
+                  lambda match: match.group(1) + _REDACTED, text)
+    return _redact_named_values(text)
+
+
+def report_projection(value):
+    """Copy and redact nested reports; never mutate source keys or receipts."""
+    if isinstance(value, dict):
+        return {(redacted_text(key) if isinstance(key, str) else key):
+                (_REDACTED if _secret_name(key) and item not in (None, '')
+                      else report_projection(item)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [report_projection(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(report_projection(item) for item in value)
+    return redacted_text(value) if isinstance(value, str) else value
+
+
+def redacted_logger(log):
+    """Sanitize before both UI callbacks and persistent process log writers."""
+    return lambda message: log(redacted_text(message))
 
 
 def current():
@@ -107,6 +199,7 @@ class FilmAudit:
         row['offset_seconds'] = fields.get('offset_seconds', evidence.get('proposed_offset_seconds'))
 
     def write(self, outcome, reason, log):
+        log = redacted_logger(log)
         replacements = [row for row in self.records if row['state'] == 'replacement_planned']
         if outcome == 'completed':
             for row in replacements:
@@ -151,6 +244,11 @@ class FilmAudit:
                 lines.append('  本轨对白内容抽检：未执行；时间轴通过不等同于内容已确认。')
         for search in self.searches:
             lines.append(f"站点 {search['provider']}：加载 {search['loaded']}；总数 {search['total']}；分页截断 {search['truncated']}；{search['identity_result']}")
+            if 'candidate_recovery_requests' in search:
+                lines.append(f"  候选级来源补证：本次 {search['candidate_recovery_requests']} 次，"
+                             f"耗时 {search.get('candidate_recovery_seconds', 0.0):.2f} 秒；"
+                             f"本片共享累计 {search.get('shared_evidence_requests', 0)} 次；"
+                             '仅具体来源继续核验，全球作品ID状态保持。')
         first_review = next((row for row in self.records if row['state'] == 'insufficient_evidence'), None)
         if '参照音轨或字幕版本待确认' in str(reason):
             advice = '建议：在核听窗口检查并选择参照音轨，再确认字幕版本；无需重复搜索已下载的候选。'
@@ -177,6 +275,8 @@ class FilmAudit:
             if evidence.get('fixed_offset_warning'):
                 lines.append('  人工三点偏移不同，已使用各点渐变修正；不把三点确认扩散为其他轨道的确认。')
         stem = self.directory / f"subtitle-report-{self.created}"
+        data = report_projection(data)
+        lines = [redacted_text(line) for line in lines]
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
             json_path, text_path = stem.with_suffix(".json"), stem.with_suffix(".txt")

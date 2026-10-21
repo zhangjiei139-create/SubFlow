@@ -172,7 +172,7 @@ class StrategyRemediationTests(unittest.TestCase):
         path=self.root/'audio-passed.srt'
         path.write_text('1\n00:00:01,000 --> 00:00:02,000\nHello there.\n', encoding='utf-8')
         return dict(rule='audio-stage-main-purpose-v1',path=str(path),sha256=subtitle_audit.file_hash(path),
-                    movie_signature=batch.media_signature(self.movie),selected_audio_id=1,
+                    movie_signature=batch.media_signature(self.movie),selected_audio_id=1,validation_audio_id=1,
                     provider='Test',release='Movie.2025.BluRay',identity_key='imdb:1',
                     report='连续VAD时间轴核验通过：提议固定偏移 +0.01 秒',
                     seal=smart.verification_seal(str(self.movie),str(path),'Test','Movie.2025.BluRay','imdb:1'))

@@ -136,6 +136,9 @@ class FeatureDeduplicationTests(unittest.TestCase):
 
 class FeatureLookupDiagnosticsTests(unittest.TestCase):
     def setUp(self):
+        evidence = patch.object(online.work_identity, 'fetch_secondary_catalogue', return_value={'results': []})
+        evidence.start()
+        self.addCleanup(evidence.stop)
         self.identity = online.MediaIdentity("The Cure", "The Cure", "1995")
 
     def search(self, response, pages=None, *, strict=True):

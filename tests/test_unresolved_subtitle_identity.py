@@ -108,6 +108,11 @@ class HashEvidenceTests(unittest.TestCase):
 
 
 class UnresolvedSearchTests(unittest.TestCase):
+    def setUp(self):
+        evidence = patch.object(online.work_identity, 'fetch_secondary_catalogue', return_value={'results': []})
+        evidence.start()
+        self.addCleanup(evidence.stop)
+
     def test_hash_miss_without_catalogue_identity_or_year_cannot_search_subtitles_by_abbreviation(self):
         identity = online.MediaIdentity("release-code", "release-code")
         with patch.object(online, "filename_container_identity_conflict", return_value=""), \

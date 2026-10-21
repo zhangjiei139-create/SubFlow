@@ -51,6 +51,7 @@ class PreparedImageHandoffTests(unittest.TestCase):
     def context(self):
         stack = ExitStack()
         stack.enter_context(patch.object(core, "inspect_tracks", side_effect=lambda *_: self.tracks))
+        stack.enter_context(patch.object(core, "tracks_from_media", side_effect=lambda *_: self.tracks))
         stack.enter_context(patch.object(core, "prepare_work_input", return_value=str(self.movie)))
         stack.enter_context(patch.object(core, "inspect_media", return_value={}))
         stack.enter_context(patch.object(core, "video_track_duration_ns", return_value=1000 * 10**9))

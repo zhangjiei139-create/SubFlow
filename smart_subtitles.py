@@ -13,6 +13,7 @@ import re
 import threading
 from typing import Callable
 import time
+import uuid
 
 import online_subtitles
 import pro_core
@@ -20,9 +21,10 @@ import subdl_subtitles
 import subtitle_tool_core as core
 import subtitle_roles
 import subtitle_audit
+import subtitle_source_recovery as source_recovery
 from subtitle_candidate_priority import prioritize_candidates, author_display
 from continuous_vad import adopted_alignment_report
-from work_identity_resolver import Resolution, validate_resolution
+from work_identity_resolver import Resolution, RecoverySession, validate_resolution, validate_filename_resolution, catalogue_year_evidence, confirmed_numeric_candidate_alias
 from subtitle_identity_guard import (
     edition_conflict,
     filename_container_identity_conflict,
@@ -33,6 +35,7 @@ from subtitle_identity_guard import (
     subtitle_language_label_conflict,
     verification_seal,
     controlled_film_title_alias,
+    trailing_filename_year_proposal,
 )
 
 
@@ -163,6 +166,16 @@ class _CombinedCancel:
 
     def is_set(self) -> bool:
         return any(event.is_set() for event in self.events)
+
+
+class _AcceptanceCancel:
+    """Retained-track work follows the user event, never the audio deadline."""
+    def __init__(self, cancel_event, validation_audio_id):
+        self.cancel_event = cancel_event
+        self.validation_audio_id = validation_audio_id
+
+    def is_set(self):
+        return bool(self.cancel_event is not None and self.cancel_event.is_set())
 
 
 @contextmanager
@@ -492,6 +505,11 @@ def verify_before_processing(
 
 
 def _validated_audio_checkpoint(movie, selected_audio_id, checkpoint):
+    if not isinstance(checkpoint, dict):
+        raise ValueError('音频核验来源记录格式无效')
+    actual_audio_id = checkpoint.get('validation_audio_id')
+    if type(actual_audio_id) is not int or actual_audio_id < 0:
+        raise ValueError('音频核验来源的实际音轨记录无效')
     if (checkpoint.get('rule') != 'audio-stage-main-purpose-v1'
             or checkpoint.get('selected_audio_id') != selected_audio_id
             or checkpoint.get('movie_signature') != media_signature(movie)
@@ -500,6 +518,9 @@ def _validated_audio_checkpoint(movie, selected_audio_id, checkpoint):
     source = Path(checkpoint['path'])
     if subtitle_audit.file_hash(source) != checkpoint['sha256']:
         raise RuntimeError('已通过音频核验的文本发生变化')
+    if (str(checkpoint.get('identity_key', '')).startswith(source_recovery.KEY_PREFIX)
+            and not source_recovery.validate_checkpoint(movie, checkpoint)):
+        raise RuntimeError('候选级恢复来源的原始字幕、影片或资格凭据不一致')
     verify_before_processing(movie,str(source),checkpoint['provider'],checkpoint['release'],
                              checkpoint['identity_key'],checkpoint['seal'])
     return source
@@ -607,12 +628,10 @@ def _candidate_recut_conflict(
     return f"候选明确标记为重剪/粉丝改版（{description}），本片未标明相同版本，暂不作为自动时间标杆"
 
 
-def _candidate_identity_conflict(candidate: object, identity: object | None) -> str:
-    """Require useful identity evidence before downloading anonymous site rows."""
-    admission = str(getattr(candidate, "identity_admission_state", "") or "")
-    admission_reason = str(getattr(candidate, "identity_admission_reason", "") or "")
+def _candidate_installment_conflict(candidate: object, identity: object | None) -> str:
+    """The explicit release installment check is shared by scoped recovery."""
     if identity is None:
-        return (admission_reason or "影片身份待确认，暂不自动下载") if admission in {"pending", "filtered"} else ""
+        return ''
     expected_title = str(
         getattr(identity, "original_title", "") or getattr(identity, "title", "") or ""
     )
@@ -635,6 +654,20 @@ def _candidate_identity_conflict(candidate: object, identity: object | None) -> 
     release_episode = episode_number(release)
     if expected_episode is not None and release_episode is not None and expected_episode != release_episode:
         return f"候选标记为第 {release_episode} 部，本片为第 {expected_episode} 部"
+    return ''
+
+
+def _candidate_identity_conflict(candidate: object, identity: object | None) -> str:
+    """Require useful identity evidence before downloading anonymous site rows."""
+    admission = str(getattr(candidate, "identity_admission_state", "") or "")
+    admission_reason = str(getattr(candidate, "identity_admission_reason", "") or "")
+    if identity is None:
+        return (admission_reason or "影片身份待确认，暂不自动下载") if admission in {"pending", "filtered"} else ""
+    expected_title = str(getattr(identity, 'original_title', '') or getattr(identity, 'title', '') or '')
+    feature_title = str(getattr(candidate, 'feature_title', '') or '')
+    release = ' '.join(str(getattr(candidate, name, '') or '') for name in ('release', 'file_name'))
+    if conflict := _candidate_installment_conflict(candidate, identity):
+        return conflict
     if conflict := online_subtitles._candidate_identity_metadata_conflict(candidate, identity):
         return conflict
     # Search keeps uncertain rows visible for manual selection. Only the
@@ -644,6 +677,8 @@ def _candidate_identity_conflict(candidate: object, identity: object | None) -> 
         return admission_reason or (
             "影片身份待确认，暂不自动下载" if admission == "pending" else "候选影片身份不符"
         )
+    if confirmed_numeric_candidate_alias(candidate, identity):
+        return ""
     # An undated filename is only a search proposal. A provider-confirmed hash
     # may contradict that spelling, but never a known ID or installment above.
     # This admits a candidate to the existing content/timing checks, not output.
@@ -711,12 +746,55 @@ def _provider_limit_reason(provider_name: str, exc: Exception) -> str:
     return ""
 
 
+def _work_directory(movie):
+    source = Path(movie)
+    return source.with_suffix("").with_name(source.stem + "_pro_work") / "smart-subtitles"
+
+
+def _save_audio_checkpoint(directory, checkpoint, state):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / 'audio-verified-source.json'
+    temporary = target.with_name(target.name + '.' + uuid.uuid4().hex + '.tmp')
+    temporary.write_text(json.dumps(dict(schema=1, state=state, checkpoint=checkpoint),
+                                    ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(target)
+
+
+def _checkpoint_after_audio(video_path, selected_audio_id, shared_content, aligned,
+                            provider, release, identity_key, report, movie_signature):
+    return dict(rule='audio-stage-main-purpose-v1', path=str(Path(aligned).resolve()),
+        sha256=subtitle_audit.file_hash(aligned), movie_signature=movie_signature,
+        selected_audio_id=selected_audio_id,
+        validation_audio_id=getattr(shared_content, 'validation_audio_id', selected_audio_id),
+        provider=provider, release=release, identity_key=identity_key, report=report,
+        seal=verification_seal(video_path, str(aligned), provider, release, identity_key))
+
+
+def _accept_retained_source(aligned, acceptance, cancel_event, validation_audio_id, log):
+    acceptance_cancel = _AcceptanceCancel(cancel_event, validation_audio_id)
+    core.check_cancel(acceptance_cancel)
+    if acceptance is not None:
+        try:
+            acceptance(Path(aligned), acceptance_cancel)
+        except pro_core.SharedImageTimingPreparationRequired as request:
+            log('智能字幕：音频核验已完成；保留图片字幕按影片独立预算补读，继续同一已对齐来源。')
+            pro_core.complete_shared_image_timing(request, log, acceptance_cancel)
+            core.check_cancel(acceptance_cancel)
+            try:
+                acceptance(Path(aligned), acceptance_cancel)
+            except pro_core.SharedImageTimingPreparationRequired as repeated:
+                raise pro_core.SharedImageTimingPreparationError(
+                    '影片共用图片字幕补读后仍不可用，停止本片；已通过音频的来源保留。') from repeated
+    core.check_cancel(acceptance_cancel)
+
+
 def find_verified_english(*args, **kwargs):
     movie = args[0] if args else kwargs["video_path"]
     log = args[2] if len(args) > 2 else kwargs["log"]
     if subtitle_audit.current() is not None:
         return _find_verified_english_impl(*args, **kwargs)
-    directory = Path(movie).with_suffix("").with_name(Path(movie).stem + "_pro_work") / "smart-subtitles"
+    directory = _work_directory(movie)
     audit = subtitle_audit.FilmAudit(movie, directory)
     outcome, reason = "completed", "找到通过全部现有验收的字幕"
     with subtitle_audit.scope(audit):
@@ -752,15 +830,25 @@ def _find_verified_english_impl(
     candidates. OpenSubtitles runs first; if none passes, SubDL receives its
     own equal allowance. Download/refill attempts are also bounded.
     """
-    log = pro_core.persistent_subtitle_logger(video_path, log)
+    log = subtitle_audit.redacted_logger(pro_core.persistent_subtitle_logger(video_path, log))
     audit = subtitle_audit.current()
+    destination_root = _work_directory(video_path)
     if conflict := filename_container_identity_conflict(video_path):
         log(f"智能字幕：{conflict}。")
         raise RuntimeError(conflict)
+    if not audio_checkpoint and not excluded_candidate_keys and not excluded_subtitle_fingerprints:
+        try:
+            saved = json.loads((destination_root / 'audio-verified-source.json').read_text(encoding='utf-8'))
+            if (isinstance(saved, dict) and saved.get('schema') == 1
+                    and saved.get('state') in {'audio_verified', 'retained_unverified'}
+                    and isinstance(saved.get('checkpoint'), dict)):
+                audio_checkpoint = saved['checkpoint']
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
     if audio_checkpoint:
         try:
             aligned = _validated_audio_checkpoint(video_path, selected_audio_id, audio_checkpoint)
-        except (OSError, ValueError, RuntimeError, KeyError) as error:
+        except (OSError, ValueError, TypeError, RuntimeError, KeyError) as error:
             log(f"已保存音频核验来源不能复用，重新检查候选：{error}")
         else:
             core.check_cancel(cancel_event)
@@ -769,17 +857,23 @@ def _find_verified_english_impl(
                          aligned_path=str(aligned), aligned_sha256=audio_checkpoint['sha256'], cache_reused=True)
             log('复用与本片、音轨及规则绑定的音频核验来源；仍须单独完成保留轨验收。')
             try:
-                if candidate_acceptance is not None:
-                    candidate_acceptance(aligned, cancel_event)
-            except pro_core.RetainedSubtitleVerificationError as error:
+                _accept_retained_source(aligned, candidate_acceptance, cancel_event,
+                    audio_checkpoint.get('validation_audio_id', selected_audio_id), log)
+            except (pro_core.RetainedSubtitleVerificationError,
+                    pro_core.SubtitleVerificationToolError) as error:
                 error.audio_checkpoint = dict(audio_checkpoint)
-                audit.update(row, 'retained_tracks', 'retained_track_unverified', str(error), results=error.results)
+                _save_audio_checkpoint(destination_root, audio_checkpoint, 'retained_unverified')
+                audit.update(row, 'retained_tracks',
+                    'timeout' if isinstance(error, pro_core.RetainedSubtitleStageTimeoutError) else 'retained_track_unverified',
+                    str(error), results=getattr(error, 'results', {}), audio_checkpoint=audio_checkpoint)
                 raise
             core.check_cancel(cancel_event)
             report = adopted_alignment_report(audio_checkpoint['report']) or audio_checkpoint['report']
             audit.update(row, 'acceptance', 'verified', report)
+            _save_audio_checkpoint(destination_root, audio_checkpoint, 'completed')
             return SmartSubtitleResult(str(aligned), 'en', report, audio_checkpoint['provider'], None,
-                audio_checkpoint['identity_key'], audio_checkpoint['release'], audio_checkpoint['seal'])
+                audio_checkpoint['identity_key'], audio_checkpoint['release'], audio_checkpoint['seal'],
+                validation_audio_id=audio_checkpoint.get('validation_audio_id', selected_audio_id))
     failures: list[str] = []
     pending_candidates: list[PendingSubtitleCandidate] = []
     retained_failures = []
@@ -787,9 +881,6 @@ def _find_verified_english_impl(
     search_details: list[str] = []
     returned_candidates = 0
     downloadable_candidates = 0
-    destination_root = Path(video_path).with_suffix("").with_name(
-        Path(video_path).stem + "_pro_work"
-    ) / "smart-subtitles"
     excluded = set(excluded_candidate_keys or ())
     seen_fingerprints = set(excluded_subtitle_fingerprints or ())
     seen_candidate_keys: set[str] = set()
@@ -809,10 +900,10 @@ def _find_verified_english_impl(
     movie_signature = media_signature(video_path)
     search_stages = []
     for provider in configured_providers:
-        search_stages.append((*provider, False))
+        search_stages.append((*provider, False, None))
         if provider[0] == "OpenSubtitles":
             # This stage is entered only after hash candidates have all failed.
-            search_stages.append((*provider, True))
+            search_stages.append((*provider, True, None))
 
     content_stop = threading.Event()
     content_cancel = _CombinedCancel(cancel_event, content_stop)
@@ -841,6 +932,15 @@ def _find_verified_english_impl(
     checked_reference_items = []
     serial = 0
     provider_usage: dict[str, list[int]] = {}
+    source_qualifications = {}
+    recovery_attempted = set()
+    duration_for_recovery = None
+    def scoped_candidate_key(provider, candidate):
+        result = candidate_key(provider, candidate)
+        receipt = source_qualifications.get(id(candidate))
+        if receipt and receipt.get('parent'):
+            result += '|parent:' + str(receipt['parent'].get('sd_id', ''))
+        return result
     download_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=SMART_DOWNLOAD_WORKERS,
         thread_name_prefix="smart-subtitle-download",
@@ -848,7 +948,10 @@ def _find_verified_english_impl(
     try:
         hash_fallback_ready = False
         confirmed_work = None
-        for provider_name, service, _key_name, key, title_fallback in search_stages:
+        # The budget starts lazily on the first evidence request. Known-year
+        # alias recovery must share it with hash fallback and the other site.
+        identity_recovery = RecoverySession(cancel_event=cancel_event)
+        for stage_index, (provider_name, service, _key_name, key, title_fallback, recovered_payload) in enumerate(search_stages):
             if title_fallback and not hash_fallback_ready:
                 continue
             if title_fallback:
@@ -867,10 +970,17 @@ def _find_verified_english_impl(
                     search_options = {"skip_hash": True} if title_fallback else {}
                     if service is online_subtitles and cancel_event is not None:
                         search_options["cancel_event"] = cancel_event
+                    if identity_recovery is not None and service in (online_subtitles, subdl_subtitles):
+                        search_options["identity_recovery_session"] = identity_recovery
+                    if service is online_subtitles:
+                        search_options['defer_candidate_recovery'] = True
                     if service is subdl_subtitles and confirmed_work is not None:
                         search_options["confirmed_work_identity"] = confirmed_work
                         log("智能字幕：SubDL 复用本片已确认的作品身份与完整别名证据；仍核对本站双ID和年份后取字幕。")
-                    identity, candidates, search_meta = service.search(key, video_path, "en", **search_options)
+                    if recovered_payload is None:
+                        identity, candidates, search_meta = service.search(key, video_path, "en", **search_options)
+                    else:
+                        identity, candidates, search_meta = recovered_payload
             except core.CancelledError:
                 raise
             except Exception as exc:
@@ -880,7 +990,8 @@ def _find_verified_english_impl(
                 failures.append(reason)
                 log(f"智能字幕：{reason}")
                 continue
-            if service is online_subtitles and getattr(search_meta, "identity_resolution_status", "") == "confirmed":
+            if (service in (online_subtitles, subdl_subtitles)
+                    and getattr(search_meta, "identity_resolution_status", "") == "confirmed"):
                 proposed_work = Resolution(
                     'confirmed', getattr(search_meta, 'identity_resolution_reason', ''),
                     identity.original_title or identity.title, str(identity.year or ''),
@@ -889,8 +1000,14 @@ def _find_verified_english_impl(
                     tuple(getattr(search_meta, 'identity_resolution_evidence', ()) or ()))
                 # Validate against the original local identity, before passing
                 # proof across provider stages. No model title is a proof.
-                if validate_resolution(online_subtitles.identify_media(video_path), proposed_work):
+                if validate_filename_resolution(video_path, online_subtitles.identify_media(video_path), proposed_work):
                     confirmed_work = proposed_work
+                    year_record = catalogue_year_evidence(proposed_work)
+                    if year_record is not None:
+                        log(f"智能字幕：目录年份复核：原始年份 {year_record['input_year']}，"
+                            f"独立目录与正式片目为 {year_record['canonical_year']}；"
+                            f"IMDb {proposed_work.imdb_id} / TMDB {proposed_work.tmdb_id} 一致，"
+                            f"采用已确认目录年份 {proposed_work.year}，原文件名保持。")
             if not title_fallback and provider_name == "OpenSubtitles":
                 hash_fallback_ready = getattr(search_meta, "query_mode", "") == "hash"
             log(
@@ -899,6 +1016,8 @@ def _find_verified_english_impl(
                 f"{getattr(identity, 'original_title', '') or getattr(identity, 'title', '') or '未识别'}"
                 f"（{getattr(identity, 'year', '') or '年份未识别'}）。"
             )
+            if getattr(identity, 'raw_title', ''):
+                log(f"智能字幕：原始完整片名“{identity.raw_title}”；采用已确认作品“{identity.title}”（{identity.year}），未直接把尾年猜测当作确认。")
             lookup_attempts = getattr(search_meta, "feature_lookup_attempts", ()) or ()
             for lookup_attempt in lookup_attempts:
                 log(f"智能字幕：{provider_name} 影片身份查询记录：{lookup_attempt}。")
@@ -917,7 +1036,7 @@ def _find_verified_english_impl(
                 log(
                     f"智能字幕：{provider_name} 自动作品确认={resolution_label}；"
                     f"{getattr(search_meta, 'identity_resolution_reason', '')}；"
-                    f"补证请求 {getattr(search_meta, 'identity_resolution_requests', 0)} 次，"
+                    f"全球作品身份补证请求 {getattr(search_meta, 'identity_resolution_requests', 0)} 次，"
                     f"耗时 {getattr(search_meta, 'identity_resolution_seconds', 0.0):.2f} 秒；"
                     f"证据缓存={'命中' if getattr(search_meta, 'identity_resolution_cache_hit', False) else '未命中'}。"
                 )
@@ -925,7 +1044,7 @@ def _find_verified_english_impl(
             if lookup_reason:
                 search_details.append(f"{provider_name}：{lookup_reason}")
             returned_candidates += len(candidates)
-            audit.searches.append(dict(provider=provider_name, loaded=len(candidates),
+            search_audit = dict(provider=provider_name, loaded=len(candidates),
                 total=getattr(search_meta, "total_count", None),
                 truncated=bool(getattr(search_meta, "truncated", False)),
                 identity_result=getattr(search_meta, "feature_lookup_reason", ""),
@@ -934,14 +1053,22 @@ def _find_verified_english_impl(
                 identity_resolution_requests=getattr(search_meta, "identity_resolution_requests", 0),
                 identity_resolution_seconds=getattr(search_meta, "identity_resolution_seconds", 0.0),
                 identity_resolution_cache_hit=getattr(search_meta, "identity_resolution_cache_hit", False),
-                identity_resolution_evidence=getattr(search_meta, "identity_resolution_evidence", ())))
+                identity_resolution_evidence=getattr(search_meta, "identity_resolution_evidence", ()))
+            audit.searches.append(search_audit)
             queue: list[object] = []
             filtered_counts = Counter()
             stage_candidate_keys: set[str] = set()
             audit_rows = {}
             identity_titles = tuple(str(getattr(identity, name, "") or "") for name in ("title", "original_title"))
             for candidate in candidates:
-                key_value = candidate_key(provider_name, candidate)
+                qualification = source_qualifications.get(id(candidate))
+                comparison_identity = identity
+                if qualification is not None:
+                    if not source_recovery.validate_qualification(video_path, identity, provider_name, candidate, qualification):
+                        failures.append(f'{provider_name}：候选级恢复凭据不一致，未下载')
+                        continue
+                    comparison_identity = source_recovery.comparison_identity(identity, qualification)
+                key_value = scoped_candidate_key(provider_name, candidate)
                 row = audit.add(f"{provider_name} · {getattr(candidate, 'release', '') or getattr(candidate, 'file_name', '')}",
                                 provider=provider_name, candidate_key=key_value, kind="source",
                                 author=author_display(candidate), author_role=getattr(candidate, 'author_role', ''))
@@ -951,7 +1078,7 @@ def _find_verified_english_impl(
                     audit.update(row, "selection", "duplicate", "重复候选或本轮已检查")
                     continue
                 stage_candidate_keys.add(key_value)
-                role_conflict = _candidate_role_conflict(candidate, identity)
+                role_conflict = _candidate_role_conflict(candidate, comparison_identity)
                 if role_conflict:
                     audit.update(row, "purpose", "filtered", role_conflict,
                                  role=subtitle_roles.candidate_role(candidate, identity).code)
@@ -963,7 +1090,8 @@ def _find_verified_english_impl(
                         f"未进入正文核验：{role_conflict}。"
                     )
                     continue
-                identity_conflict = _candidate_identity_conflict(candidate, identity)
+                identity_conflict = (_candidate_installment_conflict(candidate, comparison_identity) if qualification is not None else
+                                     _candidate_identity_conflict(candidate, identity))
                 if identity_conflict:
                     identity_pending = getattr(candidate, "identity_admission_state", "") == "pending"
                     audit.update(row, "identity", "identity_pending" if identity_pending else "filtered", identity_conflict,
@@ -997,6 +1125,8 @@ def _find_verified_english_impl(
                             part,
                             str(getattr(candidate, "feature_year", "") or ""),
                             exact_hash=bool(getattr(candidate, "moviehash_match", False)),
+                            **({'confirmed_work': confirmed_work}
+                               if identity_recovery is not None and confirmed_work is not None else {}),
                         ) for part in release_parts),
                         subtitle_language_label_conflict(release_text, "en"),
                     ) if reason
@@ -1010,6 +1140,10 @@ def _find_verified_english_impl(
                 queue.append(candidate)
                 audit_rows[id(candidate)] = row
                 audit.update(row, "selection", "queued", "等待下载与核验")
+                if qualification is not None:
+                    audit.update(row, 'identity', 'candidate_scoped_continuation',
+                        '完整片名/年份候选恢复资格；全球ID仍待确认，后续原核验全部保留',
+                        source_qualification=qualification)
             downloadable_candidates += len(queue)
             log(
                 f"智能字幕：{provider_name} "
@@ -1017,6 +1151,64 @@ def _find_verified_english_impl(
             )
             if not queue:
                 log(f"智能字幕：{provider_name} 没有返回可下载的英文候选。")
+                # An empty normal queue is not a successful identity. Recover
+                # concrete sources before ordinary provider latency consumes
+                # the already shared evidence clock. Every source then enters
+                # this same download/audio/checkpoint/retained-track loop.
+                camel_provider = (next((p for p in configured_providers if p[0] == 'SubDL'), None)
+                    if source_recovery.eligible_input(identity) and source_recovery.camel_boundary_proposal(
+                        identity.original_title or identity.title) else None)
+                runtime_ready = (service is online_subtitles and
+                    source_recovery.runtime_applicable(identity, candidates, search_meta))
+                if (recovered_payload is None and getattr(search_meta, 'query_mode', '') != 'hash'
+                        and (camel_provider or runtime_ready)
+                        and (identity.title, identity.year) not in recovery_attempted):
+                    recovery_attempted.add((identity.title, identity.year))
+                    # Observe the existing lazy budget without starting or
+                    # resetting it. These are per-attempt display counters,
+                    # distinct from a global identity Resolution's metadata.
+                    recovery_started = time.monotonic()
+                    recovery_budget = getattr(identity_recovery, 'budget', None)
+                    recovery_requests_before = getattr(recovery_budget, 'request_count', 0)
+                    try:
+                        if camel_provider:
+                            target_provider = camel_provider
+                            recovered, qualifications = source_recovery.recover_camel(
+                                video_path, identity, target_provider[3], identity_recovery, log, cancel_event)
+                        elif runtime_ready:
+                            target_provider = next((p for p in configured_providers if p[0] == 'OpenSubtitles'), None)
+                            duration_for_recovery = source_recovery.movie_duration(video_path)
+                            recovered, qualifications = source_recovery.recover_runtime(
+                                video_path, identity, candidates, identity_recovery,
+                                duration_for_recovery, log, cancel_event)
+                        else:
+                            recovered, qualifications, target_provider = [], {}, None
+                        if recovered and target_provider:
+                            source_qualifications.update(qualifications)
+                            recovery_meta = online_subtitles.SearchMeta(loaded_count=len(recovered),
+                                total_count=len(recovered), query_mode='candidate-scoped-recovery',
+                                identity_resolution_status='pending',
+                                identity_resolution_reason='仅具体来源继续核验；未确认或合并全球作品ID')
+                            search_stages.insert(stage_index + 1, (*target_provider, False,
+                                (identity, recovered, recovery_meta)))
+                    except core.CancelledError:
+                        raise
+                    except (online_subtitles.SubtitleAuthenticationError, online_subtitles.SubtitleQuotaError):
+                        raise
+                    except Exception as error:
+                        log(f'智能字幕：候选级恢复未完成：{error}；未放宽原核验。')
+                    finally:
+                        recovery_budget = getattr(identity_recovery, 'budget', None)
+                        recovery_total = getattr(recovery_budget, 'request_count', 0)
+                        recovery_requests = max(0, recovery_total - recovery_requests_before)
+                        recovery_seconds = max(0.0, time.monotonic() - recovery_started)
+                        search_audit.update(candidate_recovery_requests=recovery_requests,
+                            candidate_recovery_seconds=recovery_seconds,
+                            shared_evidence_requests=recovery_total,
+                            candidate_recovery_count_scope='this_attempt_extra_evidence_requests')
+                        log(f'智能字幕：候选级恢复本次额外补证请求 {recovery_requests} 次，'
+                            f'候选恢复耗时 {recovery_seconds:.2f} 秒；'
+                            f'本片共享补证累计 {recovery_total} 次；全球作品ID状态保持。')
                 continue
             queue = prioritize_candidates(video_path, queue, identity)
             log(f"智能字幕：{provider_name} 筛选后 {len(queue)} 条候选；按 Hash、发行文件名、剪辑版本、片源及发布组线索优先；同等条件交错作者来源。")
@@ -1066,7 +1258,7 @@ def _find_verified_english_impl(
                     usage[1] = download_attempts
                     wave: list[dict[str, object]] = []
                     for candidate in wave_candidates:
-                        seen_candidate_keys.add(candidate_key(provider_name, candidate))
+                        seen_candidate_keys.add(scoped_candidate_key(provider_name, candidate))
                         serial += 1
                         release = (
                             getattr(candidate, "release", "")
@@ -1100,6 +1292,17 @@ def _find_verified_english_impl(
                             )
                             if structure_conflict:
                                 raise RuntimeError(structure_conflict)
+                            qualification = source_qualifications.get(id(item['candidate']))
+                            endpoint = None
+                            if qualification is not None:
+                                if not source_recovery.validate_qualification(video_path, identity, provider_name,
+                                                                             item['candidate'], qualification):
+                                    raise RuntimeError('下载后恢复资格与原候选不一致')
+                                if duration_for_recovery is None:
+                                    duration_for_recovery = source_recovery.movie_duration(video_path)
+                                endpoint = source_recovery.endpoint_record(downloaded, duration_for_recovery)
+                                audit.update(row, 'structure', 'endpoint_coarse_pass',
+                                    '原始字幕末尾仅通过840秒粗筛；仍须原音频/保留轨核验', endpoint=endpoint)
                             fingerprint = subtitle_content_fingerprint(downloaded)
                             if fingerprint in seen_fingerprints:
                                 audit.update(row, "structure", "duplicate", "正文和时间轴与已检查字幕完全相同")
@@ -1118,6 +1321,8 @@ def _find_verified_english_impl(
                                 "fingerprint": fingerprint,
                                 "raw_sha256": hashlib.sha256(downloaded.read_bytes()).hexdigest(),
                                 "audit_record": row,
+                                "source_qualification": qualification,
+                                "endpoint": endpoint,
                             }
                             # Identical dialogue can belong to different cuts or
                             # carry different fixed offsets. Only the fingerprint
@@ -1213,6 +1418,7 @@ def _find_verified_english_impl(
                         time.monotonic() + candidate_budget_seconds,
                     )
                     candidate_cancel.candidate_match_clock = True
+                    audio_passed_checkpoint = None
                     log(f"智能字幕：正式核验第 {attempts} 条候选：{release}")
                     try:
                         aligned, report = pro_core.preflight_online_subtitle(
@@ -1227,46 +1433,31 @@ def _find_verified_english_impl(
                             candidate_label=f"{provider_name}候选",
                             time_budget_seconds=candidate_budget_seconds,
                         )
+                        # End the audio clock here. The retained-track phase
+                        # cannot retroactively turn this pass into an audio timeout.
+                        core.check_cancel(candidate_cancel)
+                        qualification = item.get('source_qualification')
+                        identity_key = (source_recovery.qualification_key(qualification, item['endpoint']) if qualification else
+                            str(getattr(candidate, 'identity_key', '') or '') or candidate_key(provider_name, candidate))
+                        audio_passed_checkpoint = _checkpoint_after_audio(
+                            video_path, selected_audio_id, shared_content, aligned,
+                            provider_name, release, identity_key, report, movie_signature)
+                        if qualification:
+                            audio_passed_checkpoint['source_qualification'] = dict(
+                                receipt=qualification, endpoint=item['endpoint'])
                         audit.update(row, "audio_timing", "audio_verified", report,
                                      aligned_path=str(aligned), aligned_sha256=subtitle_audit.file_hash(aligned),
                                      validation_audio_id=getattr(shared_content, "validation_audio_id", selected_audio_id))
-                        candidate_cancel.validation_audio_id = getattr(shared_content, 'validation_audio_id', selected_audio_id)
-                        if candidate_acceptance is not None:
-                            try:
-                                candidate_acceptance(Path(aligned), candidate_cancel)
-                            except pro_core.SharedImageTimingPreparationRequired as request:
-                                core.check_cancel(candidate_cancel)
-                                remaining = max(0.0, candidate_cancel.deadline - time.monotonic())
-                                log(
-                                    "智能字幕：局部图片字幕证据不足，按影片共用预算补读一次全片；"
-                                    f"当前候选剩余核验额度 {remaining:.2f} 秒，读取后继续同一已对齐字幕。"
-                                )
-                                pro_core.complete_shared_image_timing(request, log, content_cancel)
-                                core.check_cancel(cancel_event)
-                                candidate_cancel.deadline = time.monotonic() + remaining
-                                try:
-                                    candidate_acceptance(Path(aligned), candidate_cancel)
-                                except pro_core.SharedImageTimingPreparationRequired as repeated:
-                                    raise pro_core.SharedImageTimingPreparationError(
-                                        "影片共用图片字幕时间点补读后仍不可用，未再次扫描或采用本候选。"
-                                    ) from repeated
-                        core.check_cancel(candidate_cancel)
-                        identity_key = (
-                            str(getattr(candidate, "identity_key", "") or "")
-                            or candidate_key(provider_name, candidate)
-                        )
-                        seal = verification_seal(
-                            video_path,
-                            str(aligned),
-                            provider_name,
-                            release,
-                            identity_key,
-                        )
-                        core.check_cancel(candidate_cancel)
+                        _save_audio_checkpoint(destination_root, audio_passed_checkpoint, 'audio_verified')
+                        core.check_cancel(cancel_event)
+                        _accept_retained_source(aligned, candidate_acceptance, cancel_event,
+                            audio_passed_checkpoint['validation_audio_id'], log)
+                        seal = audio_passed_checkpoint['seal']
                         adopted_report = adopted_alignment_report(report)
                         if adopted_report:
                             log(f"{provider_name}候选：{adopted_report}")
                         audit.update(row, "acceptance", "verified", adopted_report or report)
+                        _save_audio_checkpoint(destination_root, audio_passed_checkpoint, 'completed')
                         return SmartSubtitleResult(
                             subtitle_path=str(aligned),
                             language=getattr(candidate, "language", "") or "en",
@@ -1279,16 +1470,35 @@ def _find_verified_english_impl(
                             validation_audio_id=getattr(shared_content, 'validation_audio_id', selected_audio_id),
                             shared_audio=shared_content,
                         )
-                    except pro_core.SharedImageTimingPreparationError:
+                    except pro_core.SharedImageTimingPreparationError as exc:
                         # Shared movie IO is not a failed subtitle candidate.
+                        if audio_passed_checkpoint:
+                            exc.audio_checkpoint = dict(audio_passed_checkpoint)
+                            _save_audio_checkpoint(destination_root, audio_passed_checkpoint, 'retained_unverified')
+                            audit.update(row, 'retained_tracks',
+                                'timeout' if isinstance(exc, pro_core.RetainedSubtitleStageTimeoutError) else 'infrastructure',
+                                str(exc), audio_checkpoint=audio_passed_checkpoint)
+                            log('智能字幕：音频核验来源已保存；保留图片字幕阶段未完成，停止本片，不轮换或重新下载来源。')
                         raise
                     except pro_core.SubtitleVerificationToolError as exc:
-                        audit.update(row, 'audio_timing', 'infrastructure', str(exc))
+                        stage = 'retained_tracks' if audio_passed_checkpoint else 'audio_timing'
+                        if audio_passed_checkpoint:
+                            exc.audio_checkpoint = dict(audio_passed_checkpoint)
+                            _save_audio_checkpoint(destination_root, audio_passed_checkpoint, 'retained_unverified')
+                        audit.update(row, stage, 'infrastructure', str(exc))
                         log('智能字幕：核验工具或程序发生异常，停止本片；不将候选判为错字幕，不继续下载重试。')
                         raise
                     except core.CancelledError:
                         if cancel_event is not None and cancel_event.is_set():
                             raise
+                        if audio_passed_checkpoint:
+                            error = pro_core.RetainedSubtitleVerificationError(
+                                '保留字幕验收被中断；已通过音频的来源保留，停止本片。', {}, aligned)
+                            error.audio_checkpoint = dict(audio_passed_checkpoint)
+                            _save_audio_checkpoint(destination_root, audio_passed_checkpoint, 'retained_unverified')
+                            audit.update(row, 'retained_tracks', 'retained_track_unverified', str(error),
+                                         audio_checkpoint=audio_passed_checkpoint)
+                            raise error
                         if candidate_cancel.timed_out:
                             audit.update(row, "audio_timing", "timeout", "本条候选独立核验达到时间上限")
                             timed_out_attempts += 1
@@ -1302,6 +1512,14 @@ def _find_verified_english_impl(
                         core.check_cancel(cancel_event)
                         raise
                     except pro_core.SubtitlePreflightTimeoutError as exc:
+                        if audio_passed_checkpoint:
+                            error = pro_core.SharedImageTimingPreparationError(
+                                f'保留字幕验收子步骤超时；音频核验来源保留，停止本片：{exc}')
+                            error.audio_checkpoint = dict(audio_passed_checkpoint)
+                            _save_audio_checkpoint(destination_root, audio_passed_checkpoint, 'retained_unverified')
+                            audit.update(row, 'retained_tracks', 'timeout', str(error),
+                                         audio_checkpoint=audio_passed_checkpoint)
+                            raise error from exc
                         audit.update(row, "audio_timing", "timeout", str(exc))
                         timed_out_attempts += 1
                         reason = f"{provider_name} · {release}：{exc}"
@@ -1326,19 +1544,24 @@ def _find_verified_english_impl(
                         failures.append(reason)
                         log(f"智能字幕：{reason}；继续核验后续候选。")
                     except pro_core.RetainedSubtitleVerificationError as exc:
-                        identity_key = str(getattr(candidate, 'identity_key', '') or '') or candidate_key(provider_name, candidate)
-                        exc.audio_checkpoint = dict(rule='audio-stage-main-purpose-v1',
-                            path=str(Path(aligned).resolve()), sha256=subtitle_audit.file_hash(aligned),
-                            movie_signature=movie_signature, selected_audio_id=selected_audio_id,
-                            validation_audio_id=getattr(shared_content, 'validation_audio_id', selected_audio_id),
-                            provider=provider_name, release=release, identity_key=identity_key, report=report,
-                            seal=verification_seal(video_path,str(aligned),provider_name,release,identity_key))
-                        retained_failures.append(exc)
+                        exc.audio_checkpoint = dict(audio_passed_checkpoint)
+                        _save_audio_checkpoint(destination_root, audio_passed_checkpoint, 'retained_unverified')
                         audit.update(row, "retained_tracks", "retained_track_unverified", str(exc), results=exc.results,
                                      audio_checkpoint=exc.audio_checkpoint)
-                        failures.append(f"{provider_name} · {release}：{exc}")
-                        log(f"智能字幕：文本音频核验已通过并保存，保留轨另行未通过：{exc}")
+                        log(f"智能字幕：文本音频核验已通过并保存，保留轨另行未通过，停止本片：{exc}")
+                        raise
                     except Exception as exc:
+                        if audio_passed_checkpoint:
+                            if isinstance(exc, pro_core.SubtitleContentMismatchError):
+                                _save_audio_checkpoint(destination_root, audio_passed_checkpoint, 'source_rejected')
+                            else:
+                                error = pro_core.SharedImageTimingPreparationError(
+                                    f'已完成音频核验后的验收失败，来源保留，停止本片：{exc}')
+                                error.audio_checkpoint = dict(audio_passed_checkpoint)
+                                _save_audio_checkpoint(destination_root, audio_passed_checkpoint, 'retained_unverified')
+                                audit.update(row, 'retained_tracks', 'infrastructure', str(error),
+                                             audio_checkpoint=audio_passed_checkpoint)
+                                raise error from exc
                         audit.update(row, "audio_timing", subtitle_audit.failure_kind(exc), str(exc))
                         import continuous_vad
                         if getattr(shared_content, 'unconfirmed', False) and continuous_vad._timing_failure(exc):
