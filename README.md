@@ -6,8 +6,8 @@ SubFlow 是 Windows 影片字幕与音轨整理工具：批量分析影片，寻
 
 ## 下载
 
-- [Windows 完整安装包](https://freezhang.com/downloads/Setup-SubFlow-2.0.85-Beta-Full.exe)（2,440,557,065 字节，约 2.27 GiB）
-- [激活码购买（爱发电，¥69 一次买断）](https://afdian.com/a/subflow)：安装后在爱发电私信我领取激活码
+> **Windows 完整安装包暂停下载。** 如果你还没有安装包，请等下载恢复后再购买激活码。已经下载的 2.0.85 Beta 安装包仍可用下方的 SHA-256 校验。
+
 - [产品与图文说明](https://freezhang.com/products/subtitle-track-tool-pro-max/)
 - [上手指南](https://freezhang.com/support/#quick-start) · [安装说明](https://freezhang.com/downloads/SubFlow-2.0.85-README.txt) · [SHA-256 校验文件](https://freezhang.com/downloads/SubFlow-2.0.85-SHA256.txt) · [更新记录](CHANGELOG.md)
 
